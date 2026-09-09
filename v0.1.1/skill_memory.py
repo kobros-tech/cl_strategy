@@ -27,17 +27,19 @@ the notebook function-for-function.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set
+from typing import Any
 
 import numpy as np
 import torch
+from avalanche.models.dynamic_modules import (
+    IncrementalClassifier,
+    avalanche_model_adaptation,
+)
+from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 from torch import Tensor, nn
 from torch.utils.data import ConcatDataset, DataLoader
-
-from avalanche.models.dynamic_modules import IncrementalClassifier, avalanche_model_adaptation
-from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,7 @@ logger = logging.getLogger(__name__)
 # nn.Linear, since there is no shared backbone living outside the skill.
 # ============================================================
 
+
 class SkillMemory:
     """Bounded, index-addressed registry of independent skill states."""
 
@@ -59,8 +62,8 @@ class SkillMemory:
         if max_skills < 1:
             raise ValueError("max_skills must be positive")
         self.max_skills = max_skills
-        self._states: Dict[int, dict] = {}
-        self._metadata: Dict[int, dict] = {}
+        self._states: dict[int, dict] = {}
+        self._metadata: dict[int, dict] = {}
 
     def allocate(self) -> int:
         for slot in range(self.max_skills):
@@ -68,8 +71,12 @@ class SkillMemory:
                 return slot
         raise RuntimeError(f"skill memory is at capacity ({self.max_skills})")
 
-    def store(self, slot: int, state_dict: Mapping[str, Tensor], metadata: Optional[dict] = None) -> None:
-        self._states[slot] = {k: v.detach().cpu().clone() for k, v in state_dict.items()}
+    def store(
+        self, slot: int, state_dict: Mapping[str, Tensor], metadata: dict | None = None
+    ) -> None:
+        self._states[slot] = {
+            k: v.detach().cpu().clone() for k, v in state_dict.items()
+        }
         self._metadata[slot] = dict(metadata or {})
 
     def state(self, slot: int) -> dict:
@@ -78,7 +85,7 @@ class SkillMemory:
     def metadata(self, slot: int) -> dict:
         return self._metadata.get(slot, {})
 
-    def slots(self) -> Set[int]:
+    def slots(self) -> set[int]:
         return set(self._states)
 
     def __len__(self) -> int:
@@ -90,7 +97,10 @@ class SkillMemory:
 # (strictly required to load a stored skill into a live, growing model)
 # ============================================================
 
-def _resize_incremental_classifiers_for_state(model: nn.Module, state_dict: Mapping[str, Tensor]) -> None:
+
+def _resize_incremental_classifiers_for_state(
+    model: nn.Module, state_dict: Mapping[str, Tensor]
+) -> None:
     for module_name, module in model.named_modules():
         if not isinstance(module, IncrementalClassifier):
             continue
@@ -102,13 +112,17 @@ def _resize_incremental_classifiers_for_state(model: nn.Module, state_dict: Mapp
             continue
         device = module.classifier.weight.device
         dtype = module.classifier.weight.dtype
-        module.classifier = nn.Linear(module.classifier.in_features, target_weight.shape[0]).to(device=device, dtype=dtype)
+        module.classifier = nn.Linear(
+            module.classifier.in_features, target_weight.shape[0]
+        ).to(device=device, dtype=dtype)
         active_key = f"{prefix}active_units"
         if active_key in state_dict:
             module.active_units = state_dict[active_key].to(device=device).clone()
 
 
-def _incremental_out_features(model: nn.Module, state_dict: Mapping[str, Tensor]) -> Optional[int]:
+def _incremental_out_features(
+    model: nn.Module, state_dict: Mapping[str, Tensor]
+) -> int | None:
     """Read the class-count a stored skill was saved with, straight from its weights."""
     for module_name, module in model.named_modules():
         if not isinstance(module, IncrementalClassifier):
@@ -120,7 +134,9 @@ def _incremental_out_features(model: nn.Module, state_dict: Mapping[str, Tensor]
     return None
 
 
-def _restore_initial_state(model: nn.Module, initial_state: Mapping[str, Tensor]) -> None:
+def _restore_initial_state(
+    model: nn.Module, initial_state: Mapping[str, Tensor]
+) -> None:
     current = model.state_dict()
     for name, initial in initial_state.items():
         if name not in current:
@@ -130,10 +146,14 @@ def _restore_initial_state(model: nn.Module, initial_state: Mapping[str, Tensor]
             target.copy_(initial.to(device=target.device, dtype=target.dtype))
         elif name.endswith("classifier.weight") and target.ndim == 2:
             rows = min(target.shape[0], initial.shape[0])
-            target[:rows].copy_(initial[:rows].to(device=target.device, dtype=target.dtype))
+            target[:rows].copy_(
+                initial[:rows].to(device=target.device, dtype=target.dtype)
+            )
         elif name.endswith("classifier.bias") and target.ndim == 1:
             rows = min(target.shape[0], initial.shape[0])
-            target[:rows].copy_(initial[:rows].to(device=target.device, dtype=target.dtype))
+            target[:rows].copy_(
+                initial[:rows].to(device=target.device, dtype=target.dtype)
+            )
         elif name.endswith("active_units"):
             continue
         else:
@@ -144,7 +164,9 @@ def _origin_experience(experience):
     return getattr(experience, "origin_experience", experience)
 
 
-def _apply_skill_state(model: nn.Module, state_dict: Mapping[str, Tensor], experience) -> None:
+def _apply_skill_state(
+    model: nn.Module, state_dict: Mapping[str, Tensor], experience
+) -> None:
     """Load a stored skill onto `model` and adapt it (grow the head) to `experience`."""
     _resize_incremental_classifiers_for_state(model, state_dict)
     model.load_state_dict(state_dict, strict=False)
@@ -155,7 +177,8 @@ def _apply_skill_state(model: nn.Module, state_dict: Mapping[str, Tensor], exper
 # PROBING  (same "concatenate a few shuffled batches" recipe as the notebook)
 # ============================================================
 
-def _probe(experience, batch_size: int, n_batches: int, seed: Optional[int] = None):
+
+def _probe(experience, batch_size: int, n_batches: int, seed: int | None = None):
     if len(experience.dataset) == 0:
         raise RuntimeError("Cannot probe an empty experience")
     generator = torch.Generator().manual_seed(seed) if seed is not None else None
@@ -184,7 +207,9 @@ def score_from_loss(loss_value: float) -> float:
     return float(np.exp(-loss_value))
 
 
-def _evaluate_state(model_factory: Callable[[], nn.Module], state_dict, experience, x, y, criterion):
+def _evaluate_state(
+    model_factory: Callable[[], nn.Module], state_dict, experience, x, y, criterion
+):
     model = model_factory()
     _apply_skill_state(model, state_dict, experience)
     model.eval()
@@ -203,8 +228,12 @@ def _evaluate_state(model_factory: Callable[[], nn.Module], state_dict, experien
 # clustering (largest gap in sorted values) plus an auto-derived floor.
 # ============================================================
 
-def find_best_skill(imagination_results: List[Dict[str, Any]], forgetting_margin: float,
-                     score_floor: Optional[float] = None):
+
+def find_best_skill(
+    imagination_results: list[dict[str, Any]],
+    forgetting_margin: float,
+    score_floor: float | None = None,
+):
     """
     Select an existing skill only when there is evidence it is BOTH
     safe to reuse (forgetting guard on old data) AND compatible with the
@@ -219,7 +248,8 @@ def find_best_skill(imagination_results: List[Dict[str, Any]], forgetting_margin
     # Forgetting guard: drop any skill whose grip on old data is already
     # weak -- reusing it would trivially "forget" further.
     safe_results = [
-        r for r in imagination_results
+        r
+        for r in imagination_results
         if r["old_accuracy"] > r["chance"] + forgetting_margin
     ]
     if not safe_results:
@@ -251,7 +281,9 @@ def find_best_skill(imagination_results: List[Dict[str, Any]], forgetting_margin
     floor_accuracy = max(r["chance"] for r in safe_results)
 
     score_candidates = strongest_candidates(safe_results, "new_score", floor_score)
-    accuracy_candidates = strongest_candidates(safe_results, "new_accuracy", floor_accuracy)
+    accuracy_candidates = strongest_candidates(
+        safe_results, "new_accuracy", floor_accuracy
+    )
 
     intersection = score_candidates & accuracy_candidates
     if not intersection:
@@ -265,6 +297,7 @@ def find_best_skill(imagination_results: List[Dict[str, Any]], forgetting_margin
 # STRATEGY PLUGIN
 # ============================================================
 
+
 class SkillMemoryPlugin(SupervisedPlugin):
     """Probe-based Skill Memory: reuse-and-keep-training an existing skill,
     or allocate and train a fresh one from scratch. Binary decision, exactly
@@ -272,17 +305,29 @@ class SkillMemoryPlugin(SupervisedPlugin):
 
     REUSE, SCRATCH = "reuse", "scratch"
 
-    def __init__(self, memory: Optional[SkillMemory] = None, *, max_skills: int = 20,
-                 forgetting_margin: float = 0.05, score_floor: Optional[float] = None,
-                 probe_batch_size: int = 64, probe_batches: int = 5, probe_seed: Optional[int] = None,
-                 replay_old_during_reuse: bool = False, replay_batches_per_epoch: int = 1,
-                 skill_name: Optional[Callable] = None, force_decision: Optional[str] = None,
-                 verbose: bool = True):
+    def __init__(
+        self,
+        memory: SkillMemory | None = None,
+        *,
+        max_skills: int = 20,
+        forgetting_margin: float = 0.05,
+        score_floor: float | None = None,
+        probe_batch_size: int = 64,
+        probe_batches: int = 5,
+        probe_seed: int | None = None,
+        replay_old_during_reuse: bool = False,
+        replay_batches_per_epoch: int = 1,
+        skill_name: Callable | None = None,
+        force_decision: str | None = None,
+        verbose: bool = True,
+    ):
         super().__init__()
         if force_decision not in (None, self.REUSE, self.SCRATCH):
             raise ValueError("invalid force_decision")
 
-        self.memory = memory if memory is not None else SkillMemory(max_skills=max_skills)
+        self.memory = (
+            memory if memory is not None else SkillMemory(max_skills=max_skills)
+        )
         self.forgetting_margin = forgetting_margin
         self.score_floor = score_floor
         self.probe_batch_size = probe_batch_size
@@ -295,13 +340,13 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.verbose = verbose
 
         self.last_decision = self.SCRATCH
-        self.last_selected_skill: Optional[int] = None
+        self.last_selected_skill: int | None = None
         self.last_compatibility_score = 0.0
         self.last_old_accuracy = 0.0
         self.last_new_accuracy = 0.0
 
-        self._initial_state: Optional[dict] = None
-        self._active_slot: Optional[int] = None
+        self._initial_state: dict | None = None
+        self._active_slot: int | None = None
         self._task_active = False
         self._seen_experiences: list = []
 
@@ -340,11 +385,13 @@ class SkillMemoryPlugin(SupervisedPlugin):
     def _is_last_subexp(experience) -> bool:
         return getattr(experience, "is_last_subexp", True)
 
-    def _score_slots(self, strategy, experience) -> List[Dict[str, Any]]:
+    def _score_slots(self, strategy, experience) -> list[dict[str, Any]]:
         """Mirrors the notebook's imagine(): evaluate every stored skill on
         both an old probe (previously seen experiences) and a new probe
         (the current experience)."""
-        new_x, new_y = _probe(experience, self.probe_batch_size, self.probe_batches, self.probe_seed)
+        new_x, new_y = _probe(
+            experience, self.probe_batch_size, self.probe_batches, self.probe_seed
+        )
         model_factory = lambda: deepcopy(strategy.model)
         results = []
         for slot in self.memory.slots():
@@ -352,31 +399,60 @@ class SkillMemoryPlugin(SupervisedPlugin):
             meta = self.memory.metadata(slot)
 
             old_index = meta.get("experience_index")
-            if isinstance(old_index, int) and 0 <= old_index < len(self._seen_experiences):
+            if isinstance(old_index, int) and 0 <= old_index < len(
+                self._seen_experiences
+            ):
                 old_experience = self._seen_experiences[old_index]
             else:
                 old_experience = self._seen_experiences[0]
-            seed = None if self.probe_seed is None else self.probe_seed + 100003 + len(results)
-            old_x, old_y = _probe(old_experience, self.probe_batch_size, self.probe_batches, seed)
+            seed = (
+                None
+                if self.probe_seed is None
+                else self.probe_seed + 100003 + len(results)
+            )
+            old_x, old_y = _probe(
+                old_experience, self.probe_batch_size, self.probe_batches, seed
+            )
 
             old_loss, old_score, old_accuracy = _evaluate_state(
-                model_factory, state_dict, old_experience, old_x, old_y, nn.functional.cross_entropy)
+                model_factory,
+                state_dict,
+                old_experience,
+                old_x,
+                old_y,
+                nn.functional.cross_entropy,
+            )
             new_loss, new_score, new_accuracy = _evaluate_state(
-                model_factory, state_dict, experience, new_x, new_y, nn.functional.cross_entropy)
+                model_factory,
+                state_dict,
+                experience,
+                new_x,
+                new_y,
+                nn.functional.cross_entropy,
+            )
 
             chance = 1.0 / (_incremental_out_features(strategy.model, state_dict) or 2)
 
-            results.append({
-                "skill": slot, "chance": chance,
-                "old_loss": old_loss, "old_score": old_score, "old_accuracy": old_accuracy,
-                "new_loss": new_loss, "new_score": new_score, "new_accuracy": new_accuracy,
-            })
+            results.append(
+                {
+                    "skill": slot,
+                    "chance": chance,
+                    "old_loss": old_loss,
+                    "old_score": old_score,
+                    "old_accuracy": old_accuracy,
+                    "new_loss": new_loss,
+                    "new_score": new_score,
+                    "new_accuracy": new_accuracy,
+                }
+            )
         return results
 
     def _build_replay_dataset(self, experience):
         if not self._seen_experiences:
             return experience.dataset
-        old_dataset = ConcatDataset([_origin_experience(e).dataset for e in self._seen_experiences])
+        old_dataset = ConcatDataset(
+            [_origin_experience(e).dataset for e in self._seen_experiences]
+        )
         return ConcatDataset([experience.dataset, old_dataset])
 
     # ------------------------------------------------------------
@@ -390,7 +466,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self._task_active = True
 
         if self._initial_state is None:
-            self._initial_state = {k: v.detach().cpu().clone() for k, v in strategy.model.state_dict().items()}
+            self._initial_state = {
+                k: v.detach().cpu().clone()
+                for k, v in strategy.model.state_dict().items()
+            }
 
         self.last_decision = self.SCRATCH
         self.last_selected_skill = None
@@ -405,13 +484,20 @@ class SkillMemoryPlugin(SupervisedPlugin):
             return
 
         if not self._seen_experiences:
-            raise RuntimeError("Skill Memory has skills but no previous experiences to probe")
+            raise RuntimeError(
+                "Skill Memory has skills but no previous experiences to probe"
+            )
 
         results = self._score_slots(strategy, experience)
         self._log("\nImagination:")
         for r in results:
-            self._log(f"  skill {r['skill']}: old_score={r['old_score']:.3f}, old_acc={r['old_accuracy']:.3f}, "
-                       f"new_score={r['new_score']:.3f}, new_acc={r['new_accuracy']:.3f}")
+            self._log(
+                f"  skill {r['skill']}: "
+                f"old_score={r['old_score']:.3f}, "
+                f"old_acc={r['old_accuracy']:.3f}, "
+                f"new_score={r['new_score']:.3f}, "
+                f"new_acc={r['new_accuracy']:.3f}"
+            )
 
         best = None
         if self.force_decision is None:
@@ -427,10 +513,15 @@ class SkillMemoryPlugin(SupervisedPlugin):
             self.last_old_accuracy = best["old_accuracy"]
             self.last_new_accuracy = best["new_accuracy"]
 
-            _apply_skill_state(strategy.model, self.memory.state(best["skill"]), experience)
+            _apply_skill_state(
+                strategy.model, self.memory.state(best["skill"]), experience
+            )
             self._reset_optimizer(strategy)
-            self._log(f"\nBest compatible skill: {best['skill']} "
-                      f"(new_score={best['new_score']:.3f}, new_accuracy={best['new_accuracy']:.3f})")
+            self._log(
+                f"\nBest compatible skill: {best['skill']} "
+                f"(new_score={best['new_score']:.3f}, "
+                f"new_accuracy={best['new_accuracy']:.3f})"
+            )
 
             if self.replay_old_during_reuse:
                 strategy.adapted_dataset = self._build_replay_dataset(experience)
@@ -438,7 +529,9 @@ class SkillMemoryPlugin(SupervisedPlugin):
             self._active_slot = self.memory.allocate()
             self._scratch(strategy)
             self.last_decision = self.SCRATCH
-            self._log(f"\nNo compatible existing skill -> allocated skill {self._active_slot}")
+            self._log(
+                f"\nNo compatible existing skill -> allocated skill {self._active_slot}"
+            )
 
     def after_training_exp(self, strategy, **kwargs):
         experience = strategy.experience
@@ -446,17 +539,21 @@ class SkillMemoryPlugin(SupervisedPlugin):
             return
 
         slot = self._active_slot
-        self.memory.store(slot, strategy.model.state_dict(), metadata={
-            "acquisition_decision": self.last_decision,
-            "selected_skill": self.last_selected_skill,
-            "compatibility_score": self.last_compatibility_score,
-            "old_accuracy": self.last_old_accuracy,
-            "new_accuracy": self.last_new_accuracy,
-            "probe_batch_size": self.probe_batch_size,
-            "probe_batches": self.probe_batches,
-            "probe_seed": self.probe_seed,
-            "experience_index": len(self._seen_experiences),
-        })
+        self.memory.store(
+            slot,
+            strategy.model.state_dict(),
+            metadata={
+                "acquisition_decision": self.last_decision,
+                "selected_skill": self.last_selected_skill,
+                "compatibility_score": self.last_compatibility_score,
+                "old_accuracy": self.last_old_accuracy,
+                "new_accuracy": self.last_new_accuracy,
+                "probe_batch_size": self.probe_batch_size,
+                "probe_batches": self.probe_batches,
+                "probe_seed": self.probe_seed,
+                "experience_index": len(self._seen_experiences),
+            },
+        )
 
         self._seen_experiences.append(_origin_experience(experience))
         self._active_slot = None

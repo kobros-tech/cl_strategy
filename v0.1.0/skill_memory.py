@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import numpy as np
+from avalanche.models.dynamic_modules import (
+    IncrementalClassifier,
+    avalanche_model_adaptation,
+)
+from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
-from avalanche.models.dynamic_modules import IncrementalClassifier, avalanche_model_adaptation
-from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 
 
 @dataclass
@@ -54,7 +58,9 @@ class SkillMemory:
         model.load_state_dict(deepcopy(state_dict), strict=False)
 
 
-def _resize_incremental_classifiers_for_state(model: nn.Module, state_dict: Mapping[str, Tensor]):
+def _resize_incremental_classifiers_for_state(
+    model: nn.Module, state_dict: Mapping[str, Tensor]
+):
     for module_name, module in model.named_modules():
         if not isinstance(module, IncrementalClassifier):
             continue
@@ -66,7 +72,9 @@ def _resize_incremental_classifiers_for_state(model: nn.Module, state_dict: Mapp
             continue
         device = module.classifier.weight.device
         dtype = module.classifier.weight.dtype
-        module.classifier = nn.Linear(module.classifier.in_features, target_weight.shape[0]).to(device=device, dtype=dtype)
+        module.classifier = nn.Linear(
+            module.classifier.in_features, target_weight.shape[0]
+        ).to(device=device, dtype=dtype)
         active_key = f"{prefix}active_units"
         if active_key in state_dict:
             module.active_units = state_dict[active_key].to(device=device).clone()
@@ -82,10 +90,14 @@ def _restore_initial_state(model: nn.Module, initial_state: Mapping[str, Tensor]
             target.copy_(initial.to(device=target.device, dtype=target.dtype))
         elif name.endswith("classifier.weight") and target.ndim == 2:
             rows = min(target.shape[0], initial.shape[0])
-            target[:rows].copy_(initial[:rows].to(device=target.device, dtype=target.dtype))
+            target[:rows].copy_(
+                initial[:rows].to(device=target.device, dtype=target.dtype)
+            )
         elif name.endswith("classifier.bias") and target.ndim == 1:
             rows = min(target.shape[0], initial.shape[0])
-            target[:rows].copy_(initial[:rows].to(device=target.device, dtype=target.dtype))
+            target[:rows].copy_(
+                initial[:rows].to(device=target.device, dtype=target.dtype)
+            )
         elif name.endswith("active_units"):
             continue
         else:
@@ -124,7 +136,9 @@ def _probe(experience, samples: int, batches: int, seed: int | None = None):
     return __import__("torch").cat(xs), __import__("torch").cat(ys)
 
 
-def _load_and_adapt(model_factory: Callable[[], nn.Module], record: SkillRecord, experience):
+def _load_and_adapt(
+    model_factory: Callable[[], nn.Module], record: SkillRecord, experience
+):
     model = model_factory()
     _resize_incremental_classifiers_for_state(model, record.state_dict)
     model.load_state_dict(record.state_dict, strict=False)
@@ -147,7 +161,16 @@ def _evaluate_state(model_factory, record, experience, x, y, loss_fn):
 class ProbeCompatibilityScorer:
     """Probe a stored skill on training data from a new experience."""
 
-    def __init__(self, model_factory, loss_fn, probe_fn, reference_fn, probe_samples=64, probe_batches=5, seed=None):
+    def __init__(
+        self,
+        model_factory,
+        loss_fn,
+        probe_fn,
+        reference_fn,
+        probe_samples=64,
+        probe_batches=5,
+        seed=None,
+    ):
         self.model_factory = model_factory
         self.loss_fn = loss_fn
         self.probe_fn = probe_fn
@@ -158,7 +181,9 @@ class ProbeCompatibilityScorer:
 
     def __call__(self, record, experience):
         x, y = self.probe_fn(experience)
-        _, score, _ = _evaluate_state(self.model_factory, record, experience, x, y, self.loss_fn)
+        _, score, _ = _evaluate_state(
+            self.model_factory, record, experience, x, y, self.loss_fn
+        )
         return score
 
 
@@ -166,11 +191,15 @@ def make_probe(experience, samples=64, batches=5, seed=None):
     return _probe(experience, samples=samples, batches=batches, seed=seed)
 
 
-def make_compatibility(model_factory, num_classes, probe_samples=64, probe_batches=5, seed=None):
+def make_compatibility(
+    model_factory, num_classes, probe_samples=64, probe_batches=5, seed=None
+):
     return ProbeCompatibilityScorer(
         model_factory=model_factory,
         loss_fn=nn.functional.cross_entropy,
-        probe_fn=lambda exp: make_probe(exp, samples=probe_samples, batches=probe_batches, seed=seed),
+        probe_fn=lambda exp: make_probe(
+            exp, samples=probe_samples, batches=probe_batches, seed=seed
+        ),
         reference_fn=lambda _y: float(np.log(num_classes)),
         probe_samples=probe_samples,
         probe_batches=probe_batches,
@@ -183,17 +212,35 @@ class SkillMemoryPlugin(SupervisedPlugin):
 
     REUSE, CLONE, SCRATCH = "reuse", "clone", "scratch"
 
-    def __init__(self, memory=None, *, compatibility=None, skill_name=None, max_skills=20,
-                 reuse_threshold=0.90, clone_threshold=0.30, forgetting_margin=0.05,
-                 probe_samples=64, probe_batches=5, probe_seed=None, force_decision=None):
+    def __init__(
+        self,
+        memory=None,
+        *,
+        compatibility=None,
+        skill_name=None,
+        max_skills=20,
+        reuse_threshold=0.90,
+        clone_threshold=0.30,
+        forgetting_margin=0.05,
+        probe_samples=64,
+        probe_batches=5,
+        probe_seed=None,
+        force_decision=None,
+    ):
         super().__init__()
         if force_decision not in (None, self.REUSE, self.CLONE, self.SCRATCH):
             raise ValueError("invalid force_decision")
         if not 0 <= clone_threshold <= reuse_threshold <= 1:
             raise ValueError("require 0 <= clone_threshold <= reuse_threshold <= 1")
-        self.memory = memory if memory is not None else SkillMemory(max_skills=max_skills)
+        self.memory = (
+            memory if memory is not None else SkillMemory(max_skills=max_skills)
+        )
         self.compatibility = compatibility
-        self.skill_name = skill_name or (lambda exp: f"experience-{getattr(getattr(exp, 'origin_experience', None), 'current_experience', exp.current_experience)}")
+        self.skill_name = skill_name or (
+            lambda exp: f"experience-{
+                (getattr(exp, 'origin_experience', None) or exp).current_experience
+            }"
+        )
         self.reuse_threshold = reuse_threshold
         self.clone_threshold = clone_threshold
         self.forgetting_margin = forgetting_margin
@@ -241,24 +288,54 @@ class SkillMemoryPlugin(SupervisedPlugin):
 
     def _probe_current(self, experience, seed_offset=0):
         seed = None if self.probe_seed is None else self.probe_seed + seed_offset
-        return make_probe(experience, samples=self.probe_samples, batches=self.probe_batches, seed=seed)
+        return make_probe(
+            experience,
+            samples=self.probe_samples,
+            batches=self.probe_batches,
+            seed=seed,
+        )
 
     def _score_records(self, strategy, experience):
         new_x, new_y = self._probe_current(experience, 0)
         model_factory = lambda: deepcopy(strategy.model)
         results = []
         for record in self.memory.records():
-            new_loss, new_score, new_accuracy = _evaluate_state(model_factory, record, experience, new_x, new_y, nn.functional.cross_entropy)
+            new_loss, new_score, new_accuracy = _evaluate_state(
+                model_factory,
+                record,
+                experience,
+                new_x,
+                new_y,
+                nn.functional.cross_entropy,
+            )
             old_index = record.metadata.get("experience")
-            if isinstance(old_index, int) and 0 <= old_index < len(self._seen_experiences):
+            if isinstance(old_index, int) and 0 <= old_index < len(
+                self._seen_experiences
+            ):
                 old_experience = self._seen_experiences[old_index]
             else:
                 old_experience = self._seen_experiences[0]
             old_x, old_y = self._probe_current(old_experience, 100003 + len(results))
-            old_loss, old_score, old_accuracy = _evaluate_state(model_factory, record, old_experience, old_x, old_y, nn.functional.cross_entropy)
-            results.append({"record": record, "skill": record.name, "old_loss": old_loss,
-                            "old_score": old_score, "old_accuracy": old_accuracy,
-                            "new_loss": new_loss, "new_score": new_score, "new_accuracy": new_accuracy})
+            old_loss, old_score, old_accuracy = _evaluate_state(
+                model_factory,
+                record,
+                old_experience,
+                old_x,
+                old_y,
+                nn.functional.cross_entropy,
+            )
+            results.append(
+                {
+                    "record": record,
+                    "skill": record.name,
+                    "old_loss": old_loss,
+                    "old_score": old_score,
+                    "old_accuracy": old_accuracy,
+                    "new_loss": new_loss,
+                    "new_score": new_score,
+                    "new_accuracy": new_accuracy,
+                }
+            )
         return results
 
     def before_training_exp(self, strategy, **kwargs):
@@ -267,7 +344,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
             return
         self._task_active = True
         if self._initial_state is None:
-            self._initial_state = {k: v.detach().cpu().clone() for k, v in strategy.model.state_dict().items()}
+            self._initial_state = {
+                k: v.detach().cpu().clone()
+                for k, v in strategy.model.state_dict().items()
+            }
         self.last_decision = self.SCRATCH
         self.last_selected_skill = None
         self.last_compatibility_score = 0.0
@@ -279,12 +359,16 @@ class SkillMemoryPlugin(SupervisedPlugin):
             self._scratch(strategy)
             return
         if not self._seen_experiences:
-            raise RuntimeError("Skill Memory has skills but no previous experiences to probe")
+            raise RuntimeError(
+                "Skill Memory has skills but no previous experiences to probe"
+            )
 
         results = self._score_records(strategy, experience)
         classifier = getattr(strategy.model, "classifier", None)
         chance = 1.0 / max(1, getattr(classifier, "out_features", 10))
-        safe = [r for r in results if r["old_accuracy"] > chance + self.forgetting_margin]
+        safe = [
+            r for r in results if r["old_accuracy"] > chance + self.forgetting_margin
+        ]
         best = max(safe or results, key=lambda r: (r["new_score"], r["new_accuracy"]))
         self.last_selected_skill = best["skill"]
         self.last_compatibility_score = best["new_score"]
@@ -322,17 +406,25 @@ class SkillMemoryPlugin(SupervisedPlugin):
         if self.last_decision != self.REUSE:
             name = self.skill_name(experience)
             if name not in self.memory._records:
-                self.memory.register(name, strategy.model.state_dict(), metadata={
-                    "acquisition_decision": self.last_decision,
-                    "selected_skill": self.last_selected_skill,
-                    "compatibility_score": self.last_compatibility_score,
-                    "old_accuracy": self.last_old_accuracy,
-                    "new_accuracy": self.last_new_accuracy,
-                    "probe_samples": self.probe_samples,
-                    "probe_batches": self.probe_batches,
-                    "probe_seed": self.probe_seed,
-                    "experience": getattr(getattr(experience, "origin_experience", None), "current_experience", experience.current_experience),
-                })
+                self.memory.register(
+                    name,
+                    strategy.model.state_dict(),
+                    metadata={
+                        "acquisition_decision": self.last_decision,
+                        "selected_skill": self.last_selected_skill,
+                        "compatibility_score": self.last_compatibility_score,
+                        "old_accuracy": self.last_old_accuracy,
+                        "new_accuracy": self.last_new_accuracy,
+                        "probe_samples": self.probe_samples,
+                        "probe_batches": self.probe_batches,
+                        "probe_seed": self.probe_seed,
+                        "experience": getattr(
+                            getattr(experience, "origin_experience", None),
+                            "current_experience",
+                            experience.current_experience,
+                        ),
+                    },
+                )
         self._seen_experiences.append(_origin_experience(experience))
         self._task_active = False
 

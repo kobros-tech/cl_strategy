@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
 import numpy as np
 import torch
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CONFIG
 # ============================================================
+
 
 @dataclass
 class SkillMemoryConfig:
@@ -55,21 +56,26 @@ class SkillMemoryConfig:
     probe_batches: int = 5  # batches concatenated per probe; more = lower variance
 
     # Allocation decision
-    forgetting_margin: float = 0.05   # old_accuracy must exceed chance + margin to be reuse-safe
-    score_floor: Optional[float] = None  # absolute floor on new_score candidates; auto-derived if None
+    forgetting_margin: float = (
+        0.05  # old_accuracy must exceed chance + margin to be reuse-safe
+    )
+    score_floor: float | None = (
+        None  # absolute floor on new_score candidates; auto-derived if None
+    )
 
     # Optional replay while training a REUSED skill
     replay_old_during_reuse: bool = False
     replay_batches_per_epoch: int = 1
 
     verbose: bool = True
-    seed: Optional[int] = None
+    seed: int | None = None
     device: str = "cpu"
 
 
 # ============================================================
 # MODEL
 # ============================================================
+
 
 class SkillClassifierBank(nn.Module):
     """A bank of linear "skill" classifiers; one is active at a time."""
@@ -83,8 +89,8 @@ class SkillClassifierBank(nn.Module):
                 for _ in range(config.n_skills)
             ]
         )
-        self.learned_skills: Set[int] = set()
-        self.active_skill: Optional[int] = None
+        self.learned_skills: set[int] = set()
+        self.active_skill: int | None = None
 
     def allocate_skill(self) -> int:
         for skill_index in range(len(self.skill_classifiers)):
@@ -107,13 +113,14 @@ class SkillClassifierBank(nn.Module):
 # PROBING HELPERS
 # ============================================================
 
+
 def _probe(loader: DataLoader, n_batches: int):
     """
     Pull up to n_batches from loader and concatenate them into one
     lower-variance probe sample, instead of trusting a single small batch.
     """
-    xs: List[torch.Tensor] = []
-    ys: List[torch.Tensor] = []
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
     it = iter(loader)
     for _ in range(n_batches):
         try:
@@ -138,7 +145,7 @@ def score_from_loss(loss_value: float) -> float:
     return float(np.exp(-loss_value))
 
 
-def compute_cl_metrics(accuracy_history: List[List[float]]):
+def compute_cl_metrics(accuracy_history: list[list[float]]):
     """
     Standard accuracy / forgetting curves from a per-experience accuracy
     history, where accuracy_history[t][j] is the accuracy on experience j
@@ -172,6 +179,7 @@ def compute_cl_metrics(accuracy_history: List[List[float]]):
 # STRATEGY
 # ============================================================
 
+
 class SkillMemoryStrategy:
     def __init__(
         self,
@@ -186,7 +194,7 @@ class SkillMemoryStrategy:
         self.config = config
 
         # Previously seen experiences (used only to source OLD probe samples)
-        self.seen_datasets: List[Any] = []
+        self.seen_datasets: list[Any] = []
 
         if config.seed is not None:
             torch.manual_seed(config.seed)
@@ -206,7 +214,7 @@ class SkillMemoryStrategy:
     # ============================================================
 
     @torch.no_grad()
-    def imagine(self, new_x, new_y, old_x, old_y) -> List[Dict[str, Any]]:
+    def imagine(self, new_x, new_y, old_x, old_y) -> list[dict[str, Any]]:
         """
         Compare every existing skill on:
           - old data: probe samples from previously seen experiences
@@ -252,7 +260,7 @@ class SkillMemoryStrategy:
     # FIND BEST SKILL
     # ============================================================
 
-    def find_best_skill(self, imagination_results: List[Dict[str, Any]]):
+    def find_best_skill(self, imagination_results: list[dict[str, Any]]):
         """
         Select an existing skill only when there is evidence that it is
         BOTH safe to reuse (forgetting guard on old data) AND compatible
@@ -340,7 +348,7 @@ class SkillMemoryStrategy:
     # ============================================================
 
     @torch.no_grad()
-    def imagine_current(self, x, y) -> List[Dict[str, Any]]:
+    def imagine_current(self, x, y) -> list[dict[str, Any]]:
         """
         Evaluate all existing skills on the current experience.
         Used at eval time to pick which skill to route the experience to.
@@ -428,7 +436,9 @@ class SkillMemoryStrategy:
 
             if best is None:
                 skill_index = self.model.allocate_skill()
-                self._log(f"\nNo compatible existing skill -> allocated skill {skill_index}")
+                self._log(
+                    f"\nNo compatible existing skill -> allocated skill {skill_index}"
+                )
             else:
                 skill_index = best["skill"]
                 reused = True
@@ -492,7 +502,9 @@ class SkillMemoryStrategy:
         cfg = self.config
         self.model.eval()
 
-        loader = DataLoader(experience.dataset, batch_size=cfg.batch_size, shuffle=False)
+        loader = DataLoader(
+            experience.dataset, batch_size=cfg.batch_size, shuffle=False
+        )
         probe_loader = DataLoader(
             experience.dataset, batch_size=cfg.probe_batch_size, shuffle=False
         )
@@ -532,7 +544,10 @@ class SkillMemoryStrategy:
 # BENCHMARK HELPERS
 # ============================================================
 
-def evaluate_seen_experiences(strategy: SkillMemoryStrategy, test_stream, current_experience: int):
+
+def evaluate_seen_experiences(
+    strategy: SkillMemoryStrategy, test_stream, current_experience: int
+):
     accuracies = []
     for experience_index in range(current_experience + 1):
         accuracy = strategy.evaluate_experience(test_stream[experience_index])
