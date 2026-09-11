@@ -474,12 +474,18 @@ class SkillMemoryPlugin(SupervisedPlugin):
         # training experience index -> skill slot
         self._experience_to_skill: dict[int, int] = {}
 
+        # Avalanche evaluation experience identity -> skill slot.
+        self._evaluation_experience_to_skill: dict[int, int] = {}
+
         # Exact state of the model before evaluation started.
         self._pre_eval_state: dict | None = None
 
         # Evaluation routing is based on the original benchmark
         # experience index, not on the order in which hooks happen.
         self._eval_active = False
+
+        self._training_experience_count = 0
+        self._current_training_experience_index = None
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -665,6 +671,9 @@ class SkillMemoryPlugin(SupervisedPlugin):
             return
         self._task_active = True
 
+        self._current_training_experience_index = self._training_experience_count
+        self._training_experience_count += 1
+
         if self._initial_state is None:
             self._initial_state = {
                 key: value.detach().cpu().clone()
@@ -764,7 +773,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         if self._active_slot is None:
             raise RuntimeError("No active Skill Memory slot after training experience")
         slot = self._active_slot
-        experience_index = self._experience_index(experience)
+        experience_index = self._current_training_experience_index
         # Store the exact trained skill.
         self.memory.store(
             slot,
@@ -795,9 +804,15 @@ class SkillMemoryPlugin(SupervisedPlugin):
         if experience_index is not None:
             self._experience_to_skill[experience_index] = slot
 
+        evaluation_index = self._current_training_experience_index
+        if evaluation_index is not None:
+            self._evaluation_experience_to_skill[evaluation_index] = slot
+
         self._seen_experiences.append(_origin_experience(experience))
         self._active_slot = None
         self._task_active = False
+
+        self._log(f"Experience {experience_index} -> Skill {slot}")
 
     # ------------------------------------------------------------
     # EVALUATION HOOKS
@@ -839,7 +854,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 "current model."
             )
             return
-        slot = self._experience_to_skill.get(experience_index)
+        slot = self._evaluation_experience_to_skill.get(experience_index)
         if slot is None:
             self._log(
                 "No stored skill for evaluation "
