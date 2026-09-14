@@ -295,7 +295,7 @@ def _routing_scores(
         raise ValueError("routing inputs must contain the same number of skills")
 
     scores = []
-    for logits, state, owned_classes in zip(
+    for logits, _state, owned_classes in zip(
         raw_skill_logits, states, skill_classes, strict=False
     ):
         if not owned_classes:
@@ -371,4 +371,6 @@ def route_probe_logits(
     richer ``find_best_routing_skill`` API exposes routing probabilities and
     diagnostics.
     """
-    return find_best_routing_skill(raw_skill_logits, states, skill_classes).skill_indices
+    return find_best_routing_skill(
+        raw_skill_logits, states, skill_classes
+    ).skill_indices

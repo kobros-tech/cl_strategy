@@ -103,12 +103,8 @@ def test_single_skill_has_probability_one_and_zero_second_best():
 def test_temperature_changes_sharpness_not_winner():
     logits, states, classes = _inputs()
 
-    cold = mod.find_best_routing_skill(
-        logits, states, classes, temperature=0.5
-    )
-    hot = mod.find_best_routing_skill(
-        logits, states, classes, temperature=2.0
-    )
+    cold = mod.find_best_routing_skill(logits, states, classes, temperature=0.5)
+    hot = mod.find_best_routing_skill(logits, states, classes, temperature=2.0)
 
     assert cold.skill_indices.tolist() == hot.skill_indices.tolist()
     assert not torch.allclose(cold.probabilities, hot.probabilities)
