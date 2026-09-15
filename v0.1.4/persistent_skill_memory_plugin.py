@@ -31,6 +31,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self.behavior = BehaviorFingerprintCache()
         self._behavior_initialized = False
         self._pending_behavior_skills: set[int] = set()
+        self._pending_reference_inputs: dict[int, Tensor] = {}
         self.last_fingerprint_routes: list[dict] = []
 
     def _build_record(
@@ -59,6 +60,23 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             reference_summary=summary,
         )
 
+    def _capture_new_class_inputs(self, experience, experience_index: int) -> None:
+        """Keep probe inputs for newly introduced classes until final refresh."""
+        decisions = self.last_class_decisions.get(experience_index, {})
+        for class_id in decisions:
+            if class_id in self.behavior._records:
+                continue
+            if class_id in self._pending_reference_inputs:
+                continue
+            x, _ = probe_class(
+                experience,
+                class_id,
+                self.probe_batch_size,
+                self.probe_batches,
+                self.probe_seed,
+            )
+            self._pending_reference_inputs[class_id] = x.detach().cpu().clone()
+
     def _refresh_skill(self, strategy, skill_id: int, experience) -> None:
         """Refresh all class references for one current skill generation."""
         version = self.behavior.skill_version(skill_id)
@@ -73,13 +91,15 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         for class_id in classes:
             record = existing.get(class_id)
             if record is None:
-                x, _ = probe_class(
-                    experience,
-                    class_id,
-                    self.probe_batch_size,
-                    self.probe_batches,
-                    self.probe_seed,
-                )
+                x = self._pending_reference_inputs.get(class_id)
+                if x is None:
+                    x, _ = probe_class(
+                        experience,
+                        class_id,
+                        self.probe_batch_size,
+                        self.probe_batches,
+                        self.probe_seed,
+                    )
             else:
                 x = record.reference_inputs
 
@@ -101,27 +121,31 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 changed.add(int(skill_id))
         return changed
 
-    def before_training_exp(self, strategy, **kwargs) -> None:
-        super().before_training_exp(strategy, **kwargs)
-        if self._current_training_experience_index is None:
-            return
-        changed = self._collect_changed_skills(self._current_training_experience_index)
-        self._pending_behavior_skills.update(changed)
-
     def after_training_exp(self, strategy, **kwargs) -> None:
+        """Refresh changed skills once all sub-experiences are complete."""
         experience = strategy.experience
         experience_index = self._current_training_experience_index
         is_last = self._is_last_subexp(experience)
+
+        if experience_index is not None:
+            self._capture_new_class_inputs(experience, experience_index)
+
+        changed = (
+            self._collect_changed_skills(experience_index)
+            if is_last and experience_index is not None
+            else set()
+        )
 
         super().after_training_exp(strategy, **kwargs)
         if experience_index is None or not is_last:
             return
 
-        for skill_id in sorted(self._pending_behavior_skills):
+        for skill_id in sorted(changed):
             self.behavior.bump_skill(skill_id)
             self._refresh_skill(strategy, skill_id, experience)
 
         self._pending_behavior_skills.clear()
+        self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
 
     def _fingerprint_route(
