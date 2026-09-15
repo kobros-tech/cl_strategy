@@ -44,8 +44,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         model = deepcopy(strategy.model)
         logits = predict_logits(model, self.memory.state(skill_id), x)
         # Keep the complete current global classifier coordinate system. The
-        # head may grow later; probe_behavior_fingerprint handles the resulting
-        # width mismatch by zero-padding missing coordinates.
+        # head may grow later; probe_behavior_fingerprint aligns it by ID.
         output_class_ids = list(range(logits.shape[-1]))
         output, summary, output_class_ids = extract_reference_behavior(
             logits,
@@ -135,68 +134,104 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         x: Tensor,
         slot_ids: list[int],
     ) -> tuple[Tensor, Tensor, list[int]]:
-        """Match each probe sample to a class, then to its canonical skill."""
+        """Match each probe to a canonical class, then its skill."""
         probe_model = deepcopy(strategy.model)
         raw_logits = {
             slot: predict_logits(probe_model, self.memory.state(slot), x)
             for slot in slot_ids
         }
 
-        per_skill_scores: list[Tensor] = []
-        per_skill_classes: list[list[int]] = []
-        for slot in slot_ids:
-            records = self.behavior.records_for_skill(slot)
-            if not records:
-                per_skill_scores.append(
-                    torch.full((x.shape[0],), -1.0, device=x.device)
-                )
-                per_skill_classes.append([-1] * x.shape[0])
-                continue
+        # A class fingerprint is canonical: it belongs to the skill that
+        # learned that class, but matching is performed across every class.
+        # This allows a skill to master multiple classes and allows an
+        # anonymous probe to identify the class before resolving its skill.
+        records = [
+            record
+            for slot in slot_ids
+            for record in self.behavior.records_for_skill(slot)
+        ]
+        if not records:
+            self.last_fingerprint_routes = []
+            chosen = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            probabilities = torch.full(
+                (len(slot_ids), x.shape[0]),
+                1.0 / max(len(slot_ids), 1),
+                device=x.device,
+            )
+            return chosen, probabilities, [-1] * x.shape[0]
 
-            class_scores = []
-            for record in records:
+        class_scores: list[Tensor] = []
+        class_skills: list[int] = []
+        class_ids: list[int] = []
+        for record in records:
+            similarity_by_skill = []
+            for slot in slot_ids:
                 similarity, _ = probe_behavior_fingerprint(
                     raw_logits[slot],
                     record.output_class_ids,
                     record.reference_output,
                     record.reference_summary,
                 )
-                class_scores.append(similarity)
+                similarity_by_skill.append(similarity)
 
-            stacked = torch.stack(class_scores, dim=0)
-            best_scores, best_indices = stacked.max(dim=0)
-            classes = [records[i].class_id for i in best_indices.cpu().tolist()]
-            per_skill_scores.append(best_scores)
-            per_skill_classes.append(classes)
+            # A class can be evaluated under every available skill snapshot;
+            # retain the strongest behavior match for that canonical class.
+            best_for_class = torch.stack(similarity_by_skill, dim=0).max(dim=0).values
+            class_scores.append(best_for_class)
+            class_skills.append(record.skill_id)
+            class_ids.append(record.class_id)
 
-        scores = torch.stack(per_skill_scores, dim=0)
-        probabilities = torch.softmax(scores, dim=0)
-        chosen = probabilities.argmax(dim=0)
+        stacked = torch.stack(class_scores, dim=0)
+        best_class_scores, best_class_indices = stacked.max(dim=0)
         chosen_classes = [
-            per_skill_classes[int(skill_index)][sample_index]
-            for sample_index, skill_index in enumerate(chosen.cpu().tolist())
+            class_ids[index] for index in best_class_indices.cpu().tolist()
+        ]
+        chosen_skills = [
+            class_skills[index] for index in best_class_indices.cpu().tolist()
         ]
 
+        skill_scores = torch.full(
+            (len(slot_ids), x.shape[0]),
+            -1.0,
+            device=x.device,
+        )
+        slot_to_row = {slot: row for row, slot in enumerate(slot_ids)}
+        for record_index, record in enumerate(records):
+            row = slot_to_row.get(record.skill_id)
+            if row is None:
+                continue
+            skill_scores[row] = torch.maximum(
+                skill_scores[row], class_scores[record_index]
+            )
+
+        probabilities = torch.softmax(skill_scores, dim=0)
+        chosen = torch.tensor(
+            [slot_to_row[skill] for skill in chosen_skills],
+            dtype=torch.long,
+            device=x.device,
+        )
+
         self.last_fingerprint_routes = []
-        for sample_index, skill_index in enumerate(chosen.cpu().tolist()):
-            sample_scores = scores[:, sample_index]
+        for sample_index, skill in enumerate(chosen_skills):
+            sample_scores = skill_scores[:, sample_index]
             if sample_scores.numel() > 1:
                 top_scores = torch.topk(sample_scores, k=2).values
                 second_score = float(top_scores[1].item())
             else:
                 second_score = float("-inf")
-            best_score = float(sample_scores[skill_index].item())
+            row = slot_to_row[skill]
+            best_score = float(best_class_scores[sample_index].item())
             self.last_fingerprint_routes.append(
                 {
                     "sample_index": sample_index,
-                    "skill": int(slot_ids[skill_index]),
+                    "skill": int(skill),
                     "class": int(chosen_classes[sample_index]),
                     "score": best_score,
                     "second_score": second_score,
                     "gap": best_score - second_score,
                     "probabilities": {
-                        int(slot): float(probabilities[row, sample_index].item())
-                        for row, slot in enumerate(slot_ids)
+                        int(slot): float(probabilities[index, sample_index].item())
+                        for index, slot in enumerate(slot_ids)
                     },
                 }
             )
@@ -217,9 +252,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             slot_ids,
         )
 
-        # Compute the selected skill's logits from an isolated model. This
-        # prevents routing from leaving the strategy model on an arbitrary
-        # skill snapshot between minibatches.
         output_model = deepcopy(strategy.model)
         per_skill_logits = [
             predict_logits(output_model, self.memory.state(slot), x)
