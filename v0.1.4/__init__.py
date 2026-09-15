@@ -1,6 +1,12 @@
 """Class-level probe-based Skill Memory for Avalanche."""
 
-from .behavior import BehaviorFingerprintCache, ClassBehaviorRecord
+from .behavior import (
+    BehaviorFingerprintCache,
+    ClassBehaviorRecord,
+    compare_fingerprint_evolution,
+    fingerprint_similarity,
+    pairwise_reference_similarity,
+)
 from .decision import find_best_skill
 from .persistent_skill_memory_plugin import PersistentFingerprintSkillMemoryPlugin
 from .probing import RoutingResult, find_best_routing_skill
@@ -16,6 +22,9 @@ __all__ = [
     "SkillMemory",
     "SkillMemoryPlugin",
     "PersistentFingerprintSkillMemoryPlugin",
+    "compare_fingerprint_evolution",
+    "fingerprint_similarity",
+    "pairwise_reference_similarity",
     "find_best_routing_skill",
     "find_best_skill",
 ]
