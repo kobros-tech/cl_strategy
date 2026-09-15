@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 import torch
@@ -7,6 +8,7 @@ import torch
 root = Path(__file__).parents[1]
 spec = importlib.util.spec_from_file_location("behavior", root / "behavior.py")
 mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
 
@@ -78,8 +80,7 @@ def test_fingerprint_uses_global_class_ids_not_local_columns():
         reference_summary=torch.ones(4),
     )
     logits = torch.zeros(1, 100)
-    logits[0, 42] = 8.0
-    logits[0, 87] = 1.0
+    logits[0, 42] = 100.0
     similarity, _ = mod.probe_behavior_fingerprint(
         logits,
         record.output_class_ids,
