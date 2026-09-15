@@ -63,8 +63,11 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     def _capture_new_class_inputs(self, experience, experience_index: int) -> None:
         """Keep probe inputs for newly introduced classes until final refresh."""
         decisions = self.last_class_decisions.get(experience_index, {})
-        for class_id in decisions:
-            if class_id in self.behavior._records:
+        for class_id, item in decisions.items():
+            skill_id = item.get("skill")
+            if skill_id is None:
+                continue
+            if self.behavior.get(class_id, int(skill_id)) is not None:
                 continue
             if class_id in self._pending_reference_inputs:
                 continue
