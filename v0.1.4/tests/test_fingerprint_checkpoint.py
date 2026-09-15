@@ -8,7 +8,9 @@ ROOT = Path(__file__).parents[1]
 
 
 def _load_behavior():
-    spec = importlib.util.spec_from_file_location("checkpoint_behavior", ROOT / "behavior.py")
+    spec = importlib.util.spec_from_file_location(
+        "checkpoint_behavior", ROOT / "behavior.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
