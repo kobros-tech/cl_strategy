@@ -95,6 +95,20 @@ class BehaviorFingerprintCache:
             if self.get(record.class_id, int(skill_id)) is not None
         ]
 
+    def all_records_for_skill(self, skill_id: int) -> list[ClassBehaviorRecord]:
+        """Return current and invalidated records for one skill.
+
+        Invalidated records retain their reference inputs so a mutable skill
+        can recompute the same class fingerprints after its weights change,
+        including when a class came from an earlier Avalanche sub-experience.
+        """
+        skill_id = int(skill_id)
+        return [
+            record
+            for record in self._records.values()
+            if record.skill_id == skill_id
+        ]
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "skill_versions": dict(self._skill_versions),
