@@ -223,19 +223,21 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         self.last_fingerprint_routes = []
         for sample_index, skill in enumerate(chosen_skills):
-            sample_scores = skill_scores[:, sample_index]
-            if sample_scores.numel() > 1:
-                top_scores = torch.topk(sample_scores, k=2).values
+            sample_class_scores = stacked[:, sample_index]
+            if sample_class_scores.numel() > 1:
+                top_scores = torch.topk(sample_class_scores, k=2).values
                 second_score = float(top_scores[1].item())
             else:
                 second_score = 0.0
-            best_probability = float(probabilities[:, sample_index].max().item())
-            sorted_probabilities = torch.sort(
-                probabilities[:, sample_index], descending=True
+            sample_probabilities = probabilities[:, sample_index]
+            top_probabilities = torch.topk(
+                sample_probabilities,
+                k=min(2, sample_probabilities.numel()),
             ).values
+            best_probability = float(top_probabilities[0].item())
             second_probability = (
-                float(sorted_probabilities[1].item())
-                if sorted_probabilities.numel() > 1
+                float(top_probabilities[1].item())
+                if top_probabilities.numel() > 1
                 else 0.0
             )
             self.last_fingerprint_routes.append(
@@ -246,14 +248,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     "score": float(best_scores[sample_index].item()),
                     "second_score": second_score,
                     "gap": float(best_scores[sample_index].item())
-                    - float(
-                        torch.topk(
-                            stacked[:, sample_index],
-                            k=min(2, stacked.shape[0]),
-                        ).values[-1].item()
-                    )
-                    if stacked.shape[0] > 1
-                    else 0.0,
+                    - second_score,
                     "best_probability": best_probability,
                     "second_probability": second_probability,
                     "confidence_gap": best_probability - second_probability,
