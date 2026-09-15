@@ -96,12 +96,7 @@ class BehaviorFingerprintCache:
         ]
 
     def all_records_for_skill(self, skill_id: int) -> list[ClassBehaviorRecord]:
-        """Return current and invalidated records for one skill.
-
-        Invalidated records retain their reference inputs so a mutable skill
-        can recompute the same class fingerprints after its weights change,
-        including when a class came from an earlier Avalanche sub-experience.
-        """
+        """Return current and invalidated records for one skill."""
         skill_id = int(skill_id)
         return [
             record for record in self._records.values() if record.skill_id == skill_id
@@ -166,10 +161,6 @@ def extract_reference_behavior(
     if target_class not in valid:
         raise ValueError("target class is not represented by the reference output")
 
-    # Store the mean probability distribution rather than an averaged
-    # normalized-logit vector. A probability distribution preserves which
-    # global classifier columns the reference class activates and remains
-    # comparable across samples with different logit scales.
     output = torch.softmax(logits, dim=-1)[:, list(valid)].mean(dim=0).detach().cpu()
     summary = summarize_behavior(logits, list(valid)).detach().cpu()
     return output, summary, valid
@@ -181,13 +172,7 @@ def probe_behavior_fingerprint(
     reference_output: Tensor,
     reference_summary: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Return probability-fingerprint similarity for each probe sample.
-
-    ``output_class_ids`` are global classifier IDs, not positions into the
-    compact reference tensor. Reference and probe outputs may have different
-    classifier widths as the global head grows. Missing coordinates are
-    treated as zero, while shared global coordinates retain their identity.
-    """
+    """Return probability-fingerprint similarity for each probe sample."""
     reference_ids = tuple(int(c) for c in output_class_ids)
     if len(reference_ids) != reference_output.shape[-1]:
         raise ValueError("reference class IDs do not match reference output width")
@@ -200,23 +185,17 @@ def probe_behavior_fingerprint(
     reference_index = {class_id: i for i, class_id in enumerate(reference_ids)}
 
     reference = torch.zeros(
-        len(union_ids),
-        device=logits.device,
-        dtype=logits.dtype,
+        len(union_ids), device=logits.device, dtype=logits.dtype
     )
     for position, class_id in enumerate(union_ids):
         reference_position = reference_index.get(class_id)
         if reference_position is not None:
             reference[position] = reference_output[reference_position].to(
-                device=logits.device,
-                dtype=logits.dtype,
+                device=logits.device, dtype=logits.dtype
             )
 
     current = torch.zeros(
-        logits.shape[0],
-        len(union_ids),
-        device=logits.device,
-        dtype=logits.dtype,
+        logits.shape[0], len(union_ids), device=logits.device, dtype=logits.dtype
     )
     current_positions = {
         class_id: position for position, class_id in enumerate(union_ids)
@@ -228,16 +207,13 @@ def probe_behavior_fingerprint(
     current = _normalize(current)
     reference = _normalize(reference.unsqueeze(0)).squeeze(0)
     output_similarity = torch.nn.functional.cosine_similarity(
-        current,
-        reference.unsqueeze(0),
-        dim=-1,
+        current, reference.unsqueeze(0), dim=-1
     )
 
     summary_ids = [c for c in reference_ids if 0 <= c < logits.shape[-1]]
     summary = summarize_behavior(logits, summary_ids)
     reference_summary = reference_summary.to(
-        device=logits.device,
-        dtype=logits.dtype,
+        device=logits.device, dtype=logits.dtype
     )
     summary_similarity = torch.nn.functional.cosine_similarity(
         summary.unsqueeze(0), reference_summary.unsqueeze(0), dim=-1
@@ -245,3 +221,82 @@ def probe_behavior_fingerprint(
 
     similarity = 0.8 * output_similarity + 0.2 * summary_similarity
     return similarity, summary
+
+
+def fingerprint_similarity(
+    left: ClassBehaviorRecord,
+    right: ClassBehaviorRecord,
+) -> float:
+    """Measure cosine similarity between two stored class fingerprints.
+
+    The comparison is based only on persistent reference behavior. It does not
+    run a probe sample and therefore cannot establish anonymous routing by
+    itself; it is a diagnostic for fingerprint separation and evolution.
+    """
+    left_index = {class_id: i for i, class_id in enumerate(left.output_class_ids)}
+    right_index = {class_id: i for i, class_id in enumerate(right.output_class_ids)}
+    union_ids = sorted(set(left_index).union(right_index))
+    if not union_ids:
+        return 0.0
+
+    left_vector = left.reference_output.new_zeros(len(union_ids))
+    right_vector = right.reference_output.new_zeros(len(union_ids))
+    for position, class_id in enumerate(union_ids):
+        left_position = left_index.get(class_id)
+        right_position = right_index.get(class_id)
+        if left_position is not None:
+            left_vector[position] = left.reference_output[left_position]
+        if right_position is not None:
+            right_vector[position] = right.reference_output[right_position]
+
+    similarity = torch.nn.functional.cosine_similarity(
+        left_vector.unsqueeze(0), right_vector.unsqueeze(0), dim=-1
+    )
+    return float(similarity.item())
+
+
+def pairwise_reference_similarity(
+    records: list[ClassBehaviorRecord],
+) -> dict[tuple[int, int], float]:
+    """Return pairwise stored-fingerprint similarity for diagnostic analysis.
+
+    This measures reference separation only. It must not be interpreted as
+    proof that anonymous samples will route correctly, because it does not
+    evaluate a sample through the competing skill snapshots.
+    """
+    result: dict[tuple[int, int], float] = {}
+    ordered = sorted(records, key=lambda record: record.class_id)
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1 :]:
+            result[(left.class_id, right.class_id)] = fingerprint_similarity(
+                left, right
+            )
+    return result
+
+
+def compare_fingerprint_evolution(
+    before: dict[int, ClassBehaviorRecord],
+    after: dict[int, ClassBehaviorRecord],
+) -> dict[int, dict[str, float | str]]:
+    """Compare persistent fingerprints before and after a training event.
+
+    Existing classes receive cosine similarity and drift (`1 - similarity`).
+    Newly created classes are reported as ``status='new'``. This intentionally
+    uses the same fixed reference inputs across generations, so measured drift
+    reflects model-behavior change rather than probe-sample changes.
+    """
+    result: dict[int, dict[str, float | str]] = {}
+    for class_id, record in sorted(after.items()):
+        previous = before.get(class_id)
+        if previous is None:
+            result[class_id] = {"status": "new"}
+            continue
+        similarity = fingerprint_similarity(previous, record)
+        result[class_id] = {
+            "status": "updated",
+            "similarity": similarity,
+            "drift": 1.0 - similarity,
+        }
+    for class_id in sorted(set(before).difference(after)):
+        result[class_id] = {"status": "removed"}
+    return result
