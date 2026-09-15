@@ -129,4 +129,11 @@ def test_fingerprint_route_records_reconstructable_per_sample_decisions():
         assert item["sample_index"] in (0, 1)
         assert item["score"] >= item["second_score"]
         assert item["gap"] >= 0.0
+        assert item["best_probability"] >= item["second_probability"]
+        assert item["confidence_gap"] >= 0.0
         assert set(item["probabilities"]) == {0, 1}
+        assert sum(item["probabilities"].values()) == torch.tensor(
+            1.0
+        ).item()
+        assert item["best_probability"] == max(item["probabilities"].values())
+        assert item["second_probability"] == min(item["probabilities"].values())
