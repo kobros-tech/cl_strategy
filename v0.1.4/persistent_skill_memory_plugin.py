@@ -43,10 +43,13 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     ) -> ClassBehaviorRecord:
         model = deepcopy(strategy.model)
         logits = predict_logits(model, self.memory.state(skill_id), x)
-        skill_classes = sorted(self.class_map.classes_for_skill(skill_id))
+        # Keep the complete current global classifier coordinate system. The
+        # head may grow later; probe_behavior_fingerprint handles the resulting
+        # width mismatch by zero-padding missing coordinates.
+        output_class_ids = list(range(logits.shape[-1]))
         output, summary, output_class_ids = extract_reference_behavior(
             logits,
-            skill_classes,
+            output_class_ids,
             class_id,
         )
         return ClassBehaviorRecord(
