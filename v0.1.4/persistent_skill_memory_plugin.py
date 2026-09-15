@@ -194,12 +194,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         stacked = torch.stack(class_scores, dim=0)
         best_scores, best_indices = stacked.max(dim=0)
-        chosen_classes = [
-            class_ids[index] for index in best_indices.cpu().tolist()
-        ]
-        chosen_skills = [
-            class_skills[index] for index in best_indices.cpu().tolist()
-        ]
+        chosen_classes = [class_ids[index] for index in best_indices.cpu().tolist()]
+        chosen_skills = [class_skills[index] for index in best_indices.cpu().tolist()]
 
         # Fingerprint similarity is a signed similarity score, not a
         # probability. Convert it to bounded routing evidence first, then use
@@ -208,7 +204,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             (len(slot_ids), x.shape[0]),
             device=x.device,
         )
-        for score, skill in zip(class_scores, class_skills):
+        for score, skill in zip(class_scores, class_skills, strict=False):
             evidence = ((score + 1.0) / 2.0).clamp(0.0, 1.0)
             skill_scores[slot_to_row[skill]] = torch.maximum(
                 skill_scores[slot_to_row[skill]], evidence
@@ -247,8 +243,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     "class": int(chosen_classes[sample_index]),
                     "score": float(best_scores[sample_index].item()),
                     "second_score": second_score,
-                    "gap": float(best_scores[sample_index].item())
-                    - second_score,
+                    "gap": float(best_scores[sample_index].item()) - second_score,
                     "best_probability": best_probability,
                     "second_probability": second_probability,
                     "confidence_gap": best_probability - second_probability,

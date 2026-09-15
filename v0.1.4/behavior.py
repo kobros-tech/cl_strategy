@@ -35,7 +35,7 @@ class ClassBehaviorRecord:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> "ClassBehaviorRecord":
+    def from_state_dict(cls, state: dict[str, Any]) -> ClassBehaviorRecord:
         return cls(
             class_id=int(state["class_id"]),
             skill_id=int(state["skill_id"]),
@@ -104,17 +104,13 @@ class BehaviorFingerprintCache:
         """
         skill_id = int(skill_id)
         return [
-            record
-            for record in self._records.values()
-            if record.skill_id == skill_id
+            record for record in self._records.values() if record.skill_id == skill_id
         ]
 
     def state_dict(self) -> dict[str, Any]:
         return {
             "skill_versions": dict(self._skill_versions),
-            "records": [
-                record.state_dict() for record in self._records.values()
-            ],
+            "records": [record.state_dict() for record in self._records.values()],
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:

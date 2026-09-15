@@ -4,7 +4,6 @@ from pathlib import Path
 
 import torch
 
-
 root = Path(__file__).parents[1]
 spec = importlib.util.spec_from_file_location("behavior", root / "behavior.py")
 mod = importlib.util.module_from_spec(spec)

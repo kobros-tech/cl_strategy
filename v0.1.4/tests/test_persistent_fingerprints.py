@@ -12,9 +12,7 @@ def _load_plugin():
     avalanche = types.ModuleType("avalanche")
     training = types.ModuleType("avalanche.training")
     plugins = types.ModuleType("avalanche.training.plugins")
-    strategy_plugin = types.ModuleType(
-        "avalanche.training.plugins.strategy_plugin"
-    )
+    strategy_plugin = types.ModuleType("avalanche.training.plugins.strategy_plugin")
 
     class SupervisedPlugin:
         pass
@@ -103,9 +101,7 @@ def test_refresh_collects_decisions_after_training_hook():
     mod = _load_plugin()
     plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
     plugin._current_training_experience_index = 0
-    plugin.last_class_decisions = {
-        0: {7: {"decision": plugin.SCRATCH, "skill": 2}}
-    }
+    plugin.last_class_decisions = {0: {7: {"decision": plugin.SCRATCH, "skill": 2}}}
     plugin.class_map.record(
         sys.modules["persistent_test_package.skill_registry"].ClassRecord(
             experience_index=0,
@@ -135,9 +131,7 @@ def test_new_class_reference_inputs_survive_multiple_subexperiences():
     mod = _load_plugin()
     plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
     plugin._current_training_experience_index = 0
-    plugin.last_class_decisions = {
-        0: {7: {"decision": plugin.SCRATCH, "skill": 2}}
-    }
+    plugin.last_class_decisions = {0: {7: {"decision": plugin.SCRATCH, "skill": 2}}}
 
     captured = torch.tensor([[7.0, 8.0]])
     mod.probe_class = lambda *args: (captured, torch.tensor([7]))
@@ -183,15 +177,11 @@ def test_multiclass_skill_routing_matches_persistent_class_behavior():
         for value in x[:, 0].tolist():
             if slot == 0 and value < 2:
                 rows.append(
-                    [8.0, 0.0, 0.0, 0.0]
-                    if value == 0
-                    else [0.0, 8.0, 0.0, 0.0]
+                    [8.0, 0.0, 0.0, 0.0] if value == 0 else [0.0, 8.0, 0.0, 0.0]
                 )
             elif slot == 1:
                 rows.append(
-                    [0.0, 0.0, 8.0, 0.0]
-                    if value == 2
-                    else [0.0, 0.0, 0.0, 8.0]
+                    [0.0, 0.0, 8.0, 0.0] if value == 2 else [0.0, 0.0, 0.0, 8.0]
                 )
             else:
                 rows.append([0.0, 0.0, 0.0, 0.0])

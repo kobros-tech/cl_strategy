@@ -12,9 +12,7 @@ def _load_plugin():
     avalanche = types.ModuleType("avalanche")
     training = types.ModuleType("avalanche.training")
     plugins = types.ModuleType("avalanche.training.plugins")
-    strategy_plugin = types.ModuleType(
-        "avalanche.training.plugins.strategy_plugin"
-    )
+    strategy_plugin = types.ModuleType("avalanche.training.plugins.strategy_plugin")
 
     class SupervisedPlugin:
         pass
