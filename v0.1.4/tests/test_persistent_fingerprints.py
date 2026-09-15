@@ -99,6 +99,53 @@ def test_changed_skill_collection_respects_mutability():
     assert plugin._collect_changed_skills(0) == {3}
 
 
+def test_refresh_collects_decisions_after_training_hook():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
+    plugin._current_training_experience_index = 0
+    plugin.last_class_decisions = {
+        0: {7: {"decision": plugin.SCRATCH, "skill": 2}}
+    }
+    plugin.class_map.record(
+        sys.modules["persistent_test_package.skill_registry"].ClassRecord(
+            experience_index=0,
+            class_id=7,
+            decision=plugin.SCRATCH,
+            skill=2,
+        )
+    )
+
+    refreshed = []
+    plugin._capture_new_class_inputs = lambda *args: None
+    plugin._refresh_skill = lambda strategy, skill_id, experience: refreshed.append(
+        skill_id
+    )
+    plugin._is_last_subexp = lambda experience: True
+    mod.SkillMemoryPlugin.after_training_exp = lambda self, strategy, **kwargs: None
+
+    experience = types.SimpleNamespace()
+    strategy = types.SimpleNamespace(experience=experience)
+    plugin.after_training_exp(strategy)
+
+    assert refreshed == [2]
+    assert plugin.behavior.skill_version(2) == 1
+
+
+def test_new_class_reference_inputs_survive_multiple_subexperiences():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
+    plugin._current_training_experience_index = 0
+    plugin.last_class_decisions = {
+        0: {7: {"decision": plugin.SCRATCH, "skill": 2}}
+    }
+
+    captured = torch.tensor([[7.0, 8.0]])
+    mod.probe_class = lambda *args: (captured, torch.tensor([7]))
+    plugin._capture_new_class_inputs(types.SimpleNamespace(), 0)
+
+    assert torch.equal(plugin._pending_reference_inputs[7], captured)
+
+
 def test_multiclass_skill_routing_matches_persistent_class_behavior():
     mod = _load_plugin()
     plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
