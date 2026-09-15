@@ -10,7 +10,9 @@ from torch import Tensor
 from .behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
+    compare_fingerprint_evolution,
     extract_reference_behavior,
+    pairwise_reference_similarity,
     probe_behavior_fingerprint,
 )
 from .probing import _normalize_routing_scores, predict_logits, probe_class
@@ -18,19 +20,14 @@ from .skill_memory_plugin import SkillMemoryPlugin
 
 
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
-    """Skill Memory with persistent anonymous class-behavior routing.
-
-    Reference behavior is generated after training and reused during every
-    evaluation pass. Mutable REUSE changes create a new skill generation and
-    refresh every class mastered by that skill. SCRATCH creates references for
-    the new skill. Unchanged skills keep their existing references.
-    """
+    """Skill Memory with persistent anonymous class-behavior routing."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
         self._behavior_initialized = False
         self._pending_reference_inputs: dict[int, Tensor] = {}
+        self._pre_training_fingerprints: dict[int, ClassBehaviorRecord] = {}
         self.last_fingerprint_routes: list[dict] = []
 
     def _build_record(
@@ -58,6 +55,66 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             reference_output=output,
             reference_summary=summary,
         )
+
+    def _snapshot_fingerprints(self) -> dict[int, ClassBehaviorRecord]:
+        state = self.behavior.state_dict()
+        return {
+            int(item["class_id"]): ClassBehaviorRecord.from_state_dict(item)
+            for item in state.get("records", [])
+            if item.get("valid", True)
+        }
+
+    def _log_fingerprint_diagnostics(
+        self,
+        experience_index: int,
+        before: dict[int, ClassBehaviorRecord],
+    ) -> None:
+        after = self._snapshot_fingerprints()
+        evolution = compare_fingerprint_evolution(before, after)
+        new_classes = [
+            class_id
+            for class_id, item in evolution.items()
+            if item["status"] == "new"
+        ]
+        updated = [
+            (class_id, item)
+            for class_id, item in evolution.items()
+            if item["status"] == "updated"
+        ]
+
+        self._log(
+            f"[FINGERPRINT evolution] experience={experience_index} "
+            f"new={new_classes} updated={len(updated)}"
+        )
+        for class_id in new_classes:
+            record = after[class_id]
+            values = record.reference_output.detach().cpu()
+            top_k = min(5, values.numel())
+            top_values, top_indices = torch.topk(values, k=top_k)
+            top = [
+                (record.output_class_ids[int(index)], round(float(value), 4))
+                for value, index in zip(top_values, top_indices, strict=False)
+            ]
+            self._log(
+                f"[FINGERPRINT new] class={class_id} skill={record.skill_id} "
+                f"version={record.version} width={values.numel()} top={top}"
+            )
+
+        for class_id, item in updated:
+            self._log(
+                f"[FINGERPRINT drift] class={class_id} "
+                f"similarity={item['similarity']:.6f} "
+                f"drift={item['drift']:.6f}"
+            )
+
+        pairwise = pairwise_reference_similarity(list(after.values()))
+        if pairwise:
+            similarities = list(pairwise.values())
+            self._log(
+                f"[FINGERPRINT separation] pairs={len(pairwise)} "
+                f"mean={sum(similarities) / len(similarities):.6f} "
+                f"max={max(similarities):.6f}"
+            )
 
     def _capture_new_class_inputs(self, experience, experience_index: int) -> None:
         """Keep probe inputs for newly introduced classes until final refresh."""
@@ -123,8 +180,14 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 changed.add(int(skill_id))
         return changed
 
+    def before_training_exp(self, strategy, **kwargs) -> None:
+        experience = strategy.experience
+        if self._is_first_subexp(experience):
+            self._pre_training_fingerprints = self._snapshot_fingerprints()
+        super().before_training_exp(strategy, **kwargs)
+
     def after_training_exp(self, strategy, **kwargs) -> None:
-        """Refresh changed skills once all sub-experiences are complete."""
+        """Refresh changed skills and measure fingerprint evolution."""
         experience = strategy.experience
         experience_index = self._current_training_experience_index
         is_last = self._is_last_subexp(experience)
@@ -148,6 +211,11 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
+        self._log_fingerprint_diagnostics(
+            experience_index,
+            self._pre_training_fingerprints,
+        )
+        self._pre_training_fingerprints = {}
 
     def _fingerprint_route(
         self,
@@ -197,12 +265,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         chosen_classes = [class_ids[index] for index in best_indices.cpu().tolist()]
         chosen_skills = [class_skills[index] for index in best_indices.cpu().tolist()]
 
-        # Fingerprint similarity is a signed similarity score, not a
-        # probability. Convert it to bounded routing evidence first, then use
-        # the same normalization contract as input-only skill routing.
         skill_scores = torch.zeros(
-            (len(slot_ids), x.shape[0]),
-            device=x.device,
+            (len(slot_ids), x.shape[0]), device=x.device
         )
         for score, skill in zip(class_scores, class_skills, strict=False):
             evidence = ((score + 1.0) / 2.0).clamp(0.0, 1.0)
@@ -265,9 +329,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         x = strategy.mbatch[0]
         slot_ids = sorted(self.memory.slots())
         chosen, probabilities, class_matches = self._fingerprint_route(
-            strategy,
-            x,
-            slot_ids,
+            strategy, x, slot_ids
         )
 
         output_model = deepcopy(strategy.model)
