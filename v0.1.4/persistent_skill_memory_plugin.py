@@ -296,7 +296,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         best = probabilities.max(dim=0).values
         self._log(
             "[FINGERPRINT routing] samples="
-            f"{x.shape[0]} mean_similarity={best.mean().item():.4f} "
+            f"{x.shape[0]} mean_probability={best.mean().item():.4f} "
             f"matched_classes={class_matches[:5]}"
         )
 
