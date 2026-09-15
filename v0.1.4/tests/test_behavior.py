@@ -1,10 +1,17 @@
+import importlib.util
+from pathlib import Path
+
 import torch
 
-from behavior import BehaviorFingerprintCache, ClassBehaviorRecord
+
+root = Path(__file__).parents[1]
+spec = importlib.util.spec_from_file_location("behavior", root / "behavior.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
 
 
 def _record(class_id=1, skill_id=2, version=0):
-    return ClassBehaviorRecord(
+    return mod.ClassBehaviorRecord(
         class_id=class_id,
         skill_id=skill_id,
         version=version,
@@ -16,7 +23,7 @@ def _record(class_id=1, skill_id=2, version=0):
 
 
 def test_fingerprint_is_reused_until_skill_changes():
-    cache = BehaviorFingerprintCache()
+    cache = mod.BehaviorFingerprintCache()
     cache.put(_record())
 
     assert cache.get(1, 2) is not None
@@ -27,7 +34,7 @@ def test_fingerprint_is_reused_until_skill_changes():
 
 
 def test_bump_invalidates_every_class_of_skill():
-    cache = BehaviorFingerprintCache()
+    cache = mod.BehaviorFingerprintCache()
     cache.put(_record(class_id=1))
     cache.put(_record(class_id=3))
     cache.put(_record(class_id=4, skill_id=7))
@@ -40,10 +47,10 @@ def test_bump_invalidates_every_class_of_skill():
 
 
 def test_state_roundtrip_preserves_valid_behavior():
-    cache = BehaviorFingerprintCache()
+    cache = mod.BehaviorFingerprintCache()
     cache.put(_record())
 
-    restored = BehaviorFingerprintCache()
+    restored = mod.BehaviorFingerprintCache()
     restored.load_state_dict(cache.state_dict())
 
     record = restored.get(1, 2)
