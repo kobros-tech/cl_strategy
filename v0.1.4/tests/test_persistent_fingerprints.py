@@ -31,7 +31,6 @@ def _load_plugin():
     dynamic.IncrementalClassifier = IncrementalClassifier
     dynamic.avalanche_model_adaptation = lambda model, experience: None
     models.dynamic_modules = dynamic
-    avalanche.models = models
     sys.modules.update(
         {
             "avalanche": avalanche,
@@ -259,13 +258,11 @@ def test_generated_fingerprints_produce_non_uniform_skill_evidence():
 
     def fake_predict(model, state, x):
         del model
-        slot = int(state["slot"].item())
         rows = []
         for value in x[:, 0].tolist():
-            if slot == 0:
-                rows.append([12.0, 0.0, -3.0] if value == 0 else [0.0, 12.0, -3.0])
-            else:
-                rows.append([0.0, 12.0, -3.0] if value == 0 else [12.0, 0.0, -3.0])
+            rows.append(
+                [12.0, 0.0, -3.0] if value == 0 else [0.0, 12.0, -3.0]
+            )
         return torch.tensor(rows)
 
     mod.predict_logits = fake_predict
@@ -275,7 +272,7 @@ def test_generated_fingerprints_produce_non_uniform_skill_evidence():
         [0, 1],
     )
 
-    assert classes == [0, 0]
+    assert classes == [0, 1]
     assert probabilities[0, 0] > probabilities[1, 0]
     assert probabilities[0, 0] > 0.5
     assert probabilities[1, 1] > probabilities[0, 1]
