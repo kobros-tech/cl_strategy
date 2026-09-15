@@ -177,19 +177,65 @@ def probe_behavior_fingerprint(
     reference_output: Tensor,
     reference_summary: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Return output/summary similarity for each probe sample."""
-    valid = [c for c in output_class_ids if 0 <= c < logits.shape[-1]]
-    if not valid:
+    """Return output/summary similarity for each probe sample.
+
+    Reference and probe outputs may have different classifier widths as the
+    global head grows. Missing class coordinates are treated as zero, so a
+    newly learned class can still distinguish a probe from an older class
+    fingerprint instead of being silently discarded.
+    """
+    reference_ids = tuple(int(c) for c in output_class_ids)
+    valid_reference = [
+        c for c in reference_ids if 0 <= c < reference_output.shape[-1]
+    ]
+    if not valid_reference:
         empty = torch.full((logits.shape[0],), -1.0, device=logits.device)
         return empty, torch.zeros(4, device=logits.device)
 
-    current = _normalize(logits[:, valid])
-    reference = reference_output.to(device=logits.device, dtype=logits.dtype)
+    current_ids = tuple(range(logits.shape[-1]))
+    union_ids = tuple(sorted(set(reference_ids).union(current_ids)))
+    reference_index = {class_id: i for i, class_id in enumerate(reference_ids)}
+
+    reference = torch.zeros(
+        len(union_ids),
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    reference_positions = [
+        (position, reference_index[class_id])
+        for position, class_id in enumerate(union_ids)
+        if class_id in reference_index
+    ]
+    for position, reference_position in reference_positions:
+        reference[position] = reference_output[reference_position].to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+
+    current = torch.zeros(
+        logits.shape[0],
+        len(union_ids),
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    current_positions = {
+        class_id: position for position, class_id in enumerate(union_ids)
+    }
+    current_columns = [
+        current_positions[class_id] for class_id in current_ids
+    ]
+    current[:, current_columns] = logits
+
+    current = _normalize(current)
+    reference = _normalize(reference.unsqueeze(0)).squeeze(0)
     output_similarity = torch.nn.functional.cosine_similarity(
-        current, reference.unsqueeze(0), dim=-1
+        current,
+        reference.unsqueeze(0),
+        dim=-1,
     )
 
-    summary = summarize_behavior(logits, valid)
+    summary_ids = [c for c in reference_ids if 0 <= c < logits.shape[-1]]
+    summary = summarize_behavior(logits, summary_ids)
     reference_summary = reference_summary.to(
         device=logits.device,
         dtype=logits.dtype,
@@ -198,7 +244,5 @@ def probe_behavior_fingerprint(
         summary.unsqueeze(0), reference_summary.unsqueeze(0), dim=-1
     )
 
-    # Class-aligned output is the primary signal. The compact summary is
-    # additive and helps distinguish behavior when output vectors are close.
     similarity = 0.8 * output_similarity + 0.2 * summary_similarity
     return similarity, summary
