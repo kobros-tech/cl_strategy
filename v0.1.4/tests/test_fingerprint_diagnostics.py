@@ -111,10 +111,8 @@ def test_fingerprint_route_records_reconstructable_per_sample_decisions():
         logits = torch.zeros(x.shape[0], 21)
         if slot == 0:
             logits[0, 10] = 9.0
-            logits[1, 10] = 8.0
         else:
-            logits[0, 20] = 9.0
-            logits[1, 20] = 8.0
+            logits[1, 20] = 9.0
         return logits
 
     mod.predict_logits = fake_predict
