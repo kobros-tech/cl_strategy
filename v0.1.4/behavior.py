@@ -98,7 +98,9 @@ class BehaviorFingerprintCache:
     def state_dict(self) -> dict[str, Any]:
         return {
             "skill_versions": dict(self._skill_versions),
-            "records": [record.state_dict() for record in self._records.values()],
+            "records": [
+                record.state_dict() for record in self._records.values()
+            ],
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -129,7 +131,12 @@ def summarize_behavior(logits: Tensor, owned_classes: list[int]) -> Tensor:
     top2 = torch.topk(owned, k=min(2, owned.shape[-1]), dim=-1).values
     margin = top2[:, 0] - (top2[:, 1] if top2.shape[-1] > 1 else 0.0)
     summary = torch.stack(
-        [owned.mean(dim=-1), owned.std(dim=-1, unbiased=False), top2[:, 0], margin],
+        [
+            owned.mean(dim=-1),
+            owned.std(dim=-1, unbiased=False),
+            top2[:, 0],
+            margin,
+        ],
         dim=-1,
     ).mean(dim=0)
     return _normalize(summary.unsqueeze(0)).squeeze(0)
@@ -156,7 +163,7 @@ def probe_behavior_fingerprint(
     reference_output: Tensor,
     reference_summary: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Return output/summarized behavior similarity for each probe sample."""
+    """Return output/summary similarity for each probe sample."""
     valid = [c for c in output_class_ids if 0 <= c < logits.shape[-1]]
     if not valid:
         empty = torch.full((logits.shape[0],), -1.0, device=logits.device)
@@ -170,13 +177,14 @@ def probe_behavior_fingerprint(
 
     summary = summarize_behavior(logits, valid)
     reference_summary = reference_summary.to(
-        device=logits.device, dtype=logits.dtype
+        device=logits.device,
+        dtype=logits.dtype,
     )
     summary_similarity = torch.nn.functional.cosine_similarity(
         summary.unsqueeze(0), reference_summary.unsqueeze(0), dim=-1
     )
 
-    # The class-aligned output is the primary signal. The compact summary is
+    # Class-aligned output is the primary signal. The compact summary is
     # additive and helps distinguish behavior when output vectors are close.
     similarity = 0.8 * output_similarity + 0.2 * summary_similarity
     return similarity, summary
