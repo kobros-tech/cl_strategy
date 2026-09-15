@@ -6,7 +6,8 @@ This branch implements persistent class-behavior references on top of
 ## Lifecycle
 
 - Each canonical class gets a `ClassBehaviorRecord` containing reference
-  inputs, global class IDs, normalized reference behavior, and a skill version.
+  inputs, global class IDs, a persistent probability-distribution fingerprint,
+  and a skill version.
 - References are computed after training and reused across evaluation passes.
 - A mutable `REUSE` update creates a new generation for that skill and refreshes
   all classes mastered by that skill, because one shared state change can alter
@@ -31,8 +32,14 @@ For each unlabeled sample it:
 The router never needs a task ID, experience ID, or target label. Labels are
 only suitable for separate diagnostic evaluation such as routing accuracy.
 
-The primary fingerprint signal is cosine similarity of class-aligned normalized
-outputs. A normalized four-value behavior summary is an additional signal.
+The primary fingerprint signal is cosine similarity between class-aligned
+mean softmax probability distributions. This preserves global classifier
+columns and is invariant to arbitrary logit scale. A normalized four-value
+behavior summary is an additional signal.
+
+The tests explicitly verify that fingerprints generated from distinct class
+reference logits rank their source class above an unrelated class and that
+clear matches produce non-uniform skill-routing evidence.
 
 ## Growing heads
 
