@@ -1,13 +1,4 @@
-"""Persistent, class-level behavioral fingerprints for probe routing.
-
-The cache stores reference behavior produced by a canonical skill.  Evaluation
-only computes the small probe-side fingerprint and compares it with these
-persistent references; reference behavior is not recomputed on every eval.
-
-Fingerprints are represented by class-aligned logits rather than a fixed
-output-column tensor.  This keeps them compatible with Avalanche's growing
-global classifier head.
-"""
+"""Persistent class-behavior fingerprints for anonymous probe routing."""
 
 from __future__ import annotations
 
@@ -58,7 +49,7 @@ class ClassBehaviorRecord:
 
 
 class BehaviorFingerprintCache:
-    """Version-aware persistent class behavior cache."""
+    """Version-aware persistent cache of class behavior references."""
 
     def __init__(self) -> None:
         self._records: dict[int, ClassBehaviorRecord] = {}
@@ -68,23 +59,23 @@ class BehaviorFingerprintCache:
         return self._skill_versions.get(int(skill_id), 0)
 
     def bump_skill(self, skill_id: int) -> int:
+        """Start a new reference generation for one mutable skill."""
         skill_id = int(skill_id)
-        version = self._skill_versions.get(skill_id, 0) + 1
+        version = self.skill_version(skill_id) + 1
         self._skill_versions[skill_id] = version
-        for record in self._records.values():
-            if record.skill_id == skill_id:
-                record.valid = False
+        self.invalidate_skill(skill_id)
         return version
 
     def invalidate_skill(self, skill_id: int) -> None:
+        skill_id = int(skill_id)
         for record in self._records.values():
-            if record.skill_id == int(skill_id):
+            if record.skill_id == skill_id:
                 record.valid = False
 
     def put(self, record: ClassBehaviorRecord) -> None:
         self._records[record.class_id] = record
         self._skill_versions[record.skill_id] = max(
-            self._skill_versions.get(record.skill_id, 0), record.version
+            self.skill_version(record.skill_id), record.version
         )
 
     def get(self, class_id: int, skill_id: int) -> ClassBehaviorRecord | None:
@@ -101,7 +92,7 @@ class BehaviorFingerprintCache:
         return [
             record
             for record in self._records.values()
-            if record.skill_id == int(skill_id) and self.get(record.class_id, skill_id)
+            if self.get(record.class_id, int(skill_id)) is not None
         ]
 
     def state_dict(self) -> dict[str, Any]:
@@ -112,7 +103,8 @@ class BehaviorFingerprintCache:
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self._skill_versions = {
-            int(key): int(value) for key, value in state.get("skill_versions", {}).items()
+            int(key): int(value)
+            for key, value in state.get("skill_versions", {}).items()
         }
         self._records = {}
         for record_state in state.get("records", []):
@@ -125,19 +117,22 @@ def _normalize(values: Tensor) -> Tensor:
 
 
 def summarize_behavior(logits: Tensor, owned_classes: list[int]) -> Tensor:
-    """Return compact scale-independent behavior statistics."""
+    """Return a compact, scale-normalized behavior summary."""
     if not owned_classes:
         return torch.zeros(4, dtype=logits.dtype, device=logits.device)
+
     valid = [c for c in owned_classes if 0 <= c < logits.shape[-1]]
     if not valid:
         return torch.zeros(4, dtype=logits.dtype, device=logits.device)
+
     owned = logits[:, valid]
     top2 = torch.topk(owned, k=min(2, owned.shape[-1]), dim=-1).values
     margin = top2[:, 0] - (top2[:, 1] if top2.shape[-1] > 1 else 0.0)
-    return torch.stack(
+    summary = torch.stack(
         [owned.mean(dim=-1), owned.std(dim=-1, unbiased=False), top2[:, 0], margin],
         dim=-1,
     ).mean(dim=0)
+    return _normalize(summary.unsqueeze(0)).squeeze(0)
 
 
 def extract_reference_behavior(
@@ -145,13 +140,13 @@ def extract_reference_behavior(
     class_ids: list[int],
     target_class: int,
 ) -> tuple[Tensor, Tensor, tuple[int, ...]]:
-    """Extract class-aligned output and summary fingerprint from references."""
+    """Extract class-aligned output and summary from reference samples."""
     valid = tuple(sorted({c for c in class_ids if 0 <= c < logits.shape[-1]}))
-    if not valid:
-        raise ValueError("no valid classifier classes available for fingerprint")
+    if target_class not in valid:
+        raise ValueError("target class is not represented by the reference output")
+
     output = _normalize(logits[:, list(valid)]).mean(dim=0).detach().cpu()
     summary = summarize_behavior(logits, list(valid)).detach().cpu()
-    del target_class
     return output, summary, valid
 
 
@@ -161,16 +156,27 @@ def probe_behavior_fingerprint(
     reference_output: Tensor,
     reference_summary: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Compare one probe batch against one persistent class fingerprint."""
+    """Return output/summarized behavior similarity for each probe sample."""
     valid = [c for c in output_class_ids if 0 <= c < logits.shape[-1]]
     if not valid:
-        return torch.full((logits.shape[0],), -1.0, device=logits.device), torch.zeros(
-            4, device=logits.device
-        )
+        empty = torch.full((logits.shape[0],), -1.0, device=logits.device)
+        return empty, torch.zeros(4, device=logits.device)
+
     current = _normalize(logits[:, valid])
     reference = reference_output.to(device=logits.device, dtype=logits.dtype)
-    similarity = torch.nn.functional.cosine_similarity(
+    output_similarity = torch.nn.functional.cosine_similarity(
         current, reference.unsqueeze(0), dim=-1
     )
+
     summary = summarize_behavior(logits, valid)
+    reference_summary = reference_summary.to(
+        device=logits.device, dtype=logits.dtype
+    )
+    summary_similarity = torch.nn.functional.cosine_similarity(
+        summary.unsqueeze(0), reference_summary.unsqueeze(0), dim=-1
+    )
+
+    # The class-aligned output is the primary signal. The compact summary is
+    # additive and helps distinguish behavior when output vectors are close.
+    similarity = 0.8 * output_similarity + 0.2 * summary_similarity
     return similarity, summary
