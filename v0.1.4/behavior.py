@@ -179,16 +179,15 @@ def probe_behavior_fingerprint(
 ) -> tuple[Tensor, Tensor]:
     """Return output/summary similarity for each probe sample.
 
-    Reference and probe outputs may have different classifier widths as the
-    global head grows. Missing class coordinates are treated as zero, so a
-    newly learned class can still distinguish a probe from an older class
-    fingerprint instead of being silently discarded.
+    ``output_class_ids`` are global classifier IDs, not positions into the
+    compact reference tensor. Reference and probe outputs may have different
+    classifier widths as the global head grows. Missing coordinates are
+    treated as zero, while shared global coordinates retain their identity.
     """
     reference_ids = tuple(int(c) for c in output_class_ids)
-    valid_reference = [
-        c for c in reference_ids if 0 <= c < reference_output.shape[-1]
-    ]
-    if not valid_reference:
+    if len(reference_ids) != reference_output.shape[-1]:
+        raise ValueError("reference class IDs do not match reference output width")
+    if not reference_ids:
         empty = torch.full((logits.shape[0],), -1.0, device=logits.device)
         return empty, torch.zeros(4, device=logits.device)
 
@@ -201,16 +200,13 @@ def probe_behavior_fingerprint(
         device=logits.device,
         dtype=logits.dtype,
     )
-    reference_positions = [
-        (position, reference_index[class_id])
-        for position, class_id in enumerate(union_ids)
-        if class_id in reference_index
-    ]
-    for position, reference_position in reference_positions:
-        reference[position] = reference_output[reference_position].to(
-            device=logits.device,
-            dtype=logits.dtype,
-        )
+    for position, class_id in enumerate(union_ids):
+        reference_position = reference_index.get(class_id)
+        if reference_position is not None:
+            reference[position] = reference_output[reference_position].to(
+                device=logits.device,
+                dtype=logits.dtype,
+            )
 
     current = torch.zeros(
         logits.shape[0],
@@ -221,10 +217,8 @@ def probe_behavior_fingerprint(
     current_positions = {
         class_id: position for position, class_id in enumerate(union_ids)
     }
-    current_columns = [
-        current_positions[class_id] for class_id in current_ids
-    ]
-    current[:, current_columns] = logits
+    for class_id in current_ids:
+        current[:, current_positions[class_id]] = logits[:, class_id]
 
     current = _normalize(current)
     reference = _normalize(reference.unsqueeze(0)).squeeze(0)
