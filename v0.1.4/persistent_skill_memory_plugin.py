@@ -31,6 +31,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self.behavior = BehaviorFingerprintCache()
         self._behavior_initialized = False
         self._pending_behavior_skills: set[int] = set()
+        self.last_fingerprint_routes: list[dict] = []
 
     def _build_record(
         self,
@@ -172,6 +173,31 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             per_skill_classes[int(skill_index)][sample_index]
             for sample_index, skill_index in enumerate(chosen.cpu().tolist())
         ]
+
+        self.last_fingerprint_routes = []
+        for sample_index, skill_index in enumerate(chosen.cpu().tolist()):
+            sample_scores = scores[:, sample_index]
+            if sample_scores.numel() > 1:
+                top_scores = torch.topk(sample_scores, k=2).values
+                second_score = float(top_scores[1].item())
+            else:
+                second_score = float("-inf")
+            best_score = float(sample_scores[skill_index].item())
+            self.last_fingerprint_routes.append(
+                {
+                    "sample_index": sample_index,
+                    "skill": int(slot_ids[skill_index]),
+                    "class": int(chosen_classes[sample_index]),
+                    "score": best_score,
+                    "second_score": second_score,
+                    "gap": best_score - second_score,
+                    "probabilities": {
+                        int(slot): float(probabilities[row, sample_index].item())
+                        for row, slot in enumerate(slot_ids)
+                    },
+                }
+            )
+
         return chosen, probabilities, chosen_classes
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
