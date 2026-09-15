@@ -13,7 +13,7 @@ from .behavior import (
     extract_reference_behavior,
     probe_behavior_fingerprint,
 )
-from .probing import predict_logits, probe_class
+from .probing import _normalize_routing_scores, predict_logits, probe_class
 from .skill_memory_plugin import SkillMemoryPlugin
 
 
@@ -201,17 +201,20 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             class_skills[index] for index in best_indices.cpu().tolist()
         ]
 
-        skill_scores = torch.full(
+        # Fingerprint similarity is a signed similarity score, not a
+        # probability. Convert it to bounded routing evidence first, then use
+        # the same normalization contract as input-only skill routing.
+        skill_scores = torch.zeros(
             (len(slot_ids), x.shape[0]),
-            -1.0,
             device=x.device,
         )
         for score, skill in zip(class_scores, class_skills):
+            evidence = ((score + 1.0) / 2.0).clamp(0.0, 1.0)
             skill_scores[slot_to_row[skill]] = torch.maximum(
-                skill_scores[slot_to_row[skill]], score
+                skill_scores[slot_to_row[skill]], evidence
             )
 
-        probabilities = torch.softmax(skill_scores, dim=0)
+        probabilities = _normalize_routing_scores(skill_scores, temperature=1.0)
         chosen = torch.tensor(
             [slot_to_row[skill] for skill in chosen_skills],
             dtype=torch.long,
@@ -225,7 +228,16 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 top_scores = torch.topk(sample_scores, k=2).values
                 second_score = float(top_scores[1].item())
             else:
-                second_score = float("-inf")
+                second_score = 0.0
+            best_probability = float(probabilities[:, sample_index].max().item())
+            sorted_probabilities = torch.sort(
+                probabilities[:, sample_index], descending=True
+            ).values
+            second_probability = (
+                float(sorted_probabilities[1].item())
+                if sorted_probabilities.numel() > 1
+                else 0.0
+            )
             self.last_fingerprint_routes.append(
                 {
                     "sample_index": sample_index,
@@ -233,7 +245,18 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     "class": int(chosen_classes[sample_index]),
                     "score": float(best_scores[sample_index].item()),
                     "second_score": second_score,
-                    "gap": float(best_scores[sample_index].item()) - second_score,
+                    "gap": float(best_scores[sample_index].item())
+                    - float(
+                        torch.topk(
+                            stacked[:, sample_index],
+                            k=min(2, stacked.shape[0]),
+                        ).values[-1].item()
+                    )
+                    if stacked.shape[0] > 1
+                    else 0.0,
+                    "best_probability": best_probability,
+                    "second_probability": second_probability,
+                    "confidence_gap": best_probability - second_probability,
                     "probabilities": {
                         int(slot): float(probabilities[row, sample_index].item())
                         for row, slot in enumerate(slot_ids)
