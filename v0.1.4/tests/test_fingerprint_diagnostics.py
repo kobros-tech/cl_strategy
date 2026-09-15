@@ -33,6 +33,7 @@ def _load_plugin():
     dynamic.IncrementalClassifier = IncrementalClassifier
     dynamic.avalanche_model_adaptation = lambda model, experience: None
     models.dynamic_modules = dynamic
+    avalanche.models = models
     sys.modules.update(
         {
             "avalanche": avalanche,
@@ -107,9 +108,14 @@ def test_fingerprint_route_records_reconstructable_per_sample_decisions():
     def fake_predict(model, state, x):
         del model
         slot = int(state["slot"].item())
+        logits = torch.zeros(x.shape[0], 21)
         if slot == 0:
-            return torch.tensor([[9.0, 0.0], [8.0, 0.0]])
-        return torch.tensor([[0.0, 9.0], [0.0, 8.0]])
+            logits[0, 10] = 9.0
+            logits[1, 10] = 8.0
+        else:
+            logits[0, 20] = 9.0
+            logits[1, 20] = 8.0
+        return logits
 
     mod.predict_logits = fake_predict
     plugin._fingerprint_route(
