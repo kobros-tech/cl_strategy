@@ -68,7 +68,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         existing = {
             record.class_id: record
-            for record in self.behavior.records_for_skill(skill_id)
+            for record in self.behavior.all_records_for_skill(skill_id)
         }
         for class_id in classes:
             record = existing.get(class_id)
