@@ -5,7 +5,6 @@ from pathlib import Path
 
 import torch
 
-
 root = Path(__file__).parents[1]
 
 
@@ -92,6 +91,7 @@ def test_changed_skill_collection_respects_mutability():
             1: {"decision": plugin.SCRATCH, "skill": 3},
         }
     }
+
     plugin.reuse_is_mutable = True
     assert plugin._collect_changed_skills(0) == {2, 3}
 
@@ -105,6 +105,8 @@ def test_multiclass_skill_routing_matches_persistent_class_behavior():
 
     plugin.memory.store(0, {"slot": torch.tensor([0.0])})
     plugin.memory.store(1, {"slot": torch.tensor([1.0])})
+
+    registry = sys.modules["persistent_test_package.skill_registry"]
     for class_id, values in (
         (0, {0: 1.0, 1: 0.0}),
         (1, {0: 0.0, 1: 1.0}),
@@ -113,11 +115,7 @@ def test_multiclass_skill_routing_matches_persistent_class_behavior():
     ):
         skill_id = 0 if class_id < 2 else 1
         plugin.class_map.record(
-            plugin.__class__.__mro__[1].__dict__["__init__"]
-            and __import__(
-                "persistent_test_package.skill_registry",
-                fromlist=["ClassRecord"],
-            ).ClassRecord(
+            registry.ClassRecord(
                 experience_index=0,
                 class_id=class_id,
                 decision=plugin.SCRATCH,
@@ -137,9 +135,17 @@ def test_multiclass_skill_routing_matches_persistent_class_behavior():
         rows = []
         for value in x[:, 0].tolist():
             if slot == 0 and value < 2:
-                rows.append([8.0, 0.0, 0.0, 0.0] if value == 0 else [0.0, 8.0, 0.0, 0.0])
+                rows.append(
+                    [8.0, 0.0, 0.0, 0.0]
+                    if value == 0
+                    else [0.0, 8.0, 0.0, 0.0]
+                )
             elif slot == 1:
-                rows.append([0.0, 0.0, 8.0, 0.0] if value == 2 else [0.0, 0.0, 0.0, 8.0])
+                rows.append(
+                    [0.0, 0.0, 8.0, 0.0]
+                    if value == 2
+                    else [0.0, 0.0, 0.0, 8.0]
+                )
             else:
                 rows.append([0.0, 0.0, 0.0, 0.0])
         return torch.tensor(rows)
