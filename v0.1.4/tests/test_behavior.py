@@ -70,14 +70,23 @@ def test_probe_behavior_matches_class_aligned_reference():
 
 
 def test_fingerprint_uses_global_class_ids_not_local_columns():
+    reference_logits = torch.zeros(1, 100)
+    reference_logits[0, 42] = 100.0
+    reference_output, reference_summary, output_class_ids = (
+        mod.extract_reference_behavior(
+            reference_logits,
+            [42, 87],
+            target_class=42,
+        )
+    )
     record = mod.ClassBehaviorRecord(
         class_id=42,
         skill_id=2,
         version=0,
         reference_inputs=torch.ones(1, 2),
-        output_class_ids=(42, 87),
-        reference_output=torch.tensor([1.0, 0.0]),
-        reference_summary=torch.ones(4),
+        output_class_ids=output_class_ids,
+        reference_output=reference_output,
+        reference_summary=reference_summary,
     )
     logits = torch.zeros(1, 100)
     logits[0, 42] = 100.0
