@@ -30,7 +30,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
         self._behavior_initialized = False
-        self._pending_behavior_skills: set[int] = set()
         self._pending_reference_inputs: dict[int, Tensor] = {}
         self.last_fingerprint_routes: list[dict] = []
 
@@ -147,7 +146,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self.behavior.bump_skill(skill_id)
             self._refresh_skill(strategy, skill_id, experience)
 
-        self._pending_behavior_skills.clear()
         self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
 
