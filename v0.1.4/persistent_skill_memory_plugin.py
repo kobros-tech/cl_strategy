@@ -130,7 +130,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         strategy,
         x: Tensor,
         slot_ids: list[int],
-    ) -> tuple[Tensor, Tensor, list[list[int]]]:
+    ) -> tuple[Tensor, Tensor, list[int]]:
         """Match each probe sample to a class, then to its canonical skill."""
         probe_model = deepcopy(strategy.model)
         raw_logits = {
@@ -172,7 +172,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             per_skill_classes[int(skill_index)][sample_index]
             for sample_index, skill_index in enumerate(chosen.cpu().tolist())
         ]
-        return chosen, probabilities, [chosen_classes]
+        return chosen, probabilities, chosen_classes
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
         if not self._eval_active or self.eval_routing != "probe":
@@ -213,7 +213,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._log(
             "[FINGERPRINT routing] samples="
             f"{x.shape[0]} mean_similarity={best.mean().item():.4f} "
-            f"matched_classes={class_matches[0][:5]}"
+            f"matched_classes={class_matches[:5]}"
         )
 
     def state_dict(self) -> dict:
