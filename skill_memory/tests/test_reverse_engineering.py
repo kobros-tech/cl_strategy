@@ -1,5 +1,8 @@
 import torch
 
+from skill_memory.persistent_skill_memory_plugin import (
+    PersistentFingerprintSkillMemoryPlugin,
+)
 from skill_memory.reverse_engineering import (
     CandidateParameters,
     NormalMLReverseEngineer,
@@ -63,3 +66,20 @@ def test_normal_ml_reverse_engineer_state_round_trip():
         expected = original.predict_proba(x, candidate.weight, candidate.bias)
         actual = restored.predict_proba(x, candidate.weight, candidate.bias)
         assert torch.allclose(expected, actual)
+
+
+def test_reverse_router_features_include_candidate_class_parameters():
+    x = torch.tensor([[0.25, 0.75]])
+    logits = torch.tensor([[2.0, -1.0]])
+    weight_a = torch.tensor([1.0, 0.0])
+    weight_b = torch.tensor([0.0, 1.0])
+
+    feature_a = PersistentFingerprintSkillMemoryPlugin._make_features(
+        x, logits, weight_a, 0.0, output_dim=2
+    )
+    feature_b = PersistentFingerprintSkillMemoryPlugin._make_features(
+        x, logits, weight_b, 0.0, output_dim=2
+    )
+
+    assert not torch.equal(feature_a, feature_b)
+    assert feature_a.shape == feature_b.shape
