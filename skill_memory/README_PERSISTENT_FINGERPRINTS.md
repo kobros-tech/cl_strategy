@@ -23,15 +23,18 @@ scores = h @ W.T + b
 ```
 
 where `W` and `b` are the persisted classifier weights and bias. The candidate
-binary behavior is then:
+binary behavior is then the candidate's own one-vs-rest score:
 
 ```text
-y_hat(c) = argmax(scores) == c
+y_hat(c) = scores[:, c] > 0
 ```
 
-This is the same affine classifier rule used by the learned head, but the
-reverse-engineering implementation explicitly derives it from the learned
-weights. PyTorch documents `nn.Linear` with the same `xA^T + b` formulation.
+This is deliberately **not** `argmax(scores) == c`. Argmax is a multiclass
+decision and guarantees that one candidate is compatible for every sample,
+even when that candidate is simply the class produced by a misclassification.
+The one-vs-rest rule allows zero, one, or multiple candidates to be compatible;
+continuous fingerprint evidence is used only to resolve multiple compatible
+candidates.
 
 The package still accepts `reverse_engineer_y_fn` for experiments that need a
 different research procedure. The injected function receives precomputed
@@ -55,16 +58,21 @@ routing.
 For every anonymous sample, the router evaluates every persistent class
 fingerprint using its canonical skill's learned weights. The route is then:
 
-1. reverse-engineer binary `y` for each candidate class;
-2. identify the class that is compatible with the learned behavior;
-3. resolve that class through the persistent canonical `class -> skill` map;
-4. load the selected skill for the final prediction.
+1. reverse-engineer binary `y` independently for each candidate class;
+2. keep candidates whose binary behavior matches the expected fingerprint;
+3. if several candidates remain, use persistent feature/margin evidence to
+   select a clear top candidate or return `AMBIGUOUS`;
+4. resolve the selected class through the persistent canonical `class -> skill`
+   map;
+5. load the selected skill for the final prediction.
 
 The routing result is intentionally discrete:
 
-- `IDENTIFIED`: exactly one candidate class is compatible.
-- `AMBIGUOUS`: more than one candidate class is compatible.
-- `FAILED`: no candidate class is compatible.
+- `IDENTIFIED`: exactly one candidate remains after binary behavior and any
+  continuous disambiguation.
+- `AMBIGUOUS`: multiple binary-compatible candidates cannot be separated by
+  the available continuous evidence.
+- `FAILED`: no candidate matches the expected binary behavior.
 
 There is no uniform-probability fallback to skill 0. A failed identification
 remains failed instead of silently routing to the first slot.
@@ -96,11 +104,12 @@ decision:
 - final status;
 - selected class and skill, when identified;
 - every candidate class and skill;
-- predicted class and binary `y`;
+- predicted multiclass class and binary `y`;
 - candidate class score from the learned weights;
 - expected `y`;
 - reference accuracy;
-- candidate correctness.
+- candidate correctness;
+- continuous feature/margin evidence when available.
 
 This makes `IDENTIFIED`, `AMBIGUOUS`, and `FAILED` decisions directly
 inspectable instead of reducing the result to a skill index.
@@ -109,7 +118,8 @@ inspectable instead of reducing the result to a skill index.
 
 The focused tests include an exact reconstruction check: the weight-based
 reverse-engineering scores must match the classifier's own affine output, and
-the resulting binary `y` must match the classifier argmax.
+the resulting binary `y` must be the candidate score threshold rather than the
+classifier argmax.
 
 `skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py` runs the
 SplitMNIST benchmark through the persistent fingerprint plugin. The CI demo
