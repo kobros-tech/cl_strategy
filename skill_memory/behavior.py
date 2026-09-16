@@ -76,18 +76,28 @@ class ClassBehaviorRecord:
             reference_feature_mean=state.get("reference_feature_mean"),
             reference_feature_std=state.get("reference_feature_std"),
             reference_margin_mean=float(state.get("reference_margin_mean", 0.0)),
-            reference_margin_std=max(float(state.get("reference_margin_std", 1.0)), 1e-6),
+            reference_margin_std=max(
+                float(state.get("reference_margin_std", 1.0)), 1e-6
+            ),
             reference_weight=state.get("reference_weight"),
             reference_bias=float(state.get("reference_bias", 0.0)),
         )
 
 
 class BehaviorFingerprintCache:
-    """Version-aware persistent cache of class behavior references."""
+    """Version-aware persistent cache of class behavior references.
+
+    A fingerprint must not be recomputed from the live model merely because a
+    later experience changed that model.  The binary behavior records therefore
+    share a frozen skill snapshot for each skill generation.  A mutable REUSE
+    creates a new generation and deliberately replaces that snapshot.
+    """
 
     def __init__(self) -> None:
         self._records: dict[int, ClassBehaviorRecord] = {}
         self._skill_versions: dict[int, int] = {}
+        self._skill_states: dict[int, dict[str, Tensor]] = {}
+        self._skill_state_versions: dict[int, int] = {}
 
     def skill_version(self, skill_id: int) -> int:
         return self._skill_versions.get(int(skill_id), 0)
@@ -97,6 +107,8 @@ class BehaviorFingerprintCache:
         version = self.skill_version(skill_id) + 1
         self._skill_versions[skill_id] = version
         self.invalidate_skill(skill_id)
+        self._skill_states.pop(skill_id, None)
+        self._skill_state_versions.pop(skill_id, None)
         return version
 
     def invalidate_skill(self, skill_id: int) -> None:
@@ -104,6 +116,28 @@ class BehaviorFingerprintCache:
         for record in self._records.values():
             if record.skill_id == skill_id:
                 record.valid = False
+
+    def put_skill_state(
+        self, skill_id: int, version: int, state_dict: dict[str, Tensor]
+    ) -> None:
+        skill_id = int(skill_id)
+        version = int(version)
+        self._skill_states[skill_id] = {
+            key: value.detach().cpu().clone() for key, value in state_dict.items()
+        }
+        self._skill_state_versions[skill_id] = version
+
+    def skill_state(
+        self, skill_id: int, version: int
+    ) -> dict[str, Tensor] | None:
+        skill_id = int(skill_id)
+        version = int(version)
+        if self._skill_state_versions.get(skill_id) != version:
+            return None
+        state = self._skill_states.get(skill_id)
+        if state is None:
+            return None
+        return {key: value.clone() for key, value in state.items()}
 
     def put(self, record: ClassBehaviorRecord) -> None:
         self._records[record.class_id] = record
@@ -137,6 +171,14 @@ class BehaviorFingerprintCache:
     def state_dict(self) -> dict[str, Any]:
         return {
             "skill_versions": dict(self._skill_versions),
+            "skill_states": {
+                int(skill_id): {
+                    key: value.detach().cpu()
+                    for key, value in state.items()
+                }
+                for skill_id, state in self._skill_states.items()
+            },
+            "skill_state_versions": dict(self._skill_state_versions),
             "records": [record.state_dict() for record in self._records.values()],
         }
 
@@ -144,6 +186,16 @@ class BehaviorFingerprintCache:
         self._skill_versions = {
             int(key): int(value)
             for key, value in state.get("skill_versions", {}).items()
+        }
+        self._skill_states = {
+            int(skill_id): {
+                key: value.detach().cpu().clone() for key, value in skill_state.items()
+            }
+            for skill_id, skill_state in state.get("skill_states", {}).items()
+        }
+        self._skill_state_versions = {
+            int(key): int(value)
+            for key, value in state.get("skill_state_versions", {}).items()
         }
         self._records = {}
         for record_state in state.get("records", []):
