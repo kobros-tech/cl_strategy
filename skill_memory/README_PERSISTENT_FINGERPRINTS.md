@@ -2,26 +2,40 @@
 
 This branch extends `v0.1.5-best-skill-routing` with one focused goal:
 
-> Identify an anonymous class by testing whether the learned model produces the
-> expected binary `y` behavior for that candidate class.
+> Identify an anonymous class by reverse-engineering the learned classifier
+> weights and testing the resulting binary `y` behavior for that candidate class.
 
-The implementation deliberately does **not** use class-weight probability
-similarity as the identification criterion.
+The implementation does **not** use the benchmark experience ID or target label
+for anonymous routing.
 
-## Binary reverse-engineering model
+## Weight-based reverse engineering
 
-For a candidate class `c`, the reverse-engineering primitive returns:
+For the default research path, a candidate class is evaluated from the stored
+skill's learned parameters rather than by treating `model(x)` logits as the
+reverse-engineering algorithm.
+
+For an Avalanche `IncrementalClassifier`, the plugin captures the learned
+feature representation `h` immediately before the classifier and explicitly
+reconstructs:
 
 ```text
-y_hat = reverse_engineer_y(sample, c)
+scores = h @ W.T + b
 ```
 
-where `y_hat` is strictly `True` or `False`.
+where `W` and `b` are the persisted classifier weights and bias. The candidate
+binary behavior is then:
 
-The current low-level adapter uses the classifier prediction as a baseline:
-`True` means the predicted global class is `c`. The plugin accepts an injected
-`reverse_engineer_y_fn`, so the actual research reverse-engineering algorithm
-can replace this adapter without changing persistence, routing, or tests.
+```text
+y_hat(c) = argmax(scores) == c
+```
+
+This is the same affine classifier rule used by the learned head, but the
+reverse-engineering implementation explicitly derives it from the learned
+weights. PyTorch documents `nn.Linear` with the same `xA^T + b` formulation.
+
+The package still accepts `reverse_engineer_y_fn` for experiments that need a
+different research procedure. The injected function receives precomputed
+scores/logits for backward compatibility; the default path is weight-based.
 
 ## Known-class validation
 
@@ -31,29 +45,29 @@ Reference samples for a known class have a known expected value:
 expected_y = True
 ```
 
-The plugin stores the binary predictions produced by the reverse-engineering
-primitive for those samples. `reference_accuracy` records how often the
-primitive reproduces the known expected value.
-
-This separates two questions:
-
-1. Can the reverse-engineering method reproduce the expected `y` for known
-   class samples?
-2. Does an anonymous sample produce the same expected `y` for a candidate
-   class?
+The plugin persists the binary reference behavior and exposes
+`reference_accuracy`. This validates whether the reverse-engineering procedure
+can reproduce the expected class behavior before it is used for anonymous
+routing.
 
 ## Anonymous identification
 
-For every anonymous sample, each persistent class fingerprint is tested.
+For every anonymous sample, the router evaluates every persistent class
+fingerprint using its canonical skill's learned weights. The route is then:
+
+1. reverse-engineer binary `y` for each candidate class;
+2. identify the class that is compatible with the learned behavior;
+3. resolve that class through the persistent canonical `class -> skill` map;
+4. load the selected skill for the final prediction.
+
 The routing result is intentionally discrete:
 
 - `IDENTIFIED`: exactly one candidate class is compatible.
 - `AMBIGUOUS`: more than one candidate class is compatible.
 - `FAILED`: no candidate class is compatible.
 
-The router identifies the **class first** and only then resolves the existing
-canonical `class -> skill` mapping. A class is never remapped, and one skill
-can own multiple classes.
+There is no uniform-probability fallback to skill 0. A failed identification
+remains failed instead of silently routing to the first slot.
 
 No target label, task ID, or experience ID is consumed by anonymous routing.
 
@@ -82,29 +96,25 @@ decision:
 - final status;
 - selected class and skill, when identified;
 - every candidate class and skill;
-- candidate predicted `y`;
-- candidate expected `y`;
-- candidate reference accuracy;
+- predicted class and binary `y`;
+- candidate class score from the learned weights;
+- expected `y`;
+- reference accuracy;
 - candidate correctness.
 
 This makes `IDENTIFIED`, `AMBIGUOUS`, and `FAILED` decisions directly
 inspectable instead of reducing the result to a skill index.
 
-## Tests
+## Tests and benchmark
 
-The focused test suite covers:
+The focused tests include an exact reconstruction check: the weight-based
+reverse-engineering scores must match the classifier's own affine output, and
+the resulting binary `y` must match the classifier argmax.
 
-- binary `y` generation and global class IDs;
-- known-class expected-vs-predicted comparison;
-- exact identification and failed identification;
-- ambiguous identification;
-- per-sample routing;
-- multi-class skills with distinct class identities;
-- mutable versus immutable `REUSE` refresh behavior;
-- invalidation of all classes belonging to a changed skill;
-- checkpoint round-trip and legacy checkpoint loading;
-- reconstructable routing diagnostics.
+`skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py` runs the
+SplitMNIST benchmark through the persistent fingerprint plugin. The CI demo
+uses this plugin directly; it does not pass experience IDs or labels to the
+router.
 
-The existing `SkillMemoryPlugin` remains unchanged. This extension is kept
-opt-in until the binary reverse-engineering primitive is validated against the
-benchmark.
+The original `SkillMemoryPlugin` remains available separately for the older
+probe-routing experiments.
