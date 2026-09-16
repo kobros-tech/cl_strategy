@@ -26,12 +26,7 @@ from .skill_memory_plugin import SkillMemoryPlugin
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     """Skill Memory with persistent binary class-behavior identification."""
 
-    def __init__(
-        self,
-        *args,
-        reverse_engineer_y_fn: Callable | None = None,
-        **kwargs,
-    ):
+    def __init__(self, *args, reverse_engineer_y_fn: Callable | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
         self._custom_reverse_engineer_y = reverse_engineer_y_fn
@@ -43,18 +38,11 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._fingerprint_batch_index = 0
         self._evaluation_experience_index: int | None = None
 
-    def _reverse_engineer_y(
-        self,
-        model,
-        state_dict: dict,
-        x: Tensor,
-        class_id: int,
-    ) -> Tensor:
+    def _reverse_engineer_y(self, model, state_dict, x: Tensor, class_id: int) -> Tensor:
         """Run the configured reverse-engineering method without label leakage."""
         if self._custom_reverse_engineer_y is not None:
             logits = predict_logits(model, state_dict, x)
             return self._custom_reverse_engineer_y(logits, class_id).detach().bool()
-
         apply_skill_state_exact(model, state_dict)
         return reverse_engineer_y_from_weights(model, x, class_id).detach().bool()
 
@@ -71,12 +59,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         if state_dict is None:
             state_dict = self.memory.state(skill_id)
         model = deepcopy(strategy.model)
-        reference_y = self._reverse_engineer_y(
-            model,
-            state_dict,
-            x,
-            class_id,
-        ).cpu()
+        reference_y = self._reverse_engineer_y(model, state_dict, x, class_id).cpu()
         apply_skill_state_exact(model, state_dict)
         statistics = build_weight_behavior_statistics(model, x, class_id)
         return ClassBehaviorRecord(
@@ -139,14 +122,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     self.probe_seed,
                 )
             self.behavior.put(
-                self._build_record(
-                    strategy,
-                    skill_id,
-                    class_id,
-                    x,
-                    version,
-                    state_dict,
-                )
+                self._build_record(strategy, skill_id, class_id, x, version, state_dict)
             )
 
     def _collect_changed_skills(self, experience_index: int) -> set[int]:
@@ -171,10 +147,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         experience = strategy.experience
         experience_index = self._current_training_experience_index
         is_last = self._is_last_subexp(experience)
-
         if experience_index is not None:
             self._capture_new_class_inputs(experience, experience_index)
-
         changed = (
             self._collect_changed_skills(experience_index)
             if is_last and experience_index is not None
@@ -184,11 +158,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         super().after_training_exp(strategy, **kwargs)
         if experience_index is None or not is_last:
             return
-
         for skill_id in sorted(changed):
             self.behavior.bump_skill(skill_id)
             self._refresh_skill(strategy, skill_id, experience)
-
         for class_id, x in sorted(pending.items()):
             skill_id = self.class_map.find_skill_for_class_anywhere(class_id)
             if skill_id is None:
@@ -202,15 +174,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 self.behavior.put_skill_state(int(skill_id), version, state_dict)
             self.behavior.put(
                 self._build_record(
-                    strategy,
-                    int(skill_id),
-                    int(class_id),
-                    x,
-                    version,
-                    state_dict,
+                    strategy, int(skill_id), int(class_id), x, version, state_dict
                 )
             )
-
         self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
 
@@ -224,14 +190,12 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         """Score one binary-compatible candidate using persistent evidence."""
         feature = features[sample_index].detach().float().cpu()
         components: list[float] = []
-
         if record.reference_feature_mean is not None:
             reference = record.reference_feature_mean.float()
             cosine = F.cosine_similarity(
                 feature.unsqueeze(0), reference.unsqueeze(0), dim=1
             ).item()
             components.append((float(cosine) + 1.0) / 2.0)
-
         class_id = record.class_id
         row = scores[sample_index]
         own = row[class_id]
@@ -246,18 +210,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             / max(float(record.reference_margin_std), 1e-6)
         ).item()
         components.append(float(margin_similarity))
-
-        if record.reference_weight is not None:
-            weight = row.new_tensor(record.reference_weight).float().cpu()
-            current_weight = record.reference_weight.new_tensor(
-                record.reference_weight
-            ).float()
-            # The current classifier weight is recovered from the score model
-            # through the persistent skill state in the caller. The reference
-            # weight is retained for checkpoint compatibility, while
-            # feature/margin evidence remains sample-specific.
-            del weight, current_weight
-
         return {
             "feature_similarity": components[0]
             if record.reference_feature_mean is not None
@@ -267,13 +219,12 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         }
 
     @staticmethod
-    def _select_continuous_candidate(
-        compatible: list[dict],
-    ) -> dict | None:
-        """Select a candidate only when the evidence has a clear top cluster."""
+    def _select_continuous_candidate(compatible: list[dict]) -> dict | None:
+        """Select a candidate only when evidence has a clear top cluster."""
         if len(compatible) <= 1:
             return compatible[0] if compatible else None
-
+        if any("continuous_evidence" not in item for item in compatible):
+            return None
         ranked = sorted(
             compatible,
             key=lambda item: float(item["continuous_evidence"]),
@@ -289,12 +240,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             return None
         if len(gaps) == 1:
             return ranked[0]
-
-        remaining_gaps = gaps[1:]
-        baseline = sum(remaining_gaps) / len(remaining_gaps)
-        if gaps[0] > baseline:
-            return ranked[0]
-        return None
+        baseline = sum(gaps[1:]) / len(gaps[1:])
+        return ranked[0] if gaps[0] > baseline else None
 
     def _fingerprint_route(
         self,
@@ -327,11 +274,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 )
             else:
                 skill_scores[slot] = predict_logits(probe_model, frozen_state, x)
-
         chosen_skills: list[int] = []
         chosen_classes: list[int] = []
         routes: list[dict] = []
-
         for sample_index in range(x.shape[0]):
             matches: list[dict] = []
             for record in candidate_records:
@@ -341,9 +286,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 predicted_class = int(scores[sample_index].argmax().item())
                 if self._custom_reverse_engineer_y is not None:
                     predicted_y = bool(
-                        self._custom_reverse_engineer_y(
-                            scores, record.class_id
-                        )[sample_index]
+                        self._custom_reverse_engineer_y(scores, record.class_id)[
+                            sample_index
+                        ]
                         .detach()
                         .item()
                     )
@@ -381,7 +326,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                             }
                         )
                 matches.append(match)
-
             compatible = [item for item in matches if item["correct"]]
             selected = self._select_continuous_candidate(compatible)
             if not compatible:
@@ -392,11 +336,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 status = "IDENTIFIED"
                 chosen_classes.append(int(selected["class"]))
                 chosen_skills.append(int(selected["skill"]))
-
             if status != "IDENTIFIED":
                 chosen_classes.append(-1)
                 chosen_skills.append(-1)
-
             routes.append(
                 {
                     "sample_index": sample_index,
@@ -406,7 +348,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     "candidates": matches,
                 }
             )
-
         self.last_fingerprint_routes = routes
         chosen = torch.tensor(chosen_skills, dtype=torch.long, device=x.device)
         return chosen, chosen_classes
@@ -432,12 +373,10 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             return super().after_eval_forward(strategy, **kwargs)
         if len(self.memory) == 0 or not self._behavior_initialized:
             return super().after_eval_forward(strategy, **kwargs)
-
         x = strategy.mbatch[0]
         y = strategy.mbatch[1]
         slot_ids = sorted(self.memory.slots())
         chosen, class_matches = self._fingerprint_route(strategy, x, slot_ids)
-
         for route, label in zip(
             self.last_fingerprint_routes,
             y.detach().cpu().tolist(),
@@ -448,7 +387,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             route["evaluation_y"] = int(label)
         self.fingerprint_route_history.extend(self.last_fingerprint_routes)
         self._fingerprint_batch_index += 1
-
         output_model = deepcopy(strategy.model)
         per_skill_logits = [
             predict_logits(output_model, self.memory.state(slot), x)
@@ -461,7 +399,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             width = min(logits.shape[-1], output_dim)
             result[:, :width] = logits[:, :width]
             padded.append(result)
-
         valid = chosen.ge(0)
         if valid.any():
             positions = torch.nonzero(valid, as_tuple=False).squeeze(-1)
@@ -473,7 +410,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             )
             stacked = torch.stack(padded, dim=0)
             strategy.mb_output[positions] = stacked[rows, positions]
-
         final_predictions = strategy.mb_output.detach().argmax(dim=-1).cpu().tolist()
         labels = y.detach().cpu().tolist()
         for route, prediction, label in zip(
@@ -484,7 +420,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         ):
             route["model_predicted_class"] = int(prediction)
             route["model_correct"] = int(prediction) == int(label)
-
         identified = sum(
             item["status"] == "IDENTIFIED" for item in self.last_fingerprint_routes
         )
