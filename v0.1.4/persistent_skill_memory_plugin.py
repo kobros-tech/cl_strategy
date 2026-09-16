@@ -133,6 +133,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             if is_last and experience_index is not None
             else set()
         )
+        pending = dict(self._pending_reference_inputs)
         super().after_training_exp(strategy, **kwargs)
         if experience_index is None or not is_last:
             return
@@ -140,6 +141,26 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         for skill_id in sorted(changed):
             self.behavior.bump_skill(skill_id)
             self._refresh_skill(strategy, skill_id, experience)
+
+        # A new class can be attached to an immutable existing skill. In that
+        # case the skill does not need a new generation, but the class still
+        # needs its first persistent reference behavior.
+        for class_id, x in sorted(pending.items()):
+            skill_id = self.class_map.find_skill_for_class_anywhere(class_id)
+            if skill_id is None:
+                continue
+            if self.behavior.get(class_id, int(skill_id)) is not None:
+                continue
+            version = self.behavior.skill_version(int(skill_id))
+            self.behavior.put(
+                self._build_record(
+                    strategy,
+                    int(skill_id),
+                    int(class_id),
+                    x,
+                    version,
+                )
+            )
 
         self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
