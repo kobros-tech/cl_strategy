@@ -7,7 +7,6 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 
 @dataclass(frozen=True)
@@ -55,14 +54,9 @@ class NormalMLReverseEngineer:
 
     The primary objective is listwise candidate selection: for every reference
     sample, all currently known class candidates form one candidate set and
-    cross-entropy trains the model to put the correct class at the top. A
-    pairwise ranking term additionally pushes the correct candidate above every
-    negative candidate, sharpening top-1 separation instead of only optimizing
-    the aggregate softmax likelihood.
-
-    The candidate tokens attend to one another, allowing the scorer to reason
-    about the complete candidate set rather than scoring every candidate
-    independently.
+    cross-entropy trains the model to put the correct class at the top. The
+    candidate tokens attend to one another, allowing the scorer to reason about
+    the complete candidate set rather than scoring every candidate independently.
 
     Candidate identity is represented only through model-derived behavior
     features. The integer class ID is never an input feature.
@@ -78,8 +72,6 @@ class NormalMLReverseEngineer:
         training_mode: str = "listwise",
         num_heads: int = 8,
         num_layers: int = 3,
-        ranking_loss_weight: float = 0.5,
-        ranking_margin: float = 0.5,
     ) -> None:
         if training_mode not in {"listwise", "binary"}:
             raise ValueError("training_mode must be 'listwise' or 'binary'")
@@ -87,8 +79,6 @@ class NormalMLReverseEngineer:
             raise ValueError("model dimensions must be positive")
         if hidden_size % num_heads != 0:
             raise ValueError("hidden_size must be divisible by num_heads")
-        if ranking_loss_weight < 0 or ranking_margin < 0:
-            raise ValueError("ranking loss weight and margin must be non-negative")
         self.hidden_size = int(hidden_size)
         self.epochs = int(epochs)
         self.learning_rate = float(learning_rate)
@@ -97,8 +87,6 @@ class NormalMLReverseEngineer:
         self.training_mode = training_mode
         self.num_heads = int(num_heads)
         self.num_layers = int(num_layers)
-        self.ranking_loss_weight = float(ranking_loss_weight)
-        self.ranking_margin = float(ranking_margin)
         self.model: _FeatureReverseModel | None = None
         self.feature_dim: int | None = None
         self.feature_mean: Tensor | None = None
@@ -109,22 +97,6 @@ class NormalMLReverseEngineer:
         mean = features.mean(dim=0)
         std = features.std(dim=0, unbiased=False).clamp_min(1e-6)
         return mean, std
-
-    @staticmethod
-    def _pairwise_ranking_loss(
-        logits: Tensor,
-        targets: Tensor,
-        margin: float,
-    ) -> Tensor:
-        """Penalize every negative candidate that is not below the target."""
-        positive = logits.gather(1, targets.reshape(-1, 1))
-        gaps = positive - logits
-        negative_mask = torch.ones_like(gaps, dtype=torch.bool)
-        negative_mask.scatter_(1, targets.reshape(-1, 1), False)
-        violations = F.softplus(margin - gaps)[negative_mask]
-        if violations.numel() == 0:
-            return logits.new_zeros(())
-        return violations.mean()
 
     def _fit_model(self, features: Tensor, targets: Tensor) -> None:
         """Fit the shared cross-candidate scoring network."""
@@ -181,14 +153,6 @@ class NormalMLReverseEngineer:
                         logits = logits.reshape(-1, batch.shape[1])
                         optimizer.zero_grad(set_to_none=True)
                         loss = criterion(logits, batch_targets)
-                        if self.ranking_loss_weight:
-                            loss = loss + self.ranking_loss_weight * (
-                                self._pairwise_ranking_loss(
-                                    logits,
-                                    batch_targets,
-                                    self.ranking_margin,
-                                )
-                            )
                         loss.backward()
                         optimizer.step()
         self.model = model.eval()
@@ -324,8 +288,6 @@ class NormalMLReverseEngineer:
             "training_mode": self.training_mode,
             "num_heads": self.num_heads,
             "num_layers": self.num_layers,
-            "ranking_loss_weight": self.ranking_loss_weight,
-            "ranking_margin": self.ranking_margin,
             "feature_dim": self.feature_dim,
             "feature_mean": (
                 None if self.feature_mean is None else self.feature_mean.clone()
@@ -351,10 +313,6 @@ class NormalMLReverseEngineer:
         self.training_mode = state.get("training_mode", self.training_mode)
         self.num_heads = int(state.get("num_heads", self.num_heads))
         self.num_layers = int(state.get("num_layers", self.num_layers))
-        self.ranking_loss_weight = float(
-            state.get("ranking_loss_weight", self.ranking_loss_weight)
-        )
-        self.ranking_margin = float(state.get("ranking_margin", self.ranking_margin))
         feature_dim = state.get("feature_dim")
         model_state = state.get("model")
         feature_mean = state.get("feature_mean")
