@@ -64,7 +64,7 @@ class ClassBehaviorRecord:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> ClassBehaviorRecord:
+    def from_state_dict(cls, state: dict[str, Any]) -> "ClassBehaviorRecord":
         return cls(
             class_id=int(state["class_id"]),
             skill_id=int(state["skill_id"]),
@@ -88,8 +88,8 @@ class BehaviorFingerprintCache:
     """Version-aware persistent cache of class behavior references.
 
     A fingerprint must not be recomputed from the live model merely because a
-    later experience changed that model.  The binary behavior records therefore
-    share a frozen skill snapshot for each skill generation.  A mutable REUSE
+    later experience changed that model. The binary behavior records therefore
+    share a frozen skill snapshot for each skill generation. A mutable REUSE
     creates a new generation and deliberately replaces that snapshot.
     """
 
@@ -268,20 +268,26 @@ def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
 
 
 def reverse_engineer_y_from_weights(model, x: Tensor, target_class: int) -> Tensor:
-    """Produce binary ``y`` for a candidate class using learned weights."""
+    """Produce one-vs-rest binary ``y`` from the candidate class score."""
     scores = reverse_engineer_scores_from_weights(model, x)
-    if not 0 <= int(target_class) < scores.shape[-1]:
-        raise ValueError("target_class is outside the classifier output")
-    return scores.argmax(dim=-1).eq(int(target_class))
+    return reverse_engineer_y(scores, target_class)
 
 
 def reverse_engineer_y(logits: Tensor, target_class: int) -> Tensor:
-    """Legacy logits adapter for callers supplying precomputed logits."""
+    """Return binary ``y`` from a candidate class score threshold.
+
+    ``y`` is intentionally not defined as ``argmax(logits) == target_class``.
+    Argmax is a multiclass decision and therefore makes exactly one candidate
+    compatible for every sample, including the class produced by a
+    misclassification. A class fingerprint instead tests the candidate's own
+    reconstructed score against the zero decision boundary, allowing zero,
+    one, or multiple candidates to be compatible.
+    """
     if logits.ndim != 2:
         raise ValueError("logits must have shape [batch, classes]")
     if not 0 <= int(target_class) < logits.shape[-1]:
         raise ValueError("target_class is outside the classifier output")
-    return logits.argmax(dim=-1).eq(int(target_class))
+    return logits[:, int(target_class)].gt(0)
 
 
 def compare_binary_behavior(
@@ -326,7 +332,7 @@ def build_weight_behavior_statistics(model, x: Tensor, class_id: int) -> dict[st
         margin = own
     return {
         "feature_mean": features.mean(dim=0).detach().cpu(),
-        "feature_std": features.std(dim=0, unbiased=False)
+        "feature_std": features.std(unbiased=False)
         .clamp_min(1e-6)
         .detach()
         .cpu(),
