@@ -1,83 +1,81 @@
-# Persistent binary class-behavior identification
+# Persistent class identification with normal ML reverse engineering
 
 This branch extends `v0.1.5-best-skill-routing` with one focused goal:
 
-> Identify an anonymous class by reverse-engineering the learned classifier
-> weights and testing the resulting binary `y` behavior for that candidate class.
+> Identify an anonymous class with a standalone ML model that learns to predict
+> binary `y` from the raw sample and a frozen candidate classifier weight.
 
-The implementation does **not** use the benchmark experience ID or target label
-for anonymous routing.
+The reverse-engineering model is intentionally separated from continual
+learning. It does not train on, update, or depend on the live CL feature
+representation.
 
-## Weight-based reverse engineering
+## Normal ML reverse engineering
 
-For the default research path, a candidate class is evaluated from the stored
-skill's learned parameters rather than by treating `model(x)` logits as the
-reverse-engineering algorithm.
-
-For an Avalanche `IncrementalClassifier`, the plugin captures the learned
-feature representation `h` immediately before the classifier and explicitly
-reconstructs:
+For each mastered class, the plugin keeps deterministic reference samples and
+the classifier weight/bias from the corresponding **frozen skill generation**.
+Those are used to build ordinary supervised ML pairs:
 
 ```text
-scores = h @ W.T + b
+input  = [flattened sample x, candidate weight W_c, candidate bias b_c]
+target = 1 if candidate class is the reference sample's class else 0
 ```
 
-where `W` and `b` are the persisted classifier weights and bias. The candidate
-binary behavior is then the candidate's own one-vs-rest score:
+A small PyTorch MLP learns:
 
 ```text
-y_hat(c) = scores[:, c] > 0
+P(y=1 | x, W_c, b_c)
 ```
 
-This is deliberately **not** `argmax(scores) == c`. Argmax is a multiclass
-decision and guarantees that one candidate is compatible for every sample,
-even when that candidate is simply the class produced by a misclassification.
-The one-vs-rest rule allows zero, one, or multiple candidates to be compatible;
-continuous fingerprint evidence is used only to resolve multiple compatible
-candidates.
+This is a genuine learned reverse-engineering model rather than a handcrafted
+`argmax`, cosine, or score-threshold fingerprint.
 
-The package still accepts `reverse_engineer_y_fn` for experiments that need a
-different research procedure. The injected function receives precomputed
-scores/logits for backward compatibility; the default path is weight-based.
+The reverse model is protected from CL drift in two ways:
 
-## Known-class validation
+1. candidate weights are copied from a frozen skill-generation snapshot;
+2. the reverse model consumes the raw input rather than the mutable CL feature
+   extractor.
 
-Reference samples for a known class have a known expected value:
+Therefore later `REUSE`, `CLONE`, or `SCRATCH` training cannot silently change
+the reverse model's input representation. When a mutable skill changes, a new
+skill generation is created, its frozen candidate weights are refreshed, and the
+normal ML reverse model is retrained from the new reference set.
 
-```text
-expected_y = True
-```
+The older `reverse_engineer_y_fn` injection remains available for experiments,
+but the benchmark router uses the standalone normal-ML path.
 
-The plugin persists the binary reference behavior and exposes
-`reference_accuracy`. This validates whether the reverse-engineering procedure
-can reproduce the expected class behavior before it is used for anonymous
-routing.
+## Known-class calibration
+
+Reference samples provide the only labels used to train the reverse model.
+For every reference sample, its canonical class is known while the model is
+being calibrated. Negative candidate pairs are generated from the other known
+class weights.
+
+Those labels are never supplied during anonymous evaluation.
 
 ## Anonymous identification
 
-For every anonymous sample, the router evaluates every persistent class
-fingerprint using its canonical skill's learned weights. The route is then:
+For an anonymous sample, every persistent class candidate is evaluated by the
+same trained reverse model:
 
-1. reverse-engineer binary `y` independently for each candidate class;
-2. keep candidates whose binary behavior matches the expected fingerprint;
-3. if several candidates remain, use persistent feature/margin evidence to
-   select a clear top candidate or return `AMBIGUOUS`;
-4. resolve the selected class through the persistent canonical `class -> skill`
-   map;
-5. load the selected skill for the final prediction.
+```text
+sample x + frozen candidate W_c,b_c
+                |
+                v
+       normal ML reverse model
+                |
+                v
+       P(y=1 | x, candidate)
+```
 
-The routing result is intentionally discrete:
+Candidates are converted to binary-compatible candidates using the learned
+probability, not the classifier's multiclass argmax. A single compatible
+candidate is identified directly. Multiple compatible candidates are resolved
+from the learned probability ordering; if the learned evidence does not form a
+clear separation, routing remains `AMBIGUOUS`. If no candidate is compatible,
+the result is `FAILED`.
 
-- `IDENTIFIED`: exactly one candidate remains after binary behavior and any
-  continuous disambiguation.
-- `AMBIGUOUS`: multiple binary-compatible candidates cannot be separated by
-  the available continuous evidence.
-- `FAILED`: no candidate matches the expected binary behavior.
-
-There is no uniform-probability fallback to skill 0. A failed identification
-remains failed instead of silently routing to the first slot.
-
-No target label, task ID, or experience ID is consumed by anonymous routing.
+No evaluation target label, task ID, or experience ID is consumed by the
+reverse model or routing decision.
 
 ## Persistent references
 
@@ -87,44 +85,40 @@ Each `ClassBehaviorRecord` stores:
 - canonical `skill_id`;
 - skill generation/version;
 - deterministic reference inputs;
-- binary `reference_y` values;
+- binary reference diagnostics;
 - expected `y`.
 
-If mutable `REUSE` changes a skill, every class mastered by that skill gets a
-new generation. The original reference inputs are retained and reused when
-refreshing the fingerprints. Unchanged skills are not refreshed. `SCRATCH`
-creates the initial fingerprint for each newly mastered class.
+If mutable `REUSE` changes a skill, every class mastered by that skill receives
+a new generation. The original reference inputs are retained. The frozen
+classifier state for that generation is used to rebuild the normal ML training
+pairs. `SCRATCH` creates the initial records for newly mastered classes.
 
 ## Diagnostics
 
-Every anonymous routing record contains enough information to reconstruct the
-decision:
+Each anonymous routing record contains:
 
 - sample index;
-- final status;
+- final routing status;
 - selected class and skill, when identified;
 - every candidate class and skill;
-- predicted multiclass class and binary `y`;
-- candidate class score from the learned weights;
-- expected `y`;
+- reverse-engineering probability;
+- learned binary compatibility;
 - reference accuracy;
-- candidate correctness;
-- continuous feature/margin evidence when available.
+- final classifier prediction/correctness when the evaluation plugin adds it.
 
-This makes `IDENTIFIED`, `AMBIGUOUS`, and `FAILED` decisions directly
-inspectable instead of reducing the result to a skill index.
+This separates the reverse-engineering decision from the final classifier
+prediction, so a bad route can be diagnosed without treating classifier
+forgetting as evidence that the reverse model itself failed.
 
 ## Tests and benchmark
 
-The focused tests include an exact reconstruction check: the weight-based
-reverse-engineering scores must match the classifier's own affine output, and
-the resulting binary `y` must be the candidate score threshold rather than the
-classifier argmax.
+The focused reverse-engineering tests verify that the standalone model can
+learn candidate identity from sample/weight pairs and does not mutate frozen
+candidate weights.
 
 `skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py` runs the
-SplitMNIST benchmark through the persistent fingerprint plugin. The CI demo
-uses this plugin directly; it does not pass experience IDs or labels to the
-router.
+SplitMNIST benchmark through the persistent fingerprint plugin. The benchmark
+router does not pass experience IDs or evaluation labels to the reverse model.
 
 The original `SkillMemoryPlugin` remains available separately for the older
 probe-routing experiments.
