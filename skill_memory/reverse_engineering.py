@@ -68,21 +68,29 @@ class NormalMLReverseEngineer:
     def fit(self, pairs: list[tuple[Tensor, CandidateParameters, float]]) -> None:
         """Fit from positive/negative reference pairs.
 
-        ``pairs`` contains reference samples paired with candidate parameters
-        and a binary target. No evaluation labels are needed by this method.
+        Each pair may contain a batch of reference samples. The scalar target
+        is expanded to every sample in that batch. No evaluation labels are
+        needed by this method.
         """
         if not pairs:
             self.model = None
             self.input_dim = None
             return
         torch.manual_seed(self.seed)
-        features = torch.cat(
-            [self._features(x, params.weight, params.bias) for x, params, _ in pairs],
-            dim=0,
-        )
-        targets = torch.tensor(
-            [target for _, _, target in pairs], dtype=torch.float32
-        ).view(-1, 1)
+        feature_batches = []
+        target_batches = []
+        for x, params, target in pairs:
+            features = self._features(x, params.weight, params.bias)
+            feature_batches.append(features)
+            target_batches.append(
+                torch.full(
+                    (features.shape[0], 1),
+                    float(target),
+                    dtype=torch.float32,
+                )
+            )
+        features = torch.cat(feature_batches, dim=0)
+        targets = torch.cat(target_batches, dim=0)
         self.input_dim = int(features.shape[1])
         model = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_size),
