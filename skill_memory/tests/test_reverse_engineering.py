@@ -68,6 +68,32 @@ def test_normal_ml_reverse_engineer_state_round_trip():
         assert torch.allclose(expected, actual)
 
 
+def test_normal_ml_reverse_engineer_standardizes_features():
+    pairs = [
+        (torch.tensor([[1.0, 10.0], [2.0, 20.0]]), 1.0),
+        (torch.tensor([[3.0, 30.0], [4.0, 40.0]]), 0.0),
+    ]
+    reverse_engineer = NormalMLReverseEngineer(epochs=5)
+    reverse_engineer.fit_feature_pairs(pairs)
+
+    assert reverse_engineer.feature_mean is not None
+    assert reverse_engineer.feature_std is not None
+    assert torch.all(reverse_engineer.feature_std > 0)
+
+
+def test_normal_ml_reverse_engineer_handles_many_negative_candidates():
+    positive = torch.tensor([[1.0, 0.0]])
+    negative = torch.tensor([[0.0, 1.0]])
+    pairs = [(positive, 1.0)] + [(negative, 0.0)] * 19
+
+    reverse_engineer = NormalMLReverseEngineer(epochs=120, seed=11)
+    reverse_engineer.fit_feature_pairs(pairs)
+
+    positive_probability = reverse_engineer.predict_proba_features(positive)
+    negative_probability = reverse_engineer.predict_proba_features(negative)
+    assert float(positive_probability.mean()) > float(negative_probability.mean())
+
+
 def test_reverse_router_features_include_candidate_class_parameters():
     x = torch.tensor([[0.25, 0.75]])
     logits = torch.tensor([[2.0, -1.0]])
