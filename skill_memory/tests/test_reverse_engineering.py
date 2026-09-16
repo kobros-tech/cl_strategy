@@ -38,3 +38,28 @@ def test_normal_ml_reverse_engineer_does_not_mutate_candidate_weights():
     reverse_engineer = NormalMLReverseEngineer(epochs=5)
     reverse_engineer.fit([(torch.ones(2, 2), params, 1.0)])
     assert torch.equal(params.weight, weight)
+
+
+def test_normal_ml_reverse_engineer_state_round_trip():
+    x0 = torch.tensor([[1.0, 0.0], [0.9, 0.1]])
+    x1 = torch.tensor([[0.0, 1.0], [0.1, 0.9]])
+    candidate0 = CandidateParameters(torch.tensor([1.0, 0.0]), 0.0)
+    candidate1 = CandidateParameters(torch.tensor([0.0, 1.0]), 0.0)
+    pairs = [
+        (x0, candidate0, 1.0),
+        (x0, candidate1, 0.0),
+        (x1, candidate0, 0.0),
+        (x1, candidate1, 1.0),
+    ]
+
+    original = NormalMLReverseEngineer(epochs=40, seed=3)
+    original.fit(pairs)
+    state = original.state_dict()
+
+    restored = NormalMLReverseEngineer()
+    restored.load_state_dict(state)
+
+    for x, candidate in ((x0, candidate0), (x1, candidate1)):
+        expected = original.predict_proba(x, candidate.weight, candidate.bias)
+        actual = restored.predict_proba(x, candidate.weight, candidate.bias)
+        assert torch.allclose(expected, actual)
