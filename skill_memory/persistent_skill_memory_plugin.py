@@ -259,13 +259,40 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             "evidence": float(evidence.item()),
         }
 
+    @staticmethod
+    def _select_fingerprint_candidate(matches: list[dict]) -> tuple[str, dict | None]:
+        """Select only among behaviorally compatible candidates.
+
+        Binary behavior is the identity gate inherited from the original
+        persistent fingerprint router. Continuous fingerprints are supporting
+        evidence: they can distinguish multiple compatible candidates, but
+        cannot promote an incompatible candidate into a route.
+        """
+        compatible = [item for item in matches if item["binary_compatible"]]
+        if not compatible:
+            return "FAILED", None
+        if len(compatible) == 1:
+            return "IDENTIFIED", compatible[0]
+
+        compatible.sort(key=lambda item: item["evidence"], reverse=True)
+        top = compatible[0]
+        second = compatible[1]
+        evidence_values = torch.tensor(
+            [item["evidence"] for item in compatible]
+        )
+        dispersion = float(evidence_values.std(unbiased=False).item())
+        gap = top["evidence"] - second["evidence"]
+        if gap > dispersion:
+            return "IDENTIFIED", top
+        return "AMBIGUOUS", None
+
     def _fingerprint_route(
         self,
         strategy,
         x: Tensor,
         slot_ids: list[int],
     ) -> tuple[Tensor, list[int]]:
-        """Infer class from persistent weight evidence, then resolve its skill."""
+        """Infer class from persistent behavior, then resolve its skill."""
         probe_model = deepcopy(strategy.model)
         candidate_records = [
             record
@@ -297,30 +324,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     )
                 )
 
-            if not matches:
-                status = "FAILED"
-                selected = None
-            else:
-                matches.sort(key=lambda item: item["evidence"], reverse=True)
-                top = matches[0]
-                second = matches[1] if len(matches) > 1 else None
-                if second is None:
-                    clear_winner = True
-                else:
-                    evidence_values = torch.tensor(
-                        [item["evidence"] for item in matches]
-                    )
-                    dispersion = float(evidence_values.std(unbiased=False).item())
-                    gap = top["evidence"] - second["evidence"]
-                    clear_winner = gap > dispersion
-
-                if clear_winner:
-                    status = "IDENTIFIED"
-                    selected = top
-                else:
-                    status = "AMBIGUOUS"
-                    selected = None
-
+            status, selected = self._select_fingerprint_candidate(matches)
             if selected is None:
                 chosen_classes.append(-1)
                 chosen_skills.append(-1)
@@ -413,7 +417,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         )
 
     def state_dict(self) -> dict:
-        """Serialize only the persistent binary behavior state."""
+        """Serialize only the persistent behavior state."""
         return {"behavior": self.behavior.state_dict()}
 
     def load_state_dict(self, state: dict) -> None:
