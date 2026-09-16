@@ -1,86 +1,110 @@
-# Persistent class behavioral fingerprints
+# Persistent binary class-behavior identification
 
-This branch implements persistent class-behavior references on top of
-`v0.1.5-best-skill-routing`.
+This branch extends `v0.1.5-best-skill-routing` with one focused goal:
 
-## Lifecycle
+> Identify an anonymous class by testing whether the learned model produces the
+> expected binary `y` behavior for that candidate class.
 
-- Each canonical class gets a `ClassBehaviorRecord` containing reference
-  inputs, global class IDs, a persistent probability-distribution fingerprint,
-  and a skill version.
-- References are computed after training and reused across evaluation passes.
-- A mutable `REUSE` update creates a new generation for that skill and refreshes
-  all classes mastered by that skill, because one shared state change can alter
-  every class it owns.
-- `SCRATCH` creates a new skill and its initial class references.
-- Unchanged skills keep their cached references.
-- A logical experience with multiple Avalanche sub-experiences accumulates all
-  changed skills before refreshing them.
+The implementation deliberately does **not** use class-weight probability
+similarity as the identification criterion.
 
-## Routing
+## Binary reverse-engineering model
 
-`PersistentFingerprintSkillMemoryPlugin` performs task-free evaluation routing.
-For each unlabeled sample it:
+For a candidate class `c`, the reverse-engineering primitive returns:
 
-1. runs the sample through each stored skill;
-2. compares the current behavior with the persistent fingerprints for the
-   classes owned by that skill;
-3. finds the best matching class within each skill;
-4. compares the winning class match across skills;
-5. uses the winning canonical skill to produce the final prediction.
+```text
+y_hat = reverse_engineer_y(sample, c)
+```
 
-The router never needs a task ID, experience ID, or target label. Labels are
-only suitable for separate diagnostic evaluation such as routing accuracy.
+where `y_hat` is strictly `True` or `False`.
 
-The primary fingerprint signal is cosine similarity between class-aligned
-mean softmax probability distributions. This preserves global classifier
-columns and is invariant to arbitrary logit scale. A normalized four-value
-behavior summary is an additional signal.
+The current low-level adapter uses the classifier prediction as a baseline:
+`True` means the predicted global class is `c`. The plugin accepts an injected
+`reverse_engineer_y_fn`, so the actual research reverse-engineering algorithm
+can replace this adapter without changing persistence, routing, or tests.
 
-The tests explicitly verify that fingerprints generated from distinct class
-reference logits rank their source class above an unrelated class and that
-clear matches produce non-uniform skill-routing evidence.
+## Known-class validation
 
-## Fingerprint validation diagnostics
+Reference samples for a known class have a known expected value:
 
-The implementation also measures whether the fingerprint itself is a stable
-and discriminative representation of learned behavior before changing its
-mathematical formula.
+```text
+expected_y = True
+```
 
-At the beginning of each logical training experience, existing persistent
-fingerprints are snapshotted. After changed skills are refreshed, the plugin
-compares the same reference inputs before and after training and logs:
+The plugin stores the binary predictions produced by the reverse-engineering
+primitive for those samples. `reference_accuracy` records how often the
+primitive reproduces the known expected value.
 
-- per-class fingerprint cosine similarity;
-- per-class fingerprint drift (`1 - similarity`);
-- the calculated fingerprint of each newly introduced class using its top
-  global classifier coordinates;
-- pairwise reference-fingerprint separation across all current classes.
+This separates two questions:
 
-This separates several possible failure modes: unstable fingerprints,
-cross-class interference, poor reference separation, and a routing problem
-where stored references are distinct but anonymous samples still produce
-similar behavior across competing skills.
+1. Can the reverse-engineering method reproduce the expected `y` for known
+   class samples?
+2. Does an anonymous sample produce the same expected `y` for a candidate
+   class?
 
-Pairwise reference similarity is intentionally diagnostic only. It compares
-stored fingerprints with each other and does not establish anonymous routing,
-because it does not run a sample through competing skill snapshots.
+## Anonymous identification
 
-## Growing heads
+For every anonymous sample, each persistent class fingerprint is tested.
+The routing result is intentionally discrete:
 
-Fingerprints store `output_class_ids` explicitly instead of assuming that a
-fixed tensor column always represents a particular class. This keeps the
-reference representation tied to global class IDs while Avalanche grows the
-classifier head.
+- `IDENTIFIED`: exactly one candidate class is compatible.
+- `AMBIGUOUS`: more than one candidate class is compatible.
+- `FAILED`: no candidate class is compatible.
 
-## Checkpoints
+The router identifies the **class first** and only then resolves the existing
+canonical `class -> skill` mapping. A class is never remapped, and one skill
+can own multiple classes.
 
-`BehaviorFingerprintCache.state_dict()` stores skill generations and all
-persistent records. `load_state_dict()` accepts missing behavior state, so a
-checkpoint produced before fingerprints were introduced can still be loaded.
+No target label, task ID, or experience ID is consumed by anonymous routing.
 
-## Usage
+## Persistent references
 
-The extension is exported as `PersistentFingerprintSkillMemoryPlugin` so the
-existing `SkillMemoryPlugin` remains available while this routing path is
-validated against the current benchmark and integration tests.
+Each `ClassBehaviorRecord` stores:
+
+- global `class_id`;
+- canonical `skill_id`;
+- skill generation/version;
+- deterministic reference inputs;
+- binary `reference_y` values;
+- expected `y`.
+
+If mutable `REUSE` changes a skill, every class mastered by that skill gets a
+new generation. The original reference inputs are retained and reused when
+refreshing the fingerprints. Unchanged skills are not refreshed. `SCRATCH`
+creates the initial fingerprint for each newly mastered class.
+
+## Diagnostics
+
+Every anonymous routing record contains enough information to reconstruct the
+decision:
+
+- sample index;
+- final status;
+- selected class and skill, when identified;
+- every candidate class and skill;
+- candidate predicted `y`;
+- candidate expected `y`;
+- candidate reference accuracy;
+- candidate correctness.
+
+This makes `IDENTIFIED`, `AMBIGUOUS`, and `FAILED` decisions directly
+inspectable instead of reducing the result to a skill index.
+
+## Tests
+
+The focused test suite covers:
+
+- binary `y` generation and global class IDs;
+- known-class expected-vs-predicted comparison;
+- exact identification and failed identification;
+- ambiguous identification;
+- per-sample routing;
+- multi-class skills with distinct class identities;
+- mutable versus immutable `REUSE` refresh behavior;
+- invalidation of all classes belonging to a changed skill;
+- checkpoint round-trip and legacy checkpoint loading;
+- reconstructable routing diagnostics.
+
+The existing `SkillMemoryPlugin` remains unchanged. This extension is kept
+opt-in until the binary reverse-engineering primitive is validated against the
+benchmark.
