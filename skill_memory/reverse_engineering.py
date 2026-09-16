@@ -18,7 +18,7 @@ class CandidateParameters:
 
 
 class _FeatureReverseModel(nn.Module):
-    """Small supervised scorer over frozen-candidate behavior features."""
+    """Higher-capacity scorer over frozen-candidate behavior features."""
 
     def __init__(self, feature_dim: int, hidden_size: int) -> None:
         super().__init__()
@@ -41,13 +41,16 @@ class NormalMLReverseEngineer:
     avoids the one-positive-versus-many-negative calibration problem of an
     independent binary classifier and naturally scales to large candidate sets.
 
-    The older binary-pair API is retained for compatibility and focused tests.
+    The default scorer uses a wider hidden layer than the original prototype.
+    This increases nonlinear capacity while reducing the fixed training budget,
+    keeping the default experiment cost in roughly the same range. The older
+    binary-pair API is retained for compatibility and focused tests.
     """
 
     def __init__(
         self,
-        hidden_size: int = 64,
-        epochs: int = 200,
+        hidden_size: int = 128,
+        epochs: int = 120,
         learning_rate: float = 1e-3,
         seed: int = 0,
         batch_size: int = 256,
