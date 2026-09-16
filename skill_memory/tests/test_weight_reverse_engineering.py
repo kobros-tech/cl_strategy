@@ -32,12 +32,13 @@ def test_weight_reconstruction_matches_classifier_output():
     torch.testing.assert_close(reconstructed, expected)
 
 
-def test_weight_reverse_engineering_returns_classifier_argmax_behavior():
+def test_weight_reverse_engineering_uses_candidate_score_threshold():
     torch.manual_seed(1)
     model = TinyClassifier()
     x = torch.randn(8, 4)
 
-    expected = model(x).argmax(dim=1)
+    scores = model(x)
     for class_id in range(3):
+        expected = scores[:, class_id] > 0
         actual = reverse_engineer_y_from_weights(model, x, class_id)
-        torch.testing.assert_close(actual, expected.eq(class_id))
+        torch.testing.assert_close(actual, expected)
