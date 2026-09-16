@@ -247,6 +247,7 @@ def test_eval_output_uses_skill_id_not_slot_position():
     plugin.class_map.record(_registry_record(registry, plugin, 20, 7))
     plugin.behavior.put(_record(mod, 10, 2))
     plugin.behavior.put(_record(mod, 20, 7))
+    plugin._behavior_initialized = True
 
     class Model:
         pass
