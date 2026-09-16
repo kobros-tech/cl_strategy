@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feature/persistent-class-behavior-fingerprints
+      - feature/listwise-reverse-routing
 
 jobs:
   splitmnist-weight-reverse-engineering:
