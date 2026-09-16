@@ -84,13 +84,25 @@ def flatten_route(route: dict, train_index: int) -> dict:
     )
     top = ranked[0] if ranked else {}
     second = ranked[1] if len(ranked) > 1 else {}
+    true_class = route.get("evaluation_y")
+    true_candidate = next(
+        (candidate for candidate in candidates if candidate.get("class") == true_class),
+        {},
+    )
+    top_score = top.get("score")
+    true_score = true_candidate.get("score")
+    score_margin = (
+        float(top_score) - float(true_score)
+        if top_score is not None and true_score is not None
+        else None
+    )
     correct_rank = _correct_candidate_rank(route)
     return {
         "training_step": train_index,
         "evaluation_experience": route.get("evaluation_experience"),
         "batch_index": route.get("batch_index", -1),
         "sample_index": route.get("sample_index", -1),
-        "evaluation_y": route.get("evaluation_y"),
+        "evaluation_y": true_class,
         "status": route.get("status"),
         "inferred_class": route.get("class"),
         "selected_skill": route.get("skill"),
@@ -99,16 +111,15 @@ def flatten_route(route: dict, train_index: int) -> dict:
         "correct_class_rank": correct_rank,
         "top_candidate_class": top.get("class"),
         "top_candidate_skill": top.get("skill"),
-        "top_candidate_correct": (
-            top.get("class") == route.get("evaluation_y")
-        ),
-        "top_class_score": top.get("score"),
+        "top_candidate_correct": top.get("class") == true_class,
+        "top_class_score": top_score,
         "top_probability": top.get("probability"),
+        "true_class_score": true_score,
+        "true_probability": true_candidate.get("probability"),
+        "top_minus_true_score": score_margin,
         "second_candidate_class": second.get("class"),
         "second_candidate_skill": second.get("skill"),
-        "second_candidate_correct": (
-            second.get("class") == route.get("evaluation_y")
-        ),
+        "second_candidate_correct": second.get("class") == true_class,
         "second_class_score": second.get("score"),
         "second_probability": second.get("probability"),
         "reference_accuracy": route.get("reference_accuracy"),
@@ -161,6 +172,87 @@ def rank_summary_by_experience(rows: list[dict]) -> dict:
     return {
         experience: rank_summary(experience_rows)
         for experience, experience_rows in sorted(grouped.items())
+    }
+
+
+def _score_margin_stats(rows: list[dict]) -> dict:
+    """Summarize winner-vs-true score margins for Top-1 routing failures."""
+    failures = [
+        row
+        for row in rows
+        if row.get("status") == "IDENTIFIED"
+        and row.get("correct_class_rank") is not None
+        and int(row["correct_class_rank"]) > 1
+        and row.get("top_minus_true_score") is not None
+    ]
+    margins = np.asarray(
+        [float(row["top_minus_true_score"]) for row in failures],
+        dtype=float,
+    )
+    if margins.size == 0:
+        return {
+            "samples": 0,
+            "mean_margin": 0.0,
+            "median_margin": 0.0,
+            "min_margin": 0.0,
+            "max_margin": 0.0,
+        }
+    return {
+        "samples": int(margins.size),
+        "mean_margin": float(np.mean(margins)),
+        "median_margin": float(np.median(margins)),
+        "min_margin": float(np.min(margins)),
+        "max_margin": float(np.max(margins)),
+    }
+
+
+def score_margin_summary(rows: list[dict]) -> dict:
+    """Diagnose how strongly wrong winners beat the true candidate."""
+    failures = [
+        row
+        for row in rows
+        if row.get("status") == "IDENTIFIED"
+        and row.get("correct_class_rank") is not None
+        and int(row["correct_class_rank"]) > 1
+    ]
+    confusion_counts: dict[str, int] = {}
+    wrong_candidate_counts: dict[str, int] = {}
+    for row in failures:
+        true_class = row.get("evaluation_y")
+        wrong_class = row.get("top_candidate_class")
+        if true_class is not None and wrong_class is not None:
+            pair = f"{true_class}->{wrong_class}"
+            confusion_counts[pair] = confusion_counts.get(pair, 0) + 1
+        if wrong_class is not None:
+            key = str(wrong_class)
+            wrong_candidate_counts[key] = wrong_candidate_counts.get(key, 0) + 1
+
+    by_experience: dict[str, list[dict]] = {}
+    for row in failures:
+        experience = row.get("evaluation_experience")
+        if experience is not None:
+            by_experience.setdefault(str(experience), []).append(row)
+
+    return {
+        "top1_failures": len(failures),
+        "overall": _score_margin_stats(rows),
+        "by_evaluation_experience": {
+            experience: _score_margin_stats(experience_rows)
+            for experience, experience_rows in sorted(by_experience.items())
+        },
+        "most_frequent_confusion_pairs": [
+            {"true_class_to_wrong_class": pair, "count": count}
+            for pair, count in sorted(
+                confusion_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:20]
+        ],
+        "most_frequent_wrong_candidates": [
+            {"wrong_class": wrong_class, "count": count}
+            for wrong_class, count in sorted(
+                wrong_candidate_counts.items(),
+                key=lambda item: (-item[1], int(item[0])),
+            )[:20]
+        ],
     }
 
 
@@ -264,6 +356,9 @@ def write_analysis_files(
         "top_candidate_correct",
         "top_class_score",
         "top_probability",
+        "true_class_score",
+        "true_probability",
+        "top_minus_true_score",
         "second_candidate_class",
         "second_candidate_skill",
         "second_candidate_correct",
@@ -297,6 +392,7 @@ def write_analysis_files(
         "routing_by_evaluation_experience": routing_summary(rows),
         "routing_rank_diagnostics": rank_summary(rows),
         "routing_rank_by_evaluation_experience": rank_summary_by_experience(rows),
+        "routing_score_margin_diagnostics": score_margin_summary(rows),
         "analysis_csv": csv_path.name,
         "metric_scope": {
             "accuracy_curve": "anonymous routed model accuracy",
@@ -308,6 +404,11 @@ def write_analysis_files(
                 "post-routing diagnostic: evaluation labels are used only to "
                 "measure where the true class ranked among already-computed "
                 "candidate scores; labels are never routing inputs"
+            ),
+            "score_margin_diagnostics": (
+                "post-routing diagnostic: for Top-1 failures, top candidate "
+                "score minus true candidate score is measured after routing; "
+                "labels are never routing inputs"
             ),
             "warning": (
                 "Routed accuracy and forgetting combine routing errors with "
@@ -321,6 +422,10 @@ def write_analysis_files(
     print("Accuracy matrix CSV saved to:", matrix_path)
     print("Analysis JSON saved to:", json_path)
     print("Routing rank diagnostics:", json.dumps(summary["routing_rank_diagnostics"], indent=2))
+    print(
+        "Routing score-margin diagnostics:",
+        json.dumps(summary["routing_score_margin_diagnostics"], indent=2),
+    )
 
 
 def main() -> None:
