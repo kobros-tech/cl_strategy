@@ -188,5 +188,9 @@ def test_reverse_router_features_include_candidate_behavior():
     assert not torch.equal(feature_a, feature_b)
     assert feature_a.shape == feature_b.shape
     assert feature_a.shape[1] == x.numel() + 2 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 1
-    assert torch.allclose(feature_a[:, -3], torch.tensor([0.25]))
-    assert torch.allclose(feature_b[:, -3], torch.tensor([0.75]))
+    assert torch.allclose(
+        feature_a[:, -3:-1], torch.tensor([[0.25, 0.0]])
+    )
+    assert torch.allclose(
+        feature_b[:, -3:-1], torch.tensor([[0.0, 0.75]])
+    )
