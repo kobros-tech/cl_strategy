@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -32,7 +33,12 @@ class _FeatureReverseModel(nn.Module):
 
 
 class NormalMLReverseEngineer:
-    """Learn candidate/class compatibility as a normal ML problem."""
+    """Learn anonymous candidate/class compatibility as a normal ML problem.
+
+    Training consumes only detached samples and responses from frozen skill
+    snapshots. Evaluation is a pure prediction operation; the reverse model is
+    never fitted from inside an evaluation forward pass.
+    """
 
     def __init__(
         self,
@@ -128,3 +134,36 @@ class NormalMLReverseEngineer:
         return self.predict_proba_features(
             torch.cat((samples, weight, bias_column), dim=1)
         )
+
+    def state_dict(self) -> dict[str, Any]:
+        """Serialize the fitted reverse model without optimizer state."""
+        return {
+            "hidden_size": self.hidden_size,
+            "epochs": self.epochs,
+            "learning_rate": self.learning_rate,
+            "seed": self.seed,
+            "feature_dim": self.feature_dim,
+            "model": None
+            if self.model is None
+            else {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
+            },
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore a previously fitted reverse model."""
+        self.hidden_size = int(state.get("hidden_size", self.hidden_size))
+        self.epochs = int(state.get("epochs", self.epochs))
+        self.learning_rate = float(state.get("learning_rate", self.learning_rate))
+        self.seed = int(state.get("seed", self.seed))
+        feature_dim = state.get("feature_dim")
+        model_state = state.get("model")
+        if feature_dim is None or model_state is None:
+            self.model = None
+            self.feature_dim = None
+            return
+        self.feature_dim = int(feature_dim)
+        model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
+        model.load_state_dict(model_state)
+        self.model = model.eval()
