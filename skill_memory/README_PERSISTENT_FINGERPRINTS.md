@@ -2,80 +2,104 @@
 
 This branch extends `v0.1.5-best-skill-routing` with one focused goal:
 
-> Identify an anonymous class with a standalone ML model that learns to predict
-> binary `y` from the raw sample and a frozen candidate classifier weight.
+> Identify an anonymous class with a standalone ML model trained from raw
+> samples and responses produced by frozen Skill Memory snapshots.
 
-The reverse-engineering model is intentionally separated from continual
-learning. It does not train on, update, or depend on the live CL feature
-representation.
+The reverse-engineering model is deliberately separated from continual
+learning. It never consumes the live CL feature representation and it is never
+trained during evaluation.
 
 ## Normal ML reverse engineering
 
 For each mastered class, the plugin keeps deterministic reference samples and
-the classifier weight/bias from the corresponding **frozen skill generation**.
-Those are used to build ordinary supervised ML pairs:
+the complete frozen skill state for the corresponding skill generation. For a
+reference sample and each candidate class/skill pair, the frozen skill produces
+its full classifier response. The normal ML input is:
 
 ```text
-input  = [flattened sample x, candidate weight W_c, candidate bias b_c]
-target = 1 if candidate class is the reference sample's class else 0
+input = [flattened raw sample x,
+         padded full frozen logits,
+         full frozen softmax response]
 ```
+
+The supervised target is `1` only when the candidate class is the reference
+sample's canonical class; otherwise it is `0`.
 
 A small PyTorch MLP learns:
 
 ```text
-P(y=1 | x, W_c, b_c)
+P(candidate_class | raw sample, frozen skill response)
 ```
 
-This is a genuine learned reverse-engineering model rather than a handcrafted
-`argmax`, cosine, or score-threshold fingerprint.
+This is a learned compatibility model rather than a handcrafted argmax,
+cosine similarity, fingerprint threshold, or binary decision rule.
 
-The reverse model is protected from CL drift in two ways:
+## CL-safety boundary
 
-1. candidate weights are copied from a frozen skill-generation snapshot;
-2. the reverse model consumes the raw input rather than the mutable CL feature
-   extractor.
+The lifecycle is intentionally one-way:
 
-Therefore later `REUSE`, `CLONE`, or `SCRATCH` training cannot silently change
-the reverse model's input representation. When a mutable skill changes, a new
-skill generation is created, its frozen candidate weights are refreshed, and the
-normal ML reverse model is retrained from the new reference set.
+```text
+CL training
+    |
+    | complete frozen Skill Memory state
+    v
+reference data + frozen skill responses
+    |
+    | normal supervised ML training
+    v
+cached reverse model
+    |
+    | inference only
+    v
+anonymous class -> canonical skill -> frozen prediction
+```
 
-The older `reverse_engineer_y_fn` injection remains available for experiments,
-but the benchmark router uses the standalone normal-ML path.
+The reverse model is fitted **once after each completed logical training
+experience** when the frozen candidate set changes. It is not fitted from
+`after_eval_forward`. Therefore evaluation batch order, `torch.no_grad()`, and
+the live CL representation cannot alter the reverse model.
+
+For this plugin, `REUSE` is immutable by default. A stored skill snapshot is
+therefore not changed by later training merely because a class is encountered
+again. `CLONE` and `SCRATCH` produce new skill generations according to the
+underlying Skill Memory policy.
 
 ## Known-class calibration
 
 Reference samples provide the only labels used to train the reverse model.
-For every reference sample, its canonical class is known while the model is
-being calibrated. Negative candidate pairs are generated from the other known
-class weights.
+For every reference sample, the canonical class is known while the model is
+being calibrated. Candidate class/skill pairs from the stored memory create
+both positive and negative examples.
 
-Those labels are never supplied during anonymous evaluation.
+Those labels are never supplied during anonymous evaluation. Evaluation uses
+only the raw sample and the frozen candidate responses.
 
 ## Anonymous identification
 
 For an anonymous sample, every persistent class candidate is evaluated by the
-same trained reverse model:
+same cached reverse model:
 
 ```text
-sample x + frozen candidate W_c,b_c
-                |
-                v
+sample x + frozen candidate response
+              |
+              v
        normal ML reverse model
-                |
-                v
-       P(y=1 | x, candidate)
+              |
+              v
+       candidate probability
+              |
+              v
+       class -> canonical skill
 ```
 
-Candidates are converted to binary-compatible candidates using the learned
-probability, not the classifier's multiclass argmax. A single compatible
-candidate is identified directly. Multiple compatible candidates are resolved
-from the learned probability ordering; if the learned evidence does not form a
-clear separation, routing remains `AMBIGUOUS`. If no candidate is compatible,
-the result is `FAILED`.
+The highest learned candidate probability selects the anonymous class. The
+canonical `class -> skill` mapping then selects the stored skill used for the
+final classifier prediction. No evaluation target label, task ID, or
+experience ID is used for routing.
 
-No evaluation target label, task ID, or experience ID is consumed by the
-reverse model or routing decision.
+The router intentionally does not apply a universal `0.5` compatibility gate.
+The output is a ranked learned probability over the currently known candidate
+classes.
 
 ## Persistent references
 
@@ -88,37 +112,43 @@ Each `ClassBehaviorRecord` stores:
 - binary reference diagnostics;
 - expected `y`.
 
-If mutable `REUSE` changes a skill, every class mastered by that skill receives
-a new generation. The original reference inputs are retained. The frozen
-classifier state for that generation is used to rebuild the normal ML training
-pairs. `SCRATCH` creates the initial records for newly mastered classes.
+If a mutable Skill Memory configuration changes a skill generation, the
+associated frozen behavior records are invalidated and rebuilt. With the
+persistent plugin's default immutable `REUSE`, old generations remain stable.
 
 ## Diagnostics
 
 Each anonymous routing record contains:
 
 - sample index;
-- final routing status;
-- selected class and skill, when identified;
-- every candidate class and skill;
-- reverse-engineering probability;
-- learned binary compatibility;
-- reference accuracy;
-- final classifier prediction/correctness when the evaluation plugin adds it.
+- selected class and skill;
+- learned candidate probability;
+- all candidate probabilities;
+- evaluation experience index **only as a diagnostic field**;
+- evaluation label **only as a diagnostic field**;
+- final classifier prediction/correctness.
 
-This separates the reverse-engineering decision from the final classifier
-prediction, so a bad route can be diagnosed without treating classifier
-forgetting as evidence that the reverse model itself failed.
+The evaluation label is recorded after routing for analysis; it is not an
+input to the reverse model or the routing decision.
+
+Routed accuracy and forgetting therefore combine two distinct effects:
+
+1. reverse-routing correctness;
+2. the prediction quality of the selected frozen skill.
+
+An oracle-skill evaluation should be used to measure raw skill retention
+separately from routing error.
 
 ## Tests and benchmark
 
 The focused reverse-engineering tests verify that the standalone model can
-learn candidate identity from sample/weight pairs and does not mutate frozen
-candidate weights.
+learn candidate identity, does not mutate candidate parameters, and can be
+saved/restored without changing predictions.
 
 `skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py` runs the
-SplitMNIST benchmark through the persistent fingerprint plugin. The benchmark
-router does not pass experience IDs or evaluation labels to the reverse model.
+SplitMNIST benchmark through the persistent plugin. The reverse model is
+trained after training experiences and only performs inference during
+`eval`.
 
-The original `SkillMemoryPlugin` remains available separately for the older
+The original `SkillMemoryPlugin` remains available separately for older
 probe-routing experiments.
