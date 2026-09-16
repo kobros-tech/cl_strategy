@@ -2,43 +2,7 @@
 #
 # Deliberately named `demo_*.py`, not `test_*.py`: this is a runnable demo
 # script (real SplitMNIST training, network access to download MNIST, no
-# `test_` functions), not a pytest unit test, so it must NOT match pytest's
-# default `test_*.py` / `*_test.py` collection pattern. Two independent
-# reasons:
-#   1. pytest would try to import and execute it during `pytest -q`,
-#      running a full real training loop instead of a fast unit test.
-#   2. Several of the package's real unit tests (test_plugin_eval.py,
-#      test_probing.py, test_persistent_fingerprints.py) register a stub
-#      `avalanche` module into `sys.modules` for isolated testing. Once
-#      pytest has imported one of those in the same process, a later
-#      `from avalanche... import ...` in this file would resolve against
-#      that stub instead of the real installed package and fail with
-#      "'avalanche' is not a package". Running this file on its own
-#      (`python demo_splitmnist_eval_log.py`) is unaffected either way.
-#
-# This plays the same role as `learn_CL_3.ipynb` / the "refined" prototype
-# you pasted, but rewritten against the *actual* `skill_memory` v0.1.4
-# package (a real Avalanche plugin, not the `skill_memory2` module the
-# prototype imported from -- see the previous version of this file for that
-# mapping).
-#
-# The difference from the previous version of this script: instead of only
-# reporting aggregate per-experience accuracy, a `PredictionLogger` plugin
-# captures the actual routed prediction (predicted y) against the ground
-# truth label (real y) for every evaluated sample, so you can inspect
-# individual right/wrong calls rather than just an experience-id-level
-# accuracy number.
-#
-# It assumes `train_stream`, `test_stream`, and `device` already exist from
-# your Avalanche benchmark setup earlier in the notebook -- paste those
-# setup cells above this one unchanged, or just run this script standalone;
-# it builds its own SplitMNIST stream below if you haven't.
-#
-# NOTE on import path: this file assumes the v0.1.4 package has been
-# installed/placed importable as `skill_memory` (e.g. `pip install -e .`
-# from inside the unzipped `v0.1.4/` directory after adding a `pyproject
-# .toml`, or by simply renaming the folder). Adjust the import line below
-# if your project exposes it under a different name.
+# `test_` functions), not a pytest unit test.
 
 from __future__ import annotations
 
@@ -59,12 +23,7 @@ from skill_memory import SkillMemory, SkillMemoryPlugin
 
 
 class Tee:
-    """Writes everything to several streams at once (e.g. real stdout + a log file).
-
-    Used below to mirror every `print(...)` -- including SkillMemoryPlugin's
-    own `verbose=True` logging, which goes through plain `print` -- into a
-    log file, without changing any of the existing print call sites.
-    """
+    """Write output to several streams at once."""
 
     def __init__(self, *streams):
         self.streams = streams
@@ -79,12 +38,11 @@ class Tee:
             stream.flush()
 
 
-# Every CSV/log pair from a run shares this timestamp so they're easy to
-# match up later. Both land in a gitignored `logs/` dir next to this file.
+# Keep one ID for the complete run so the CSV and text log can be matched.
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_dir = Path(__file__).resolve().parent / "logs"
 log_dir.mkdir(exist_ok=True)
-terminal_log_path = log_dir / f"run_{run_id}.log"
+terminal_log_path = log_dir / f"run_{run_id}.txt"
 csv_log_path = log_dir / f"run_{run_id}.csv"
 
 _terminal_log_file = open(terminal_log_path, "w")
@@ -96,15 +54,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
 
-########################################################
-# Model
-########################################################
-# skill_memory's probing/decision code (probing.py) resizes and reloads
-# `IncrementalClassifier` heads when it swaps skill state dicts in and out
-# during REUSE/SCRATCH, and grows the head on new classes via Avalanche's
-# `avalanche_model_adaptation`. The classifier head therefore MUST be an
-# `IncrementalClassifier`, not a plain `nn.Linear`.
 class SkillMemoryMLP(nn.Module):
+    """Small MLP with an Avalanche growing classifier head."""
+
     def __init__(self, input_dim: int, hidden_size: int = 256):
         super().__init__()
         self.features = nn.Sequential(
@@ -119,31 +71,16 @@ class SkillMemoryMLP(nn.Module):
         return self.classifier(x)
 
 
-########################################################
-# Prediction logger -- captures predicted y vs. real y per sample
-########################################################
 class PredictionLogger(SupervisedPlugin):
-    """Logs predicted vs. real labels for every evaluated sample.
-
-    Must appear AFTER `SkillMemoryPlugin` in `plugins=[...]`. Avalanche
-    calls each hook in plugin-list order, and `SkillMemoryPlugin`'s own
-    `after_eval_forward` is what overwrites `strategy.mb_output` with the
-    routed (probe-selected) logits -- this plugin's `after_eval_forward`
-    needs to fire afterwards so it reads that routed prediction rather than
-    a single skill's raw, unrouted logits.
-    """
+    """Capture the routed prediction and ground truth for every eval sample."""
 
     def __init__(self):
         super().__init__()
         self.records: list[dict] = []
-        self._train_step: int | None = None  # which training step this eval is under
+        self._train_step: int | None = None
         self._exp_id: int | None = None
 
     def set_train_step(self, step: int) -> None:
-        """Call before each `strategy.eval(...)` so records know which
-        training step (t) they were logged under -- the same experience
-        gets re-evaluated after every later training step, so this is what
-        distinguishes those repeated passes in the log."""
         self._train_step = step
 
     def before_eval_exp(self, strategy, **kwargs) -> None:
@@ -169,16 +106,13 @@ class PredictionLogger(SupervisedPlugin):
                 }
             )
 
-    # ------------------------------------------------------------------
-    # Reporting helpers
-    # ------------------------------------------------------------------
     def print_log(
         self,
         train_step: int | None = None,
         only_errors: bool = False,
         max_rows: int | None = 40,
     ) -> None:
-        """Print true-y vs. predicted-y rows, optionally filtered/truncated."""
+        """Print sample-level predictions, optionally filtered to errors."""
         rows = self.records
         if train_step is not None:
             rows = [r for r in rows if r["train_step"] == train_step]
@@ -200,8 +134,59 @@ class PredictionLogger(SupervisedPlugin):
         if not rows:
             print("(no rows match this filter)")
 
+    def print_misclassifications(self, train_step: int) -> None:
+        """Print every error for one training step, grouped by experience."""
+        rows = [
+            r
+            for r in self.records
+            if r["train_step"] == train_step and not r["correct"]
+        ]
+        total = sum(r["train_step"] == train_step for r in self.records)
+        print(f"\n=== MISCLASSIFICATIONS AFTER TRAINING STEP {train_step} ===")
+        print(f"Misclassified: {len(rows)} / {total}")
+        if not rows:
+            print("None")
+            return
+
+        by_exp: dict[int, list[dict]] = {}
+        for row in rows:
+            by_exp.setdefault(int(row["experience"]), []).append(row)
+
+        for exp_id in sorted(by_exp):
+            exp_rows = by_exp[exp_id]
+            print(f"\nExperience {exp_id}: {len(exp_rows)} misclassified samples")
+            print("sample  true_y  pred_y  confidence")
+            print("-" * 38)
+            for row in exp_rows:
+                print(
+                    f"{self.records.index(row):>6}  "
+                    f"{row['true_y']:>6}  {row['pred_y']:>6}  "
+                    f"{row['confidence']:.4f}"
+                )
+
+    def print_misclassification_summary(self, train_step: int) -> None:
+        """Print per-experience error counts for one training step."""
+        rows = [r for r in self.records if r["train_step"] == train_step]
+        print(f"\n--- misclassification summary for step {train_step} ---")
+        if not rows:
+            print("(no evaluation rows)")
+            return
+
+        by_exp: dict[int, list[dict]] = {}
+        for row in rows:
+            by_exp.setdefault(int(row["experience"]), []).append(row)
+
+        for exp_id in sorted(by_exp):
+            exp_rows = by_exp[exp_id]
+            errors = sum(not row["correct"] for row in exp_rows)
+            accuracy = 1.0 - errors / len(exp_rows)
+            print(
+                f"Exp {exp_id:>2}: errors={errors:>4} / {len(exp_rows):>4}, "
+                f"accuracy={accuracy:.3f}"
+            )
+
     def to_csv(self, path: str) -> None:
-        """Dump the full per-sample log (every row, no truncation) to CSV."""
+        """Dump every evaluated sample to CSV."""
         fieldnames = [
             "train_step",
             "experience",
@@ -217,9 +202,6 @@ class PredictionLogger(SupervisedPlugin):
         print(f"Wrote {len(self.records)} eval rows to {path}")
 
 
-########################################################
-# Metrics helpers (per-experience accuracy; not shipped by the package)
-########################################################
 def evaluate_seen_experiences(
     strategy,
     test_stream,
@@ -227,12 +209,7 @@ def evaluate_seen_experiences(
     pred_logger: PredictionLogger,
     train_step: int,
 ) -> list[float]:
-    """Per-experience test accuracy for experiences 0..up_to_index.
-
-    Evaluates one experience at a time so each accuracy is unambiguously
-    attributable to a single experience, and so `pred_logger` tags every
-    logged sample with the right experience id.
-    """
+    """Evaluate each seen experience separately."""
     accuracies = []
     pred_logger.set_train_step(train_step)
     for i in range(up_to_index + 1):
@@ -249,7 +226,7 @@ def evaluate_seen_experiences(
 
 
 def compute_cl_metrics(accuracy_history: list[list[float]]):
-    """Build accuracy/forgetting curves from a ragged per-step accuracy history."""
+    """Build accuracy/forgetting curves from a ragged accuracy history."""
     n = len(accuracy_history)
     matrix = np.full((n, n), np.nan)
     for t, row in enumerate(accuracy_history):
@@ -267,11 +244,7 @@ def compute_cl_metrics(accuracy_history: list[list[float]]):
     return accuracy_curve, forgetting_curve
 
 
-########################################################
-# Benchmark (skip this cell if train_stream/test_stream already exist)
-########################################################
 benchmark = SplitMNIST(n_experiences=10, seed=0)
-
 train_stream = benchmark.train_stream
 test_stream = benchmark.test_stream
 
@@ -280,11 +253,7 @@ for i, exp in enumerate(train_stream):
     print(i, sorted(exp.classes_in_this_experience), len(exp.dataset))
 
 
-########################################################
-# Strategy
-########################################################
 model = SkillMemoryMLP(input_dim=784).to(device)
-
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 criterion = torch.nn.CrossEntropyLoss()
 
@@ -292,12 +261,12 @@ skill_plugin = SkillMemoryPlugin(
     memory=SkillMemory(max_skills=10),
     forgetting_margin=0.05,
     probe_batch_size=10,
-    probe_batches=5,  # was implicitly 1 batch of 10; now 5 (~50 samples)
-    probe_seed=0,  # reproducible probe sampling across runs
+    probe_batches=5,
+    probe_seed=0,
     class_train_epochs=1,
     class_train_batch_size=64,
-    reuse_is_mutable=True,  # flip to False to A/B against a frozen-skill version
-    eval_routing="probe",  # task-free evaluation; see package README
+    reuse_is_mutable=True,
+    eval_routing="probe",
     verbose=True,
 )
 pred_logger = PredictionLogger()
@@ -310,7 +279,6 @@ strategy = SupervisedTemplate(
     train_epochs=1,
     eval_mb_size=64,
     device=device,
-    # pred_logger MUST come after skill_plugin -- see PredictionLogger docstring.
     plugins=[skill_plugin, pred_logger],
 )
 
@@ -331,29 +299,19 @@ try:
             f"mean seen accuracy = {np.mean(current_accuracies):.3f}"
         )
 
-        # Per-sample eval log for this training step: predicted y vs. real y.
-        print(f"\n--- eval log after training step {t} (predicted y vs. real y) ---")
-        pred_logger.print_log(train_step=t, only_errors=False, max_rows=40)
-        print()
+        # Keep the normal sample-level view, but make the complete error list
+        # explicit for every training step. The error list is intentionally
+        # not truncated so the text artifact is sufficient for diagnosis.
+        pred_logger.print_misclassification_summary(train_step=t)
+        pred_logger.print_misclassifications(train_step=t)
 
     accuracy_curve, forgetting_curve = compute_cl_metrics(accuracy_history)
 
-    print("\n")
-    print("Accuracy:", np.round(accuracy_curve, 3))
+    print("\nAccuracy:", np.round(accuracy_curve, 3))
     print("Forgetting:", np.round(forgetting_curve, 3))
-
-    # Full per-sample log (every evaluated sample across every training
-    # step), for offline inspection -- this is the complete predicted-vs-real
-    # record, unlike the truncated console printouts above.
-    pred_logger.to_csv(str(csv_log_path))
-
-    # Quick look at only the mistakes from the very last (final) evaluation pass.
-    final_step = len(train_stream) - 1
-    print(f"\n--- misclassified samples at final training step ({final_step}) ---")
-    pred_logger.print_log(train_step=final_step, only_errors=True, max_rows=40)
 finally:
-    # Always restore real stdout and close the log file, even on error/Ctrl-C,
-    # so a partial transcript isn't left with a dangling file handle.
+    # Export partial results too if training/evaluation fails or is cancelled.
+    pred_logger.to_csv(str(csv_log_path))
     sys.stdout = _real_stdout
     _terminal_log_file.close()
     print(f"Terminal log saved to {terminal_log_path}")
