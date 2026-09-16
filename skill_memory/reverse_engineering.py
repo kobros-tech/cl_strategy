@@ -94,43 +94,48 @@ class NormalMLReverseEngineer:
         Each pair may contain a batch of reference samples. The scalar target
         is expanded to every sample in that batch. No evaluation labels are
         needed by this method.
+
+        This method may be called from an Avalanche evaluation hook. Avalanche
+        wraps ``eval`` in ``torch.no_grad()``, so explicitly re-enable autograd
+        for this independent ML training step.
         """
         if not pairs:
             self.model = None
             self.input_dim = None
             self.weight_dim = None
             return
-        torch.manual_seed(self.seed)
-        sample_batches = []
-        candidate_batches = []
-        target_batches = []
-        for x, params, target in pairs:
-            samples, candidate = self._features(x, params.weight, params.bias)
-            sample_batches.append(samples)
-            candidate_batches.append(candidate)
-            target_batches.append(
-                torch.full(
-                    (samples.shape[0], 1),
-                    float(target),
-                    dtype=torch.float32,
+        with torch.enable_grad():
+            torch.manual_seed(self.seed)
+            sample_batches = []
+            candidate_batches = []
+            target_batches = []
+            for x, params, target in pairs:
+                samples, candidate = self._features(x, params.weight, params.bias)
+                sample_batches.append(samples)
+                candidate_batches.append(candidate)
+                target_batches.append(
+                    torch.full(
+                        (samples.shape[0], 1),
+                        float(target),
+                        dtype=torch.float32,
+                    )
                 )
-            )
-        samples = torch.cat(sample_batches, dim=0)
-        candidates = torch.cat(candidate_batches, dim=0)
-        targets = torch.cat(target_batches, dim=0)
-        self.input_dim = int(samples.shape[1])
-        self.weight_dim = int(candidates.shape[1] - 1)
-        model = _ReverseModel(self.input_dim, self.weight_dim, self.hidden_size)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
-        criterion = nn.BCEWithLogitsLoss()
-        model.train()
-        for _ in range(self.epochs):
-            optimizer.zero_grad()
-            logits = model(samples, candidates)
-            loss = criterion(logits, targets)
-            loss.backward()
-            optimizer.step()
-        self.model = model.eval()
+            samples = torch.cat(sample_batches, dim=0)
+            candidates = torch.cat(candidate_batches, dim=0)
+            targets = torch.cat(target_batches, dim=0)
+            self.input_dim = int(samples.shape[1])
+            self.weight_dim = int(candidates.shape[1] - 1)
+            model = _ReverseModel(self.input_dim, self.weight_dim, self.hidden_size)
+            optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+            criterion = nn.BCEWithLogitsLoss()
+            model.train()
+            for _ in range(self.epochs):
+                optimizer.zero_grad()
+                logits = model(samples, candidates)
+                loss = criterion(logits, targets)
+                loss.backward()
+                optimizer.step()
+            self.model = model.eval()
 
     def predict_proba(
         self,
