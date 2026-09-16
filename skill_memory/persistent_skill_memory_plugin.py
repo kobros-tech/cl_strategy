@@ -98,6 +98,17 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         weight = candidate_weight.detach().float().cpu().reshape(1, -1)
         weight = weight.expand(samples.shape[0], -1)
         bias = torch.full((samples.shape[0], 1), float(candidate_bias))
+
+        if samples.shape[1] == weight.shape[1]:
+            interaction = samples * weight
+            sample_norm = samples.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            weight_norm = weight.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            cosine = (interaction.sum(dim=1, keepdim=True) / (sample_norm * weight_norm))
+        else:
+            interaction = torch.zeros_like(weight)
+            cosine = torch.zeros((samples.shape[0], 1))
+        dot_product = (samples * weight).sum(dim=1, keepdim=True) if samples.shape[1] == weight.shape[1] else torch.zeros((samples.shape[0], 1))
+
         return torch.cat(
             (
                 samples,
@@ -107,6 +118,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 candidate_probability,
                 weight,
                 bias,
+                interaction,
+                dot_product,
+                cosine,
             ),
             dim=1,
         )
@@ -267,7 +281,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self._fit_reverse_router(strategy)
 
     def _fit_reverse_router(self, strategy) -> None:
-        """Fit once from complete candidate sets; never fit during evaluation."""
+        """Fit from candidate sets using the same candidate behavior as routing."""
         slot_ids = sorted(self.memory.slots())
         records = [
             record
@@ -282,7 +296,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         output_dim = 0
         candidate_dim = 0
-        reference_logits: dict[tuple[int, int], Tensor] = {}
         for record in records:
             candidate_dim = max(
                 candidate_dim,
@@ -292,7 +305,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             )
             for slot in slot_ids:
                 logits = self._frozen_logits(strategy, slot, record.reference_inputs)
-                reference_logits[(record.class_id, slot)] = logits
                 output_dim = max(output_dim, int(logits.shape[-1]))
         if candidate_dim == 0:
             raise RuntimeError("reverse router requires stored candidate class weights")
@@ -309,31 +321,37 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         self._reverse_output_dim = output_dim
         self._reverse_candidate_dim = candidate_dim
+        candidate_logits: dict[tuple[int, int], Tensor] = {}
+        for record in records:
+            for candidate in candidates:
+                key = (record.class_id, candidate.skill_id)
+                if key not in candidate_logits:
+                    candidate_logits[key] = self._frozen_logits(
+                        strategy, candidate.skill_id, record.reference_inputs
+                    )
+
         candidate_sets: list[tuple[Tensor, int]] = []
         for record in records:
             target_index = class_to_candidate.get(record.class_id)
             if target_index is None:
                 continue
-            for slot in slot_ids:
-                logits = reference_logits[(record.class_id, slot)]
-                feature_rows: list[Tensor] = []
-                for sample_index in range(record.reference_inputs.shape[0]):
-                    rows = []
-                    for candidate in candidates:
-                        rows.append(
-                            self._make_features(
-                                record.reference_inputs[sample_index : sample_index + 1],
-                                logits[sample_index : sample_index + 1],
-                                candidate.reference_weight,
-                                candidate.reference_bias,
-                                output_dim,
-                                candidate.class_id,
-                            ).squeeze(0)
-                        )
-                    feature_rows.append(torch.stack(rows, dim=0))
-                candidate_sets.extend(
-                    (rows, target_index) for rows in feature_rows
-                )
+            feature_rows: list[Tensor] = []
+            for sample_index in range(record.reference_inputs.shape[0]):
+                rows = []
+                for candidate in candidates:
+                    logits = candidate_logits[(record.class_id, candidate.skill_id)]
+                    rows.append(
+                        self._make_features(
+                            record.reference_inputs[sample_index : sample_index + 1],
+                            logits[sample_index : sample_index + 1],
+                            candidate.reference_weight,
+                            candidate.reference_bias,
+                            output_dim,
+                            candidate.class_id,
+                        ).squeeze(0)
+                    )
+                feature_rows.append(torch.stack(rows, dim=0))
+            candidate_sets.extend((rows, target_index) for rows in feature_rows)
         self.reverse_engineer.fit_candidate_sets(candidate_sets)
 
     def _route(self, strategy, x: Tensor, slot_ids: list[int]) -> tuple[Tensor, list[int]]:
