@@ -242,7 +242,7 @@ def extract_features_from_weights(model, x: Tensor) -> Tensor:
 
 
 def _classifier_scores(classifier, features: Tensor) -> Tensor:
-    """Compute scores with the same active-unit semantics as the classifier."""
+    """Compute scores with the same active-unit semantics as Avalanche."""
     scores = F.linear(
         features,
         classifier.weight.detach(),
@@ -258,14 +258,14 @@ def _classifier_scores(classifier, features: Tensor) -> Tensor:
         active_mask = active_units.to(torch.bool)
         if not bool(active_mask.any()):
             raise ValueError("classifier has no active output units")
-        scores = scores.masked_fill(~active_mask.unsqueeze(0), -torch.inf)
+        mask_value = getattr(classifier, "mask_value", -1000.0)
+        scores = scores.masked_fill(~active_mask.unsqueeze(0), mask_value)
     return scores
 
 
 def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
     """Reconstruct classifier scores directly from learned head weights."""
-    incremental_classifier = _find_classifier(model)
-    classifier = incremental_classifier.classifier
+    classifier = _find_classifier(model).classifier
     features = extract_features_from_weights(model, x)
     return _classifier_scores(classifier, features)
 
