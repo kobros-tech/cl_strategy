@@ -21,7 +21,12 @@ from .skill_memory_plugin import SkillMemoryPlugin
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     """Skill Memory with persistent binary class-behavior identification."""
 
-    def __init__(self, *args, reverse_engineer_y_fn: Callable | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        reverse_engineer_y_fn: Callable | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
         self.reverse_engineer_y = reverse_engineer_y_fn or reverse_engineer_y
@@ -39,7 +44,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     ) -> ClassBehaviorRecord:
         model = deepcopy(strategy.model)
         logits = predict_logits(model, self.memory.state(skill_id), x)
-        reference_y = self.reverse_engineer_y(logits, class_id).detach().cpu().bool()
+        reference_y = (
+            self.reverse_engineer_y(logits, class_id).detach().cpu().bool()
+        )
         return ClassBehaviorRecord(
             class_id=class_id,
             skill_id=skill_id,
