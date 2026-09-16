@@ -38,7 +38,7 @@ class ClassBehaviorRecord:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> "ClassBehaviorRecord":
+    def from_state_dict(cls, state: dict[str, Any]) -> ClassBehaviorRecord:
         return cls(
             class_id=int(state["class_id"]),
             skill_id=int(state["skill_id"]),
@@ -140,9 +140,7 @@ def compare_binary_behavior(
         "predicted_y": predicted_y,
         "expected_y": bool(expected_y),
         "correct": correct,
-        "accuracy": float(correct.float().mean().item())
-        if correct.numel()
-        else 0.0,
+        "accuracy": float(correct.float().mean().item()) if correct.numel() else 0.0,
         "all_correct": bool(correct.all().item()) if correct.numel() else False,
     }
 

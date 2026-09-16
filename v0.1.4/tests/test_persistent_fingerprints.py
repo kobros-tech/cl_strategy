@@ -135,8 +135,7 @@ def test_binary_route_identifies_one_candidate_and_logs_evidence():
     for item in plugin.last_fingerprint_routes:
         assert len(item["candidates"]) == 2
         assert all(
-            {"class", "skill", "predicted_y", "expected_y", "correct"}
-            <= set(candidate)
+            {"class", "skill", "predicted_y", "expected_y", "correct"} <= set(candidate)
             for candidate in item["candidates"]
         )
 
