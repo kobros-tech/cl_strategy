@@ -58,35 +58,37 @@ def evaluate_seen(strategy, test_stream, up_to_index: int) -> list[float]:
 
 
 def flatten_route(route: dict, train_index: int) -> dict:
-    """Convert one nested routing record into a compact analysis row."""
+    """Convert one binary routing record into a compact analysis row."""
     candidates = route.get("candidates", [])
     top = candidates[0] if candidates else {}
     second = candidates[1] if len(candidates) > 1 else {}
     evaluation_y = route.get("evaluation_y")
+    inferred_class = route.get("class")
     return {
         "training_step": train_index,
         "batch_index": route.get("batch_index", -1),
         "sample_index": route.get("sample_index", -1),
         "evaluation_y": evaluation_y,
         "status": route.get("status"),
-        "inferred_class": route.get("class"),
+        "inferred_class": inferred_class,
         "selected_skill": route.get("skill"),
         "top_candidate_class": top.get("class"),
         "top_candidate_skill": top.get("skill"),
-        "top_evidence": top.get("evidence"),
-        "top_binary_compatible": top.get("binary_compatible"),
-        "top_feature_similarity": top.get("feature_similarity"),
-        "top_margin_similarity": top.get("margin_similarity"),
-        "top_margin": top.get("margin"),
+        "top_candidate_correct": top.get("correct"),
+        "top_class_score": top.get("class_score"),
+        "top_predicted_class": top.get("predicted_class"),
+        "top_binary_compatible": top.get("correct"),
         "second_candidate_class": second.get("class"),
         "second_candidate_skill": second.get("skill"),
-        "second_evidence": second.get("evidence"),
+        "second_candidate_correct": second.get("correct"),
+        "second_class_score": second.get("class_score"),
+        "second_predicted_class": second.get("predicted_class"),
         "reference_accuracy": top.get("reference_accuracy"),
     }
 
 
 def write_analysis_files(log_dir: Path, run_id: str, rows: list[dict]) -> None:
-    """Write compact CSV and JSON routing-analysis artifacts."""
+    """Write CSV and JSON routing-analysis artifacts."""
     csv_path = log_dir / f"weight_reverse_engineering_{run_id}.csv"
     json_path = log_dir / f"weight_reverse_engineering_{run_id}.json"
 
@@ -100,14 +102,15 @@ def write_analysis_files(log_dir: Path, run_id: str, rows: list[dict]) -> None:
         "selected_skill",
         "top_candidate_class",
         "top_candidate_skill",
-        "top_evidence",
+        "top_candidate_correct",
+        "top_class_score",
+        "top_predicted_class",
         "top_binary_compatible",
-        "top_feature_similarity",
-        "top_margin_similarity",
-        "top_margin",
         "second_candidate_class",
         "second_candidate_skill",
-        "second_evidence",
+        "second_candidate_correct",
+        "second_class_score",
+        "second_predicted_class",
         "reference_accuracy",
     ]
     with csv_path.open("w", newline="") as handle:
@@ -115,6 +118,7 @@ def write_analysis_files(log_dir: Path, run_id: str, rows: list[dict]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+    identified = sum(row["status"] == "IDENTIFIED" for row in rows)
     summary = {
         "rows": len(rows),
         "status_counts": {
@@ -127,7 +131,7 @@ def write_analysis_files(log_dir: Path, run_id: str, rows: list[dict]) -> None:
                 and row["inferred_class"] == row["evaluation_y"]
                 for row in rows
             )
-            / max(sum(row["status"] == "IDENTIFIED" for row in rows), 1)
+            / max(identified, 1)
         ),
         "analysis_csv": csv_path.name,
     }
