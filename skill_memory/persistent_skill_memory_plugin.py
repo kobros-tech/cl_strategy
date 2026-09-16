@@ -1,4 +1,4 @@
-"""Skill Memory extension using binary reverse-engineered class behavior."""
+"""Skill Memory extension using binary and continuous weight behavior."""
 
 from __future__ import annotations
 
@@ -11,16 +11,18 @@ from torch import Tensor
 from .behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
+    build_weight_behavior_statistics,
     compare_binary_behavior,
-    reverse_engineer_scores_from_weights,
+    extract_features_from_weights,
     reverse_engineer_y_from_weights,
+    reverse_engineer_scores_from_weights,
 )
 from .probing import apply_skill_state_exact, predict_logits, probe_class
 from .skill_memory_plugin import SkillMemoryPlugin
 
 
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
-    """Skill Memory with persistent binary class-behavior identification."""
+    """Skill Memory with persistent binary and continuous class fingerprints."""
 
     def __init__(
         self,
@@ -60,18 +62,24 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         version: int,
     ) -> ClassBehaviorRecord:
         model = deepcopy(strategy.model)
-        reference_y = self._reverse_engineer_y(
-            model,
-            self.memory.state(skill_id),
-            x,
-            class_id,
+        state = self.memory.state(skill_id)
+        apply_skill_state_exact(model, state)
+        reference_y = reverse_engineer_y_from_weights(
+            model, x, class_id
         ).cpu()
+        statistics = build_weight_behavior_statistics(model, x, class_id)
         return ClassBehaviorRecord(
             class_id=class_id,
             skill_id=skill_id,
             version=version,
             reference_inputs=x.detach().cpu().clone(),
             reference_y=reference_y,
+            reference_feature_mean=statistics["feature_mean"],
+            reference_feature_std=statistics["feature_std"],
+            reference_margin_mean=statistics["margin_mean"],
+            reference_margin_std=statistics["margin_std"],
+            reference_weight=statistics["weight"],
+            reference_bias=statistics["bias"],
         )
 
     def _capture_new_class_inputs(self, experience, experience_index: int) -> None:
@@ -161,9 +169,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self.behavior.bump_skill(skill_id)
             self._refresh_skill(strategy, skill_id, experience)
 
-        # A new class can be attached to an immutable existing skill. In that
-        # case the skill does not need a new generation, but the class still
-        # needs its first persistent reference behavior.
         for class_id, x in sorted(pending.items()):
             skill_id = self.class_map.find_skill_for_class_anywhere(class_id)
             if skill_id is None:
@@ -184,33 +189,95 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
 
+    @staticmethod
+    def _feature_similarity(features: Tensor, record: ClassBehaviorRecord) -> Tensor:
+        """Measure how closely a sample matches a persistent feature fingerprint."""
+        if record.reference_feature_mean is None:
+            return torch.ones(features.shape[0], device=features.device)
+        mean = record.reference_feature_mean.to(features.device)
+        std = record.reference_feature_std.to(features.device).clamp_min(1e-6)
+        z = (features - mean) / std
+        distance = z.square().mean(dim=-1)
+        return torch.exp(-0.5 * distance)
+
+    @staticmethod
+    def _margin_similarity(margin: Tensor, record: ClassBehaviorRecord) -> Tensor:
+        """Measure similarity to the learned class-vs-rest margin distribution."""
+        mean = torch.tensor(
+            record.reference_margin_mean, device=margin.device, dtype=margin.dtype
+        )
+        std = torch.tensor(
+            max(record.reference_margin_std, 1e-6),
+            device=margin.device,
+            dtype=margin.dtype,
+        )
+        z = (margin - mean) / std
+        return torch.exp(-0.5 * z.square())
+
+    def _candidate_evidence(
+        self,
+        scores: Tensor,
+        features: Tensor,
+        record: ClassBehaviorRecord,
+        sample_index: int,
+    ) -> dict:
+        class_id = record.class_id
+        predicted_class = int(scores[sample_index].argmax().item())
+        predicted_y = predicted_class == class_id
+        comparison = compare_binary_behavior(
+            torch.tensor([predicted_y]), record.expected_y
+        )
+        own = scores[sample_index, class_id]
+        if scores.shape[-1] > 1:
+            others = scores[sample_index].clone()
+            others[class_id] = -torch.inf
+            margin = own - others.max()
+        else:
+            margin = own
+        feature_score = self._feature_similarity(
+            features[sample_index : sample_index + 1], record
+        )[0]
+        margin_score = self._margin_similarity(
+            margin.reshape(1), record
+        )[0]
+        evidence = 0.65 * feature_score + 0.35 * margin_score
+        return {
+            "class": class_id,
+            "skill": record.skill_id,
+            "predicted_y": predicted_y,
+            "predicted_class": predicted_class,
+            "expected_y": record.expected_y,
+            "reference_y": record.reference_y.tolist(),
+            "reference_accuracy": record.reference_accuracy,
+            "binary_compatible": bool(comparison["all_correct"]),
+            "class_score": float(own.item()),
+            "margin": float(margin.item()),
+            "feature_similarity": float(feature_score.item()),
+            "margin_similarity": float(margin_score.item()),
+            "evidence": float(evidence.item()),
+        }
+
     def _fingerprint_route(
         self,
         strategy,
         x: Tensor,
         slot_ids: list[int],
     ) -> tuple[Tensor, list[int]]:
-        """Identify a class from learned weights, then resolve its skill."""
+        """Infer class from persistent weight evidence, then resolve its skill."""
         probe_model = deepcopy(strategy.model)
         candidate_records = [
             record
             for slot in slot_ids
             for record in self.behavior.records_for_skill(slot)
         ]
-
-        # Reconstruct the classifier scores from each stored skill's learned
-        # feature extractor + classifier weights.  The default path does not
-        # use the model's returned logits as the reverse-engineering signal.
-        skill_scores: dict[int, Tensor] = {}
+        skill_data: dict[int, tuple[Tensor, Tensor]] = {}
         for slot in slot_ids:
             state = self.memory.state(slot)
-            if self._custom_reverse_engineer_y is None:
-                apply_skill_state_exact(probe_model, state)
-                skill_scores[slot] = reverse_engineer_scores_from_weights(
-                    probe_model, x
-                )
-            else:
-                skill_scores[slot] = predict_logits(probe_model, state, x)
+            apply_skill_state_exact(probe_model, state)
+            skill_data[slot] = (
+                reverse_engineer_scores_from_weights(probe_model, x),
+                extract_features_from_weights(probe_model, x),
+            )
 
         chosen_skills: list[int] = []
         chosen_classes: list[int] = []
@@ -219,46 +286,45 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         for sample_index in range(x.shape[0]):
             matches: list[dict] = []
             for record in candidate_records:
-                scores = skill_scores[record.skill_id]
+                scores, features = skill_data[record.skill_id]
                 if not 0 <= record.class_id < scores.shape[-1]:
                     continue
-                predicted_class = int(scores[sample_index].argmax().item())
-                predicted_y = predicted_class == record.class_id
-                comparison = compare_binary_behavior(
-                    torch.tensor([predicted_y]), record.expected_y
-                )
                 matches.append(
-                    {
-                        "class": record.class_id,
-                        "skill": record.skill_id,
-                        "predicted_y": predicted_y,
-                        "predicted_class": predicted_class,
-                        "expected_y": record.expected_y,
-                        "reference_y": record.reference_y.tolist(),
-                        "reference_accuracy": record.reference_accuracy,
-                        "correct": bool(comparison["all_correct"]),
-                        "class_score": float(
-                            scores[sample_index, record.class_id].item()
-                        ),
-                    }
+                    self._candidate_evidence(
+                        scores, features, record, sample_index
+                    )
                 )
 
-            compatible = [item for item in matches if item["correct"]]
-            if len(compatible) == 1:
-                status = "IDENTIFIED"
-                selected = compatible[0]
-                chosen_classes.append(int(selected["class"]))
-                chosen_skills.append(int(selected["skill"]))
-            elif len(compatible) > 1:
-                status = "AMBIGUOUS"
+            if not matches:
+                status = "FAILED"
                 selected = None
+            else:
+                matches.sort(key=lambda item: item["evidence"], reverse=True)
+                top = matches[0]
+                second = matches[1] if len(matches) > 1 else None
+                if second is None:
+                    clear_winner = True
+                else:
+                    evidence_values = torch.tensor(
+                        [item["evidence"] for item in matches]
+                    )
+                    dispersion = float(evidence_values.std(unbiased=False).item())
+                    gap = top["evidence"] - second["evidence"]
+                    clear_winner = gap > dispersion
+
+                if clear_winner:
+                    status = "IDENTIFIED"
+                    selected = top
+                else:
+                    status = "AMBIGUOUS"
+                    selected = None
+
+            if selected is None:
                 chosen_classes.append(-1)
                 chosen_skills.append(-1)
             else:
-                status = "FAILED"
-                selected = None
-                chosen_classes.append(-1)
-                chosen_skills.append(-1)
+                chosen_classes.append(int(selected["class"]))
+                chosen_skills.append(int(selected["skill"]))
 
             routes.append(
                 {
@@ -330,7 +396,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         return {"behavior": self.behavior.state_dict()}
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore binary behavior state; old checkpoints remain loadable."""
+        """Restore behavior state; old checkpoints remain loadable."""
         behavior_state = state.get("behavior", {})
         self.behavior.load_state_dict(behavior_state)
         self._behavior_initialized = bool(behavior_state.get("records"))
