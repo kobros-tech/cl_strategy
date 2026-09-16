@@ -51,17 +51,25 @@ class SkillMemoryMLP(nn.Module):
 
 
 def evaluate_seen(strategy, test_stream, up_to_index: int) -> list[float]:
-    """Evaluate seen experiences; labels are used only for metrics."""
+    """Evaluate seen experiences through the anonymous routing path."""
     results = strategy.eval([test_stream[i] for i in range(up_to_index + 1)])
     keys = sorted(key for key in results if key.startswith("Top1_Acc_Exp"))
     return [float(results[key]) for key in keys]
 
 
 def flatten_route(route: dict, train_index: int) -> dict:
-    """Convert one binary routing record into a compact analysis row."""
+    """Convert one routing record into a compact analysis row."""
     candidates = route.get("candidates", [])
-    top = candidates[0] if candidates else {}
-    second = candidates[1] if len(candidates) > 1 else {}
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            bool(item.get("correct", False)),
+            float(item.get("continuous_evidence", -1.0)),
+        ),
+        reverse=True,
+    )
+    top = ranked[0] if ranked else {}
+    second = ranked[1] if len(ranked) > 1 else {}
     return {
         "training_step": train_index,
         "evaluation_experience": route.get("evaluation_experience"),
@@ -79,11 +87,13 @@ def flatten_route(route: dict, train_index: int) -> dict:
         "top_class_score": top.get("class_score"),
         "top_predicted_class": top.get("predicted_class"),
         "top_binary_compatible": top.get("correct"),
+        "top_continuous_evidence": top.get("continuous_evidence"),
         "second_candidate_class": second.get("class"),
         "second_candidate_skill": second.get("skill"),
         "second_candidate_correct": second.get("correct"),
         "second_class_score": second.get("class_score"),
         "second_predicted_class": second.get("predicted_class"),
+        "second_continuous_evidence": second.get("continuous_evidence"),
         "reference_accuracy": top.get("reference_accuracy"),
     }
 
@@ -137,7 +147,7 @@ def write_accuracy_matrix(
     run_id: str,
     accuracy_history: list[list[float]],
 ) -> Path:
-    """Write train-step x evaluation-experience accuracy matrix."""
+    """Write train-step x evaluation-experience routed accuracy matrix."""
     path = log_dir / f"weight_reverse_engineering_accuracy_{run_id}.csv"
     max_experiences = max((len(row) for row in accuracy_history), default=0)
     fieldnames = ["training_step"] + [
@@ -166,7 +176,7 @@ def write_analysis_files(
     accuracy_curve: np.ndarray,
     forgetting: np.ndarray,
 ) -> None:
-    """Write CSV/JSON artifacts that separate routing from final metrics."""
+    """Write artifacts that keep routing diagnostics separate from metrics."""
     csv_path = log_dir / f"weight_reverse_engineering_{run_id}.csv"
     json_path = log_dir / f"weight_reverse_engineering_{run_id}.json"
     matrix_path = write_accuracy_matrix(log_dir, run_id, accuracy_history)
@@ -188,11 +198,13 @@ def write_analysis_files(
         "top_class_score",
         "top_predicted_class",
         "top_binary_compatible",
+        "top_continuous_evidence",
         "second_candidate_class",
         "second_candidate_skill",
         "second_candidate_correct",
         "second_class_score",
         "second_predicted_class",
+        "second_continuous_evidence",
         "reference_accuracy",
     ]
     with csv_path.open("w", newline="") as handle:
@@ -215,11 +227,23 @@ def write_analysis_files(
             )
             / max(identified, 1)
         ),
-        "accuracy_curve": accuracy_curve.tolist(),
-        "forgetting": forgetting.tolist(),
+        "routed_accuracy_curve": accuracy_curve.tolist(),
+        "routed_forgetting": forgetting.tolist(),
         "accuracy_matrix_csv": matrix_path.name,
         "routing_by_evaluation_experience": routing_summary(rows),
         "analysis_csv": csv_path.name,
+        "metric_scope": {
+            "accuracy_curve": "anonymous routed model accuracy",
+            "forgetting": "anonymous routed model forgetting",
+            "identified_class_accuracy": (
+                "class-identification accuracy conditional on IDENTIFIED"
+            ),
+            "warning": (
+                "Routed accuracy and forgetting combine routing errors with "
+                "classifier errors. They must not be interpreted as raw skill "
+                "retention without a separate oracle-skill evaluation."
+            ),
+        },
     }
     json_path.write_text(json.dumps(summary, indent=2))
     print("Analysis CSV saved to:", csv_path)
@@ -244,9 +268,13 @@ def main() -> None:
 
         print("Device:", device)
         print(
-            "Routing: persistent class fingerprint -> learned weights -> class -> skill"
+            "Routing: persistent binary fingerprint -> class -> canonical skill"
         )
         print("No experience ID or target class is supplied to routing.")
+        print(
+            "Reported accuracy/forgetting are routed metrics; routing and "
+            "classifier errors are not separated by these values."
+        )
 
         model = SkillMemoryMLP(input_dim=784).to(device)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -291,12 +319,12 @@ def main() -> None:
             print(
                 f"Step {train_index}: classes="
                 f"{sorted(train_exp.classes_in_this_experience)} "
-                f"mean_seen_accuracy={np.mean(accuracies):.3f} "
+                f"mean_seen_routed_accuracy={np.mean(accuracies):.3f} "
                 f"last_batch_routes=(identified={identified}, "
                 f"ambiguous={ambiguous}, failed={failed})"
             )
             for eval_index, accuracy in enumerate(accuracies):
-                print(f"  eval_exp={eval_index}: accuracy={accuracy:.3f}")
+                print(f"  routed_eval_exp={eval_index}: accuracy={accuracy:.3f}")
 
         n = len(accuracy_history)
         accuracy_curve = np.array([accuracy_history[i][i] for i in range(n)])
@@ -306,9 +334,9 @@ def main() -> None:
             if len(seen) > 1:
                 forgetting[class_index] = max(seen[:-1]) - seen[-1]
 
-        print("Accuracy:", np.round(accuracy_curve, 3))
-        print("Forgetting:", np.round(forgetting, 3))
-        print("Evaluation accuracy matrix:")
+        print("Routed accuracy:", np.round(accuracy_curve, 3))
+        print("Routed forgetting:", np.round(forgetting, 3))
+        print("Routed evaluation accuracy matrix:")
         for train_index, accuracies in enumerate(accuracy_history):
             print(
                 f"  train_step={train_index}: "
