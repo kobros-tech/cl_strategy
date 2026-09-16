@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feature/listwise-reverse-routing
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
   splitmnist-weight-reverse-engineering:

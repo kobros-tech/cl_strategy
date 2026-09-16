@@ -18,20 +18,35 @@ class CandidateParameters:
 
 
 class _FeatureReverseModel(nn.Module):
-    """Higher-capacity scorer over frozen-candidate behavior features."""
+    """Cross-candidate Transformer scorer for listwise routing."""
 
-    def __init__(self, feature_dim: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_size: int,
+        num_heads: int = 8,
+        num_layers: int = 3,
+    ) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(feature_dim, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.input_projection = nn.Linear(feature_dim, hidden_size)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output = nn.Linear(hidden_size, 1)
 
     def forward(self, features: Tensor) -> Tensor:
-        return self.network(features)
+        tokens = self.input_projection(features)
+        tokens = self.encoder(tokens)
+        return self.output(tokens)
 
 
 class NormalMLReverseEngineer:
@@ -39,14 +54,12 @@ class NormalMLReverseEngineer:
 
     The primary objective is listwise candidate selection: for every reference
     sample, all currently known class candidates form one candidate set and
-    cross-entropy trains the model to put the correct class at the top. This
-    avoids the one-positive-versus-many-negative calibration problem of an
-    independent binary classifier and naturally scales to large candidate sets.
+    cross-entropy trains the model to put the correct class at the top. The
+    candidate tokens attend to one another, allowing the scorer to reason about
+    the complete candidate set rather than scoring every candidate independently.
 
-    The scorer is a candidate-conditioned MLP. Candidate-specific behavior and
-    classifier parameters are part of each row, while the complete candidate
-    set is handled by the listwise loss at training time and softmax at routing
-    time. The integer class ID is never an input feature.
+    Candidate identity is represented only through model-derived behavior
+    features. The integer class ID is never an input feature.
     """
 
     def __init__(
@@ -55,17 +68,25 @@ class NormalMLReverseEngineer:
         epochs: int = 120,
         learning_rate: float = 1e-3,
         seed: int = 0,
-        batch_size: int = 256,
+        batch_size: int = 32,
         training_mode: str = "listwise",
+        num_heads: int = 8,
+        num_layers: int = 3,
     ) -> None:
         if training_mode not in {"listwise", "binary"}:
             raise ValueError("training_mode must be 'listwise' or 'binary'")
+        if hidden_size <= 0 or num_heads <= 0 or num_layers <= 0:
+            raise ValueError("model dimensions must be positive")
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
         self.hidden_size = int(hidden_size)
         self.epochs = int(epochs)
         self.learning_rate = float(learning_rate)
         self.seed = int(seed)
         self.batch_size = int(batch_size)
         self.training_mode = training_mode
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
         self.model: _FeatureReverseModel | None = None
         self.feature_dim: int | None = None
         self.feature_mean: Tensor | None = None
@@ -78,7 +99,7 @@ class NormalMLReverseEngineer:
         return mean, std
 
     def _fit_model(self, features: Tensor, targets: Tensor) -> None:
-        """Fit the shared scoring network on standardized features."""
+        """Fit the shared cross-candidate scoring network."""
         torch.manual_seed(self.seed)
         self.feature_dim = int(features.shape[-1])
         flat = features.reshape(-1, self.feature_dim)
@@ -86,8 +107,15 @@ class NormalMLReverseEngineer:
         normalized = (features - self.feature_mean) / self.feature_std
         if self.training_mode == "listwise":
             self.hidden_size = max(self.hidden_size, 128)
-        model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+            if self.hidden_size % self.num_heads != 0:
+                raise ValueError("hidden_size must be divisible by num_heads")
+        model = _FeatureReverseModel(
+            self.feature_dim,
+            self.hidden_size,
+            self.num_heads,
+            self.num_layers,
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=self.learning_rate)
 
         if normalized.ndim == 2:
             positive_count = float(targets.sum().item())
@@ -121,10 +149,8 @@ class NormalMLReverseEngineer:
                         indices = order[start : start + batch_size]
                         batch = normalized[indices]
                         batch_targets = targets[indices]
-                        candidate_count = batch.shape[1]
-                        logits = model(
-                            batch.reshape(-1, self.feature_dim)
-                        ).reshape(-1, candidate_count)
+                        logits = model(batch).squeeze(-1)
+                        logits = logits.reshape(-1, batch.shape[1])
                         optimizer.zero_grad(set_to_none=True)
                         loss = criterion(logits, batch_targets)
                         loss.backward()
@@ -139,8 +165,7 @@ class NormalMLReverseEngineer:
 
         Each item is ``(features, target_index)`` where ``features`` has shape
         ``[candidates, feature_dim]`` and ``target_index`` identifies the
-        correct candidate. All candidate sets must contain the same candidates
-        and feature width.
+        correct candidate. Candidate order has no learned positional meaning.
         """
         if not candidate_sets:
             self.model = None
@@ -181,10 +206,7 @@ class NormalMLReverseEngineer:
     ) -> None:
         """Fit from detached frozen-model features and binary targets."""
         if not pairs:
-            self.model = None
-            self.feature_dim = None
-            self.feature_mean = None
-            self.feature_std = None
+            self.fit_candidate_sets([])
             return
         features = torch.cat(
             [feature.detach().float().cpu() for feature, _ in pairs],
@@ -218,7 +240,7 @@ class NormalMLReverseEngineer:
             raise ValueError("reverse-engineering feature shape changed")
         normalized = (features - self.feature_mean) / self.feature_std
         with torch.no_grad():
-            return self.model(normalized).squeeze(-1)
+            return self.model(normalized.unsqueeze(0)).squeeze(0).squeeze(-1)
 
     def predict_proba_features(self, features: Tensor) -> Tensor:
         """Return independent binary probabilities for compatibility mode."""
@@ -264,6 +286,8 @@ class NormalMLReverseEngineer:
             "seed": self.seed,
             "batch_size": self.batch_size,
             "training_mode": self.training_mode,
+            "num_heads": self.num_heads,
+            "num_layers": self.num_layers,
             "feature_dim": self.feature_dim,
             "feature_mean": (
                 None if self.feature_mean is None else self.feature_mean.clone()
@@ -287,6 +311,8 @@ class NormalMLReverseEngineer:
         self.seed = int(state.get("seed", self.seed))
         self.batch_size = int(state.get("batch_size", self.batch_size))
         self.training_mode = state.get("training_mode", self.training_mode)
+        self.num_heads = int(state.get("num_heads", self.num_heads))
+        self.num_layers = int(state.get("num_layers", self.num_layers))
         feature_dim = state.get("feature_dim")
         model_state = state.get("model")
         feature_mean = state.get("feature_mean")
@@ -305,6 +331,11 @@ class NormalMLReverseEngineer:
         self.feature_dim = int(feature_dim)
         self.feature_mean = feature_mean.detach().cpu().clone()
         self.feature_std = feature_std.detach().cpu().clone()
-        model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
+        model = _FeatureReverseModel(
+            self.feature_dim,
+            self.hidden_size,
+            self.num_heads,
+            self.num_layers,
+        )
         model.load_state_dict(model_state)
         self.model = model.eval()
