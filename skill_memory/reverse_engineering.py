@@ -53,16 +53,33 @@ class NormalMLReverseEngineer:
         self.seed = int(seed)
         self.model: _FeatureReverseModel | None = None
         self.feature_dim: int | None = None
+        self.feature_mean: Tensor | None = None
+        self.feature_std: Tensor | None = None
+
+    @staticmethod
+    def _fit_scaler(features: Tensor) -> tuple[Tensor, Tensor]:
+        mean = features.mean(dim=0)
+        std = features.std(dim=0, unbiased=False).clamp_min(1e-6)
+        return mean, std
 
     def fit_feature_pairs(
         self,
         pairs: list[tuple[Tensor, float]],
     ) -> None:
-        """Fit from detached frozen-model features and binary targets."""
+        """Fit from detached frozen-model features and binary targets.
+
+        Features are standardized before fitting so raw pixels, logits,
+        probabilities, and classifier parameters do not compete merely because
+        they have different numeric scales. The positive class is weighted to
+        compensate for the one-positive-versus-many-negative candidate pairs.
+        """
         if not pairs:
             self.model = None
             self.feature_dim = None
+            self.feature_mean = None
+            self.feature_std = None
             return
+
         torch.manual_seed(self.seed)
         features = torch.cat(
             [feature.detach().float().cpu() for feature, _ in pairs],
@@ -80,14 +97,25 @@ class NormalMLReverseEngineer:
             dim=0,
         )
         self.feature_dim = int(features.shape[1])
+        self.feature_mean, self.feature_std = self._fit_scaler(features)
+        normalized = (features - self.feature_mean) / self.feature_std
+
+        positives = float(targets.sum().item())
+        negatives = float(targets.numel() - positives)
+        pos_weight = (
+            torch.tensor(negatives / positives, dtype=torch.float32)
+            if positives > 0 and negatives > 0
+            else torch.tensor(1.0, dtype=torch.float32)
+        )
+
         model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
-        criterion = nn.BCEWithLogitsLoss()
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         model.train()
         with torch.enable_grad():
             for _ in range(self.epochs):
                 optimizer.zero_grad(set_to_none=True)
-                logits = model(features)
+                logits = model(normalized)
                 loss = criterion(logits, targets)
                 loss.backward()
                 optimizer.step()
@@ -95,19 +123,27 @@ class NormalMLReverseEngineer:
 
     def predict_proba_features(self, features: Tensor) -> Tensor:
         """Return candidate-match probabilities for behavior features."""
-        if self.model is None or self.feature_dim is None:
+        if (
+            self.model is None
+            or self.feature_dim is None
+            or self.feature_mean is None
+            or self.feature_std is None
+        ):
             raise RuntimeError("reverse-engineering model has not been fitted")
         features = features.detach().float().cpu()
         if features.ndim != 2 or features.shape[1] != self.feature_dim:
             raise ValueError("reverse-engineering feature shape changed")
+        normalized = (features - self.feature_mean) / self.feature_std
         with torch.no_grad():
-            return torch.sigmoid(self.model(features).squeeze(-1))
+            return torch.sigmoid(self.model(normalized).squeeze(-1))
 
     def fit(self, pairs: list[tuple[Tensor, CandidateParameters, float]]) -> None:
         """Backward-compatible raw-pair API."""
         if not pairs:
             self.model = None
             self.feature_dim = None
+            self.feature_mean = None
+            self.feature_std = None
             return
         feature_pairs = []
         for samples, params, target in pairs:
@@ -143,6 +179,12 @@ class NormalMLReverseEngineer:
             "learning_rate": self.learning_rate,
             "seed": self.seed,
             "feature_dim": self.feature_dim,
+            "feature_mean": (
+                None if self.feature_mean is None else self.feature_mean.clone()
+            ),
+            "feature_std": (
+                None if self.feature_std is None else self.feature_std.clone()
+            ),
             "model": None
             if self.model is None
             else {
@@ -159,11 +201,22 @@ class NormalMLReverseEngineer:
         self.seed = int(state.get("seed", self.seed))
         feature_dim = state.get("feature_dim")
         model_state = state.get("model")
-        if feature_dim is None or model_state is None:
+        feature_mean = state.get("feature_mean")
+        feature_std = state.get("feature_std")
+        if (
+            feature_dim is None
+            or model_state is None
+            or feature_mean is None
+            or feature_std is None
+        ):
             self.model = None
             self.feature_dim = None
+            self.feature_mean = None
+            self.feature_std = None
             return
         self.feature_dim = int(feature_dim)
+        self.feature_mean = feature_mean.detach().cpu().clone()
+        self.feature_std = feature_std.detach().cpu().clone()
         model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
         model.load_state_dict(model_state)
         self.model = model.eval()
