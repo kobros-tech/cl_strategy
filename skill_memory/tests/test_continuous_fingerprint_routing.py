@@ -53,7 +53,7 @@ def test_continuous_candidate_keeps_non_top_cluster_ambiguous():
 def test_continuous_evidence_uses_persistent_reference_statistics():
     record = _record(1)
     features = torch.tensor([[1.0, 0.0]])
-    scores = torch.tensor([[0.0, 2.0, 0.0]])
+    scores = torch.tensor([[0.0, 2.0, 1.0]])
 
     evidence = PersistentFingerprintSkillMemoryPlugin._continuous_evidence(
         record,
