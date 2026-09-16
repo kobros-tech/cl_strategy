@@ -5,7 +5,9 @@ from .behavior import (
     ClassBehaviorRecord,
     compare_binary_behavior,
     identify_binary_behavior,
+    reverse_engineer_scores_from_weights,
     reverse_engineer_y,
+    reverse_engineer_y_from_weights,
 )
 from .decision import find_best_skill
 from .persistent_skill_memory_plugin import PersistentFingerprintSkillMemoryPlugin
@@ -24,7 +26,9 @@ __all__ = [
     "PersistentFingerprintSkillMemoryPlugin",
     "compare_binary_behavior",
     "identify_binary_behavior",
+    "reverse_engineer_scores_from_weights",
     "reverse_engineer_y",
+    "reverse_engineer_y_from_weights",
     "find_best_routing_skill",
     "find_best_skill",
 ]
