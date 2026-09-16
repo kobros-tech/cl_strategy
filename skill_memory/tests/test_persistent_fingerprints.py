@@ -301,3 +301,59 @@ def test_legacy_checkpoint_loads_without_behavior_records():
     plugin.load_state_dict({})
 
     assert plugin._behavior_initialized is False
+
+
+def test_skill_generation_state_is_persisted_and_reused():
+    mod = _load_plugin()
+    cache = mod.BehaviorFingerprintCache()
+    state = {"weight": torch.tensor([1.0, 2.0])}
+
+    cache.put_skill_state(3, 0, state)
+    state["weight"][0] = 99.0
+
+    frozen = cache.skill_state(3, 0)
+    assert frozen is not None
+    assert torch.equal(frozen["weight"], torch.tensor([1.0, 2.0]))
+
+    restored = mod.BehaviorFingerprintCache()
+    restored.load_state_dict(cache.state_dict())
+    restored_state = restored.skill_state(3, 0)
+    assert restored_state is not None
+    assert torch.equal(restored_state["weight"], torch.tensor([1.0, 2.0]))
+
+
+def test_route_uses_frozen_generation_instead_of_current_skill_state():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(
+        verbose=False,
+        reverse_engineer_y_fn=lambda logits, target: logits[:, target] > 0,
+    )
+    plugin.memory.store(0, {"slot": torch.tensor([99.0])})
+    registry = sys.modules["binary_fingerprint_test.skill_registry"]
+    plugin.class_map.record(_registry_record(registry, plugin, 10, 0))
+    plugin.behavior.put(_record(mod, 10, 0))
+    plugin.behavior.put_skill_state(0, 0, {"slot": torch.tensor([10.0])})
+
+    class Model:
+        pass
+
+    seen_slots = []
+
+    def fake_predict(model, state, x):
+        del model
+        seen_slots.append(int(state["slot"].item()))
+        logits = torch.full((x.shape[0], 11), -1.0)
+        if int(state["slot"].item()) == 10:
+            logits[:, 10] = 1.0
+        return logits
+
+    mod.predict_logits = fake_predict
+    chosen, classes = plugin._fingerprint_route(
+        types.SimpleNamespace(model=Model()),
+        torch.tensor([[0.0]]),
+        [0],
+    )
+
+    assert chosen.tolist() == [0]
+    assert classes == [10]
+    assert seen_slots == [10]
