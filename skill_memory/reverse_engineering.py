@@ -16,13 +16,38 @@ class CandidateParameters:
     bias: float
 
 
+class _ReverseModel(nn.Module):
+    """Sample encoder plus candidate-conditioned binary classifier."""
+
+    def __init__(self, sample_dim: int, weight_dim: int, hidden_size: int) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(sample_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, weight_dim),
+            nn.ReLU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(weight_dim * 3 + 1, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, samples: Tensor, candidate: Tensor) -> Tensor:
+        embedding = self.encoder(samples)
+        interaction = embedding * candidate[:, :-1]
+        features = torch.cat((embedding, candidate[:, :-1], interaction, candidate[:, -1:]), dim=1)
+        return self.head(features)
+
+
 class NormalMLReverseEngineer:
     """Learn ``P(y=1 | x, candidate_weights)`` as a normal ML problem.
 
     The reverse model is deliberately independent of the continual-learning
-    feature extractor. It consumes the raw sample and a frozen candidate
-    classifier weight/bias pair. Candidate parameters come from a frozen skill
-    generation, while this model has its own parameters and optimizer.
+    feature extractor. It learns its own sample representation and consumes a
+    frozen candidate classifier weight/bias pair. Candidate parameters come
+    from a frozen skill generation, while this model has its own parameters and
+    optimizer.
     """
 
     def __init__(
@@ -36,8 +61,9 @@ class NormalMLReverseEngineer:
         self.epochs = int(epochs)
         self.learning_rate = float(learning_rate)
         self.seed = int(seed)
-        self.model: nn.Module | None = None
+        self.model: _ReverseModel | None = None
         self.input_dim: int | None = None
+        self.weight_dim: int | None = None
 
     @staticmethod
     def _flatten_samples(x: Tensor) -> Tensor:
@@ -60,10 +86,10 @@ class NormalMLReverseEngineer:
         x: Tensor,
         weight: Tensor,
         bias: float,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         samples = self._flatten_samples(x)
         candidate = self._candidate_vector(weight, bias, samples.shape[0])
-        return torch.cat((samples, candidate), dim=1)
+        return samples, candidate
 
     def fit(self, pairs: list[tuple[Tensor, CandidateParameters, float]]) -> None:
         """Fit from positive/negative reference pairs.
@@ -75,36 +101,35 @@ class NormalMLReverseEngineer:
         if not pairs:
             self.model = None
             self.input_dim = None
+            self.weight_dim = None
             return
         torch.manual_seed(self.seed)
-        feature_batches = []
+        sample_batches = []
+        candidate_batches = []
         target_batches = []
         for x, params, target in pairs:
-            features = self._features(x, params.weight, params.bias)
-            feature_batches.append(features)
+            samples, candidate = self._features(x, params.weight, params.bias)
+            sample_batches.append(samples)
+            candidate_batches.append(candidate)
             target_batches.append(
                 torch.full(
-                    (features.shape[0], 1),
+                    (samples.shape[0], 1),
                     float(target),
                     dtype=torch.float32,
                 )
             )
-        features = torch.cat(feature_batches, dim=0)
+        samples = torch.cat(sample_batches, dim=0)
+        candidates = torch.cat(candidate_batches, dim=0)
         targets = torch.cat(target_batches, dim=0)
-        self.input_dim = int(features.shape[1])
-        model = nn.Sequential(
-            nn.Linear(self.input_dim, self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, 1),
-        )
+        self.input_dim = int(samples.shape[1])
+        self.weight_dim = int(candidates.shape[1] - 1)
+        model = _ReverseModel(self.input_dim, self.weight_dim, self.hidden_size)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
         criterion = nn.BCEWithLogitsLoss()
         model.train()
         for _ in range(self.epochs):
             optimizer.zero_grad()
-            logits = model(features)
+            logits = model(samples, candidates)
             loss = criterion(logits, targets)
             loss.backward()
             optimizer.step()
@@ -117,10 +142,12 @@ class NormalMLReverseEngineer:
         bias: float,
     ) -> Tensor:
         """Return ``P(y=1)`` for each sample/candidate pair."""
-        if self.model is None or self.input_dim is None:
+        if self.model is None or self.input_dim is None or self.weight_dim is None:
             raise RuntimeError("reverse-engineering model has not been fitted")
-        features = self._features(x, weight, bias)
-        if features.shape[1] != self.input_dim:
-            raise ValueError("sample/candidate feature shape changed after fitting")
+        samples, candidate = self._features(x, weight, bias)
+        if samples.shape[1] != self.input_dim:
+            raise ValueError("sample shape changed after fitting")
+        if candidate.shape[1] != self.weight_dim + 1:
+            raise ValueError("candidate weight shape changed after fitting")
         with torch.no_grad():
-            return torch.sigmoid(self.model(features).squeeze(-1))
+            return torch.sigmoid(self.model(samples, candidate).squeeze(-1))
