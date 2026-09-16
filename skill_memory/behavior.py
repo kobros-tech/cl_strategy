@@ -85,13 +85,7 @@ class ClassBehaviorRecord:
 
 
 class BehaviorFingerprintCache:
-    """Version-aware persistent cache of class behavior references.
-
-    A fingerprint must not be recomputed from the live model merely because a
-    later experience changed that model. The binary behavior records therefore
-    share a frozen skill snapshot for each skill generation. A mutable REUSE
-    creates a new generation and deliberately replaces that snapshot.
-    """
+    """Version-aware persistent cache of class behavior references."""
 
     def __init__(self) -> None:
         self._records: dict[int, ClassBehaviorRecord] = {}
@@ -200,12 +194,33 @@ class BehaviorFingerprintCache:
             self._records[record.class_id] = record
 
 
-def _find_classifier(model) -> IncrementalClassifier:
-    """Return the model's Avalanche incremental classifier head."""
+def _find_classifier(model) -> Any:
+    """Return the classifier wrapper used for weight reconstruction.
+
+    Some Avalanche classifier wrappers are not registered as ``nn.Module``
+    children in every supported version. Inspect the conventional top-level
+    ``classifier`` attribute first, then fall back to module traversal.
+    """
+    direct_classifier = getattr(model, "classifier", None)
+    if isinstance(direct_classifier, IncrementalClassifier):
+        return direct_classifier
+    if isinstance(getattr(direct_classifier, "classifier", None), torch.nn.Linear):
+        return direct_classifier
+    if isinstance(direct_classifier, torch.nn.Linear):
+        return model
+
     for module in model.modules():
         if isinstance(module, IncrementalClassifier):
             return module
-    raise ValueError("reverse engineering requires an IncrementalClassifier head")
+
+    for module in model.modules():
+        classifier = getattr(module, "classifier", None)
+        if isinstance(classifier, torch.nn.Linear):
+            return module
+
+    raise ValueError(
+        "reverse engineering requires an IncrementalClassifier-compatible head"
+    )
 
 
 def extract_features_from_weights(model, x: Tensor) -> Tensor:
@@ -238,12 +253,13 @@ def extract_features_from_weights(model, x: Tensor) -> Tensor:
     return features
 
 
-def _classifier_scores(classifier, features: Tensor) -> Tensor:
+def _classifier_scores(classifier: Any, features: Tensor) -> Tensor:
     """Compute scores with the same active-unit semantics as Avalanche."""
+    linear = classifier.classifier
     scores = F.linear(
         features,
-        classifier.weight.detach(),
-        classifier.bias.detach() if classifier.bias is not None else None,
+        linear.weight.detach(),
+        linear.bias.detach() if linear.bias is not None else None,
     )
     active_units = getattr(classifier, "active_units", None)
     if active_units is not None:
@@ -262,7 +278,7 @@ def _classifier_scores(classifier, features: Tensor) -> Tensor:
 
 def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
     """Reconstruct classifier scores directly from learned head weights."""
-    classifier = _find_classifier(model).classifier
+    classifier = _find_classifier(model)
     features = extract_features_from_weights(model, x)
     return _classifier_scores(classifier, features)
 
@@ -274,15 +290,7 @@ def reverse_engineer_y_from_weights(model, x: Tensor, target_class: int) -> Tens
 
 
 def reverse_engineer_y(logits: Tensor, target_class: int) -> Tensor:
-    """Return binary ``y`` from a candidate class score threshold.
-
-    ``y`` is intentionally not defined as ``argmax(logits) == target_class``.
-    Argmax is a multiclass decision and therefore makes exactly one candidate
-    compatible for every sample, including the class produced by a
-    misclassification. A class fingerprint instead tests the candidate's own
-    reconstructed score against the zero decision boundary, allowing zero,
-    one, or multiple candidates to be compatible.
-    """
+    """Return binary ``y`` from a candidate class score threshold."""
     if logits.ndim != 2:
         raise ValueError("logits must have shape [batch, classes]")
     if not 0 <= int(target_class) < logits.shape[-1]:
@@ -317,12 +325,13 @@ def identify_binary_behavior(
 
 def build_weight_behavior_statistics(model, x: Tensor, class_id: int) -> dict[str, Any]:
     """Build continuous, weight-derived statistics for a persistent class."""
-    classifier = _find_classifier(model).classifier
+    classifier = _find_classifier(model)
     features = extract_features_from_weights(model, x)
     scores = _classifier_scores(classifier, features)
     class_id = int(class_id)
     if not 0 <= class_id < scores.shape[-1]:
         raise ValueError("class_id is outside the classifier output")
+    linear = classifier.classifier
     own = scores[:, class_id]
     if scores.shape[-1] > 1:
         other = scores.clone()
@@ -338,10 +347,10 @@ def build_weight_behavior_statistics(model, x: Tensor, class_id: int) -> dict[st
         .cpu(),
         "margin_mean": float(margin.mean().item()),
         "margin_std": max(float(margin.std(unbiased=False).item()), 1e-6),
-        "weight": classifier.weight[class_id].detach().cpu().clone(),
+        "weight": linear.weight[class_id].detach().cpu().clone(),
         "bias": (
-            float(classifier.bias[class_id].item())
-            if classifier.bias is not None
+            float(linear.bias[class_id].item())
+            if linear.bias is not None
             else 0.0
         ),
     }

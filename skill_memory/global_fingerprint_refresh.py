@@ -6,14 +6,7 @@ from typing import Any
 
 
 def refresh_all_fingerprints(plugin: Any, strategy: Any) -> dict[str, int]:
-    """Rebuild every persisted class fingerprint from current skill weights.
-
-    Reference inputs are intentionally retained. Only the reverse-engineered
-    behavior and continuous statistics are recalculated, using the current
-    canonical skill state for every mastered class. This keeps the routing
-    representation synchronized with the model after a complete logical
-    training phase instead of refreshing only the experience that changed.
-    """
+    """Rebuild persisted class fingerprints from current canonical skill weights."""
     records = list(plugin.behavior.state_dict().get("records", []))
     refreshed = 0
     skipped = 0
@@ -38,13 +31,12 @@ def refresh_all_fingerprints(plugin: Any, strategy: Any) -> dict[str, int]:
             version,
             state_dict,
         )
-        plugin.behavior.put(refreshed_record)
         refreshed += 1
         touched_skills.add(skill_id)
+        if refreshed_record is not None:
+            plugin.behavior.put(refreshed_record)
 
-    plugin._behavior_initialized = bool(
-        plugin.behavior.state_dict().get("records")
-    )
+    plugin._behavior_initialized = bool(plugin.behavior.state_dict().get("records"))
     return {
         "records_seen": len(records),
         "records_refreshed": refreshed,

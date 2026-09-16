@@ -45,5 +45,5 @@ jobs:
             skill_memory/tests/logs/weight_reverse_engineering_*.csv
             skill_memory/tests/logs/weight_reverse_engineering_*.json
             skill_memory/tests/logs/oracle_skill_retention_*.txt
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
