@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from avalanche.models.dynamic_modules import IncrementalClassifier
 from torch import Tensor
+import torch.nn.functional as F
 
 
 @dataclass
@@ -38,7 +40,7 @@ class ClassBehaviorRecord:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> ClassBehaviorRecord:
+    def from_state_dict(cls, state: dict[str, Any]) -> "ClassBehaviorRecord":
         return cls(
             class_id=int(state["class_id"]),
             skill_id=int(state["skill_id"]),
@@ -119,8 +121,66 @@ class BehaviorFingerprintCache:
             self._records[record.class_id] = record
 
 
+def _find_classifier(model) -> IncrementalClassifier:
+    """Return the model's Avalanche incremental classifier head."""
+    for module in model.modules():
+        if isinstance(module, IncrementalClassifier):
+            return module
+    raise ValueError("reverse engineering requires an IncrementalClassifier head")
+
+
+def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
+    """Reconstruct classifier scores directly from learned head weights.
+
+    The classifier is an affine map ``scores = features @ W.T + b``.  We
+    capture the representation entering the learned classifier and then
+    explicitly reconstruct that affine map from ``weight`` and ``bias``.
+    This is deliberately different from calling ``model(x)`` and treating
+    the returned logits as the reverse-engineering algorithm.
+    """
+    classifier = _find_classifier(model).classifier
+    captured: dict[str, Tensor] = {}
+
+    def capture_input(_module, inputs, _output) -> None:
+        if not inputs:
+            raise RuntimeError("classifier forward hook received no input")
+        captured["features"] = inputs[0].detach()
+
+    handle = classifier.register_forward_hook(capture_input)
+    try:
+        model.eval()
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            model(x.to(device))
+    finally:
+        handle.remove()
+
+    features = captured.get("features")
+    if features is None:
+        raise RuntimeError("could not capture classifier input features")
+    if features.ndim != 2:
+        raise ValueError(
+            "classifier input must have shape [batch, features] for "
+            "weight-based reverse engineering"
+        )
+
+    weight = classifier.weight.detach()
+    bias = classifier.bias.detach() if classifier.bias is not None else None
+    return F.linear(features, weight, bias)
+
+
+def reverse_engineer_y_from_weights(
+    model, x: Tensor, target_class: int
+) -> Tensor:
+    """Produce binary ``y`` for a candidate class using learned weights."""
+    scores = reverse_engineer_scores_from_weights(model, x)
+    if not 0 <= int(target_class) < scores.shape[-1]:
+        raise ValueError("target_class is outside the classifier output")
+    return scores.argmax(dim=-1).eq(int(target_class))
+
+
 def reverse_engineer_y(logits: Tensor, target_class: int) -> Tensor:
-    """Produce binary ``y`` for a candidate class from classifier output."""
+    """Legacy logits adapter for callers supplying precomputed logits."""
     if logits.ndim != 2:
         raise ValueError("logits must have shape [batch, classes]")
     if not 0 <= int(target_class) < logits.shape[-1]:
