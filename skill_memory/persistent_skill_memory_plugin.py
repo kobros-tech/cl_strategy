@@ -38,6 +38,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         reverse_seed: int = 0,
         **kwargs,
     ):
+        kwargs.setdefault("reuse_is_mutable", False)
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
         self._custom_reverse_engineer_y = reverse_engineer_y_fn
@@ -190,7 +191,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         return changed
 
     def _fit_reverse_router(self, strategy) -> None:
-        """Fit once from frozen skill responses; never fit during evaluation."""
+        """Fit once from aligned frozen responses; never fit during evaluation."""
         slot_ids = sorted(self.memory.slots())
         records = [
             record
@@ -202,42 +203,27 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self._reverse_output_dim = None
             return
 
-        output_dim = int(strategy.model.mbatch_output_dim) if hasattr(
-            strategy.model, "mbatch_output_dim"
-        ) else 0
-        if output_dim <= 0:
-            output_dim = max(
-                predict_logits(
-                    deepcopy(strategy.model), self.memory.state(slot), record.reference_inputs
-                ).shape[-1]
-                for slot in slot_ids
-                for record in self.behavior.records_for_skill(slot)
-            )
+        output_dim = 0
+        reference_logits: dict[tuple[int, int], Tensor] = {}
+        for record in records:
+            for slot in slot_ids:
+                logits = self._frozen_logits(
+                    strategy, slot, record.reference_inputs
+                )
+                reference_logits[(record.class_id, slot)] = logits
+                output_dim = max(output_dim, int(logits.shape[-1]))
         self._reverse_output_dim = output_dim
-        cached_logits: dict[int, Tensor] = {}
-        for slot in slot_ids:
-            skill_records = self.behavior.records_for_skill(slot)
-            if not skill_records:
-                continue
-            state = self.behavior.skill_state(slot, skill_records[0].version)
-            if state is None:
-                state = self.memory.state(slot)
-            model = deepcopy(strategy.model)
-            cached_logits[slot] = predict_logits(
-                model, state, skill_records[0].reference_inputs
-            ).detach().cpu()
 
         pairs: list[tuple[Tensor, float]] = []
         for record in records:
             for slot in slot_ids:
-                logits = cached_logits.get(slot)
-                if logits is None:
-                    continue
+                logits = reference_logits[(record.class_id, slot)]
                 features = self._make_features(
                     record.reference_inputs, logits, output_dim
                 )
-                target = float(slot == record.skill_id)
-                pairs.append((features, target))
+                for candidate in self.behavior.records_for_skill(slot):
+                    target = float(candidate.class_id == record.class_id)
+                    pairs.append((features, target))
         self.reverse_engineer.fit_feature_pairs(pairs)
 
     def before_training_exp(self, strategy, **kwargs) -> None:
@@ -283,7 +269,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self._fit_reverse_router(strategy)
 
     def _route(self, strategy, x: Tensor, slot_ids: list[int]) -> tuple[Tensor, list[int]]:
-        """Route anonymously using only the frozen responses and ML model."""
+        """Route anonymously using only frozen responses and ML probabilities."""
         if self.reverse_engineer.model is None or self._reverse_output_dim is None:
             raise RuntimeError("reverse router has not been fitted")
         records = [
@@ -403,11 +389,10 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             route["model_predicted_class"] = int(prediction)
             route["model_correct"] = int(prediction) == int(label)
 
-        identified = len(self.last_fingerprint_routes)
         self._log(
             "[NORMAL ML routing] "
             f"eval_exp={self._evaluation_experience_index} "
-            f"samples={x.shape[0]} identified={identified} "
+            f"samples={x.shape[0]} identified={len(self.last_fingerprint_routes)} "
             f"matched_classes={class_matches[:5]}"
         )
 
