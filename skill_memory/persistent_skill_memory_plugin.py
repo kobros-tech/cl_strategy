@@ -12,9 +12,10 @@ from .behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
     compare_binary_behavior,
-    reverse_engineer_y,
+    reverse_engineer_scores_from_weights,
+    reverse_engineer_y_from_weights,
 )
-from .probing import predict_logits, probe_class
+from .probing import apply_skill_state_exact, predict_logits, probe_class
 from .skill_memory_plugin import SkillMemoryPlugin
 
 
@@ -29,10 +30,26 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     ):
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
-        self.reverse_engineer_y = reverse_engineer_y_fn or reverse_engineer_y
+        self._custom_reverse_engineer_y = reverse_engineer_y_fn
+        self.reverse_engineer_y = reverse_engineer_y_from_weights
         self._behavior_initialized = False
         self._pending_reference_inputs: dict[int, Tensor] = {}
         self.last_fingerprint_routes: list[dict] = []
+
+    def _reverse_engineer_y(
+        self,
+        model,
+        state_dict: dict,
+        x: Tensor,
+        class_id: int,
+    ) -> Tensor:
+        """Run the configured reverse-engineering method without label leakage."""
+        if self._custom_reverse_engineer_y is not None:
+            logits = predict_logits(model, state_dict, x)
+            return self._custom_reverse_engineer_y(logits, class_id).detach().bool()
+
+        apply_skill_state_exact(model, state_dict)
+        return reverse_engineer_y_from_weights(model, x, class_id).detach().bool()
 
     def _build_record(
         self,
@@ -43,8 +60,12 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         version: int,
     ) -> ClassBehaviorRecord:
         model = deepcopy(strategy.model)
-        logits = predict_logits(model, self.memory.state(skill_id), x)
-        reference_y = self.reverse_engineer_y(logits, class_id).detach().cpu().bool()
+        reference_y = self._reverse_engineer_y(
+            model,
+            self.memory.state(skill_id),
+            x,
+            class_id,
+        ).cpu()
         return ClassBehaviorRecord(
             class_id=class_id,
             skill_id=skill_id,
@@ -169,17 +190,27 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         x: Tensor,
         slot_ids: list[int],
     ) -> tuple[Tensor, list[int]]:
-        """Identify a class from binary ``y``, then resolve its canonical skill."""
+        """Identify a class from learned weights, then resolve its skill."""
         probe_model = deepcopy(strategy.model)
-        raw_logits = {
-            slot: predict_logits(probe_model, self.memory.state(slot), x)
-            for slot in slot_ids
-        }
-        candidates = [
+        candidate_records = [
             record
             for slot in slot_ids
             for record in self.behavior.records_for_skill(slot)
         ]
+
+        # Reconstruct the classifier scores from each stored skill's learned
+        # feature extractor + classifier weights.  The default path does not
+        # use the model's returned logits as the reverse-engineering signal.
+        skill_scores: dict[int, Tensor] = {}
+        for slot in slot_ids:
+            state = self.memory.state(slot)
+            if self._custom_reverse_engineer_y is None:
+                apply_skill_state_exact(probe_model, state)
+                skill_scores[slot] = reverse_engineer_scores_from_weights(
+                    probe_model, x
+                )
+            else:
+                skill_scores[slot] = predict_logits(probe_model, state, x)
 
         chosen_skills: list[int] = []
         chosen_classes: list[int] = []
@@ -187,19 +218,28 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         for sample_index in range(x.shape[0]):
             matches: list[dict] = []
-            for record in candidates:
-                logits = raw_logits[record.skill_id][sample_index : sample_index + 1]
-                predicted_y = self.reverse_engineer_y(logits, record.class_id)
-                comparison = compare_binary_behavior(predicted_y, record.expected_y)
+            for record in candidate_records:
+                scores = skill_scores[record.skill_id]
+                if not 0 <= record.class_id < scores.shape[-1]:
+                    continue
+                predicted_class = int(scores[sample_index].argmax().item())
+                predicted_y = predicted_class == record.class_id
+                comparison = compare_binary_behavior(
+                    torch.tensor([predicted_y]), record.expected_y
+                )
                 matches.append(
                     {
                         "class": record.class_id,
                         "skill": record.skill_id,
-                        "predicted_y": bool(predicted_y.item()),
+                        "predicted_y": predicted_y,
+                        "predicted_class": predicted_class,
                         "expected_y": record.expected_y,
                         "reference_y": record.reference_y.tolist(),
                         "reference_accuracy": record.reference_accuracy,
                         "correct": bool(comparison["all_correct"]),
+                        "class_score": float(
+                            scores[sample_index, record.class_id].item()
+                        ),
                     }
                 )
 
@@ -279,7 +319,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             item["status"] == "FAILED" for item in self.last_fingerprint_routes
         )
         self._log(
-            "[BINARY fingerprint routing] "
+            "[WEIGHT fingerprint routing] "
             f"samples={x.shape[0]} identified={identified} "
             f"ambiguous={ambiguous} failed={failed} "
             f"matched_classes={class_matches[:5]}"
