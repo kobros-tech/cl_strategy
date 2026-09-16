@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import torch
+from avalanche.models.dynamic_modules import IncrementalClassifier
 
 ROOT = Path(__file__).parents[1]
 spec = importlib.util.spec_from_file_location("binary_behavior", ROOT / "behavior.py")
@@ -21,6 +22,15 @@ def _record(class_id=42, skill_id=3, version=0):
     )
 
 
+class _ToyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.classifier = IncrementalClassifier(2, initial_out_features=3)
+
+    def forward(self, x):
+        return self.classifier(x)
+
+
 def test_reverse_engineer_y_is_binary_and_uses_global_class_id():
     logits = torch.zeros(3, 100)
     logits[:, 42] = 10.0
@@ -30,6 +40,23 @@ def test_reverse_engineer_y_is_binary_and_uses_global_class_id():
 
     assert predicted.dtype == torch.bool
     assert predicted.tolist() == [True, False, True]
+
+
+def test_reverse_engineer_scores_ignore_inactive_classifier_units():
+    model = _ToyModel()
+    with torch.no_grad():
+        model.classifier.classifier.weight.zero_()
+        model.classifier.classifier.bias.zero_()
+        model.classifier.classifier.weight[0, 0] = 100.0
+        model.classifier.classifier.weight[1, 0] = 1.0
+        model.classifier.active_units[:] = torch.tensor([0, 1, 0])
+
+    x = torch.tensor([[1.0, 0.0]])
+    actual = model(x).argmax(dim=-1)
+    reconstructed = behavior.reverse_engineer_scores_from_weights(model, x).argmax(dim=-1)
+
+    assert actual.tolist() == [1]
+    assert reconstructed.tolist() == [1]
 
 
 def test_known_class_prediction_is_compared_with_true_expected_y():
