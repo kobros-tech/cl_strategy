@@ -6,12 +6,15 @@ from collections.abc import Callable
 from copy import deepcopy
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from .behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
+    build_weight_behavior_statistics,
     compare_binary_behavior,
+    extract_features_from_weights,
     reverse_engineer_scores_from_weights,
     reverse_engineer_y_from_weights,
 )
@@ -73,12 +76,20 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             x,
             class_id,
         ).cpu()
+        apply_skill_state_exact(model, state_dict)
+        statistics = build_weight_behavior_statistics(model, x, class_id)
         return ClassBehaviorRecord(
             class_id=class_id,
             skill_id=skill_id,
             version=version,
             reference_inputs=x.detach().cpu().clone(),
             reference_y=reference_y,
+            reference_feature_mean=statistics["feature_mean"],
+            reference_feature_std=statistics["feature_std"],
+            reference_margin_mean=statistics["margin_mean"],
+            reference_margin_std=statistics["margin_std"],
+            reference_weight=statistics["weight"],
+            reference_bias=statistics["bias"],
         )
 
     def _capture_new_class_inputs(self, experience, experience_index: int) -> None:
@@ -204,13 +215,96 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
 
+    @staticmethod
+    def _continuous_evidence(
+        record: ClassBehaviorRecord,
+        features: Tensor,
+        scores: Tensor,
+        sample_index: int,
+    ) -> dict[str, float]:
+        """Score one binary-compatible candidate using persistent evidence."""
+        feature = features[sample_index].detach().float().cpu()
+        components: list[float] = []
+
+        if record.reference_feature_mean is not None:
+            reference = record.reference_feature_mean.float()
+            cosine = F.cosine_similarity(
+                feature.unsqueeze(0), reference.unsqueeze(0), dim=1
+            ).item()
+            components.append((float(cosine) + 1.0) / 2.0)
+
+        class_id = record.class_id
+        row = scores[sample_index]
+        own = row[class_id]
+        if row.numel() > 1:
+            other = row.clone()
+            other[class_id] = -torch.inf
+            margin = own - other.max()
+        else:
+            margin = own
+        margin_similarity = torch.exp(
+            -torch.abs(
+                margin.detach().cpu()
+                - float(record.reference_margin_mean)
+            )
+            / max(float(record.reference_margin_std), 1e-6)
+        ).item()
+        components.append(float(margin_similarity))
+
+        if record.reference_weight is not None:
+            weight = row.new_tensor(record.reference_weight).float().cpu()
+            current_weight = record.reference_weight.new_tensor(
+                record.reference_weight
+            ).float()
+            # The current classifier weight is recovered from the score model
+            # through the persistent skill state in the caller.  The reference
+            # weight is therefore retained for checkpoint compatibility, while
+            # feature/margin evidence remains sample-specific.
+            del weight, current_weight
+
+        return {
+            "feature_similarity": components[0] if record.reference_feature_mean is not None else 0.0,
+            "margin_similarity": float(margin_similarity),
+            "evidence": float(sum(components) / len(components)),
+        }
+
+    @staticmethod
+    def _select_continuous_candidate(
+        compatible: list[dict],
+    ) -> dict | None:
+        """Select a candidate only when the evidence has a clear top cluster."""
+        if len(compatible) <= 1:
+            return compatible[0] if compatible else None
+
+        ranked = sorted(
+            compatible,
+            key=lambda item: float(item["continuous_evidence"]),
+            reverse=True,
+        )
+        gaps = [
+            float(ranked[index]["continuous_evidence"])
+            - float(ranked[index + 1]["continuous_evidence"])
+            for index in range(len(ranked) - 1)
+        ]
+        largest_gap_index = max(range(len(gaps)), key=gaps.__getitem__)
+        if largest_gap_index != 0:
+            return None
+        if len(gaps) == 1:
+            return ranked[0]
+
+        remaining_gaps = gaps[1:]
+        baseline = sum(remaining_gaps) / len(remaining_gaps)
+        if gaps[0] > baseline:
+            return ranked[0]
+        return None
+
     def _fingerprint_route(
         self,
         strategy,
         x: Tensor,
         slot_ids: list[int],
     ) -> tuple[Tensor, list[int]]:
-        """Identify a class from frozen skill-generation weights, then resolve its skill."""
+        """Identify a class, then resolve its canonical skill mapping."""
         probe_model = deepcopy(strategy.model)
         candidate_records = [
             record
@@ -218,6 +312,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             for record in self.behavior.records_for_skill(slot)
         ]
         skill_scores: dict[int, Tensor] = {}
+        skill_features: dict[int, Tensor] = {}
         for slot in slot_ids:
             records = self.behavior.records_for_skill(slot)
             if not records:
@@ -225,11 +320,10 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             version = records[0].version
             frozen_state = self.behavior.skill_state(slot, version)
             if frozen_state is None:
-                # Backward-compatible fallback for checkpoints created before
-                # frozen skill-generation states were persisted.
                 frozen_state = self.memory.state(slot)
             if self._custom_reverse_engineer_y is None:
                 apply_skill_state_exact(probe_model, frozen_state)
+                skill_features[slot] = extract_features_from_weights(probe_model, x)
                 skill_scores[slot] = reverse_engineer_scores_from_weights(
                     probe_model, x
                 )
@@ -244,45 +338,53 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             matches: list[dict] = []
             for record in candidate_records:
                 scores = skill_scores.get(record.skill_id)
-                if scores is None:
-                    continue
-                if not 0 <= record.class_id < scores.shape[-1]:
+                if scores is None or not 0 <= record.class_id < scores.shape[-1]:
                     continue
                 predicted_class = int(scores[sample_index].argmax().item())
                 predicted_y = predicted_class == record.class_id
                 comparison = compare_binary_behavior(
                     torch.tensor([predicted_y]), record.expected_y
                 )
-                matches.append(
-                    {
-                        "class": record.class_id,
-                        "skill": record.skill_id,
-                        "predicted_y": predicted_y,
-                        "predicted_class": predicted_class,
-                        "expected_y": record.expected_y,
-                        "reference_y": record.reference_y.tolist(),
-                        "reference_accuracy": record.reference_accuracy,
-                        "correct": bool(comparison["all_correct"]),
-                        "class_score": float(
-                            scores[sample_index, record.class_id].item()
-                        ),
-                    }
-                )
+                match = {
+                    "class": record.class_id,
+                    "skill": record.skill_id,
+                    "predicted_y": predicted_y,
+                    "predicted_class": predicted_class,
+                    "expected_y": record.expected_y,
+                    "reference_y": record.reference_y.tolist(),
+                    "reference_accuracy": record.reference_accuracy,
+                    "correct": bool(comparison["all_correct"]),
+                    "class_score": float(
+                        scores[sample_index, record.class_id].item()
+                    ),
+                }
+                if match["correct"]:
+                    features = skill_features.get(record.skill_id)
+                    if features is not None:
+                        evidence = self._continuous_evidence(
+                            record, features, scores, sample_index
+                        )
+                        match.update(
+                            {
+                                "feature_similarity": evidence["feature_similarity"],
+                                "margin_similarity": evidence["margin_similarity"],
+                                "continuous_evidence": evidence["evidence"],
+                            }
+                        )
+                matches.append(match)
 
             compatible = [item for item in matches if item["correct"]]
-            if len(compatible) == 1:
+            selected = self._select_continuous_candidate(compatible)
+            if not compatible:
+                status = "FAILED"
+            elif selected is None:
+                status = "AMBIGUOUS"
+            else:
                 status = "IDENTIFIED"
-                selected = compatible[0]
                 chosen_classes.append(int(selected["class"]))
                 chosen_skills.append(int(selected["skill"]))
-            elif len(compatible) > 1:
-                status = "AMBIGUOUS"
-                selected = None
-                chosen_classes.append(-1)
-                chosen_skills.append(-1)
-            else:
-                status = "FAILED"
-                selected = None
+
+            if status != "IDENTIFIED":
                 chosen_classes.append(-1)
                 chosen_skills.append(-1)
 
@@ -314,9 +416,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         index = getattr(experience, "current_experience", None)
         if index is None:
             index = getattr(experience, "experience_id", None)
-        self._evaluation_experience_index = (
-            None if index is None else int(index)
-        )
+        self._evaluation_experience_index = None if index is None else int(index)
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
         if not self._eval_active or self.eval_routing != "probe":
@@ -329,8 +429,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         slot_ids = sorted(self.memory.slots())
         chosen, class_matches = self._fingerprint_route(strategy, x, slot_ids)
 
-        # Labels are copied only after routing has finished and are used only
-        # for diagnostics. They never participate in the routing decision.
         for route, label in zip(
             self.last_fingerprint_routes,
             y.detach().cpu().tolist(),
