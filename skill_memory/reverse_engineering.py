@@ -41,10 +41,11 @@ class NormalMLReverseEngineer:
     avoids the one-positive-versus-many-negative calibration problem of an
     independent binary classifier and naturally scales to large candidate sets.
 
-    The default scorer uses a wider hidden layer than the original prototype.
-    This increases nonlinear capacity while reducing the fixed training budget,
-    keeping the default experiment cost in roughly the same range. The older
-    binary-pair API is retained for compatibility and focused tests.
+    Listwise scoring uses at least 128 hidden units by default. A wider scorer
+    gives the model more capacity to learn the nonlinear relationship between
+    samples, frozen responses, and candidate classifier parameters without
+    changing the candidate-set objective or introducing class-ID leakage.
+    The older binary-pair API is retained for compatibility and focused tests.
     """
 
     def __init__(
@@ -82,6 +83,8 @@ class NormalMLReverseEngineer:
         flat = features.reshape(-1, self.feature_dim)
         self.feature_mean, self.feature_std = self._fit_scaler(flat)
         normalized = (features - self.feature_mean) / self.feature_std
+        if self.training_mode == "listwise":
+            self.hidden_size = max(self.hidden_size, 128)
         model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
 
@@ -301,6 +304,8 @@ class NormalMLReverseEngineer:
         self.feature_dim = int(feature_dim)
         self.feature_mean = feature_mean.detach().cpu().clone()
         self.feature_std = feature_std.detach().cpu().clone()
+        if self.training_mode == "listwise":
+            self.hidden_size = max(self.hidden_size, 128)
         model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
         model.load_state_dict(model_state)
         self.model = model.eval()
