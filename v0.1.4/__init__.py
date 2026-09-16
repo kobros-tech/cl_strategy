@@ -3,9 +3,9 @@
 from .behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
-    compare_fingerprint_evolution,
-    fingerprint_similarity,
-    pairwise_reference_similarity,
+    compare_binary_behavior,
+    identify_binary_behavior,
+    reverse_engineer_y,
 )
 from .decision import find_best_skill
 from .persistent_skill_memory_plugin import PersistentFingerprintSkillMemoryPlugin
@@ -22,9 +22,9 @@ __all__ = [
     "SkillMemory",
     "SkillMemoryPlugin",
     "PersistentFingerprintSkillMemoryPlugin",
-    "compare_fingerprint_evolution",
-    "fingerprint_similarity",
-    "pairwise_reference_similarity",
+    "compare_binary_behavior",
+    "identify_binary_behavior",
+    "reverse_engineer_y",
     "find_best_routing_skill",
     "find_best_skill",
 ]
