@@ -37,6 +37,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self.last_fingerprint_routes: list[dict] = []
         self.fingerprint_route_history: list[dict] = []
         self._fingerprint_batch_index = 0
+        self._evaluation_experience_index: int | None = None
 
     def _reverse_engineer_y(
         self,
@@ -274,6 +275,18 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         super().before_eval(strategy, **kwargs)
         self.fingerprint_route_history = []
         self._fingerprint_batch_index = 0
+        self._evaluation_experience_index = None
+
+    def before_eval_exp(self, strategy, **kwargs) -> None:
+        """Record the evaluation experience without using it for routing."""
+        super().before_eval_exp(strategy, **kwargs)
+        experience = strategy.experience
+        index = getattr(experience, "current_experience", None)
+        if index is None:
+            index = getattr(experience, "experience_id", None)
+        self._evaluation_experience_index = (
+            None if index is None else int(index)
+        )
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
         if not self._eval_active or self.eval_routing != "probe":
@@ -294,6 +307,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             strict=False,
         ):
             route["batch_index"] = self._fingerprint_batch_index
+            route["evaluation_experience"] = self._evaluation_experience_index
             route["evaluation_y"] = int(label)
         self.fingerprint_route_history.extend(self.last_fingerprint_routes)
         self._fingerprint_batch_index += 1
@@ -323,6 +337,20 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             stacked = torch.stack(padded, dim=0)
             strategy.mb_output[positions] = stacked[rows, positions]
 
+        # Capture the prediction actually consumed by Avalanche's metric
+        # after routing. This separates a routing decision from the final
+        # model output and makes evaluation failures reconstructable.
+        final_predictions = strategy.mb_output.detach().argmax(dim=-1).cpu().tolist()
+        labels = y.detach().cpu().tolist()
+        for route, prediction, label in zip(
+            self.last_fingerprint_routes,
+            final_predictions,
+            labels,
+            strict=False,
+        ):
+            route["model_predicted_class"] = int(prediction)
+            route["model_correct"] = int(prediction) == int(label)
+
         identified = sum(
             item["status"] == "IDENTIFIED" for item in self.last_fingerprint_routes
         )
@@ -334,6 +362,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         )
         self._log(
             "[WEIGHT fingerprint routing] "
+            f"eval_exp={self._evaluation_experience_index} "
             f"samples={x.shape[0]} identified={identified} "
             f"ambiguous={ambiguous} failed={failed} "
             f"matched_classes={class_matches[:5]}"
