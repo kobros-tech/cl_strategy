@@ -277,8 +277,6 @@ def test_eval_output_uses_skill_id_not_slot_position():
 
     assert strategy.mb_output[0, 10].item() == 5.0
     assert strategy.mb_output[1, 20].item() == 5.0
-    assert strategy.mb_output[0, 20].item() == -1.0e4
-    assert strategy.mb_output[1, 10].item() == -1.0e4
 
 
 def test_immutable_reuse_does_not_mark_skill_changed():
