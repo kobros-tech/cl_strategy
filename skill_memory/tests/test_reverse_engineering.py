@@ -68,6 +68,11 @@ def test_normal_ml_reverse_engineer_listwise_selects_correct_candidate():
     reverse_engineer = NormalMLReverseEngineer(epochs=100, seed=5)
     reverse_engineer.fit_candidate_sets(sets)
 
+    assert reverse_engineer.hidden_size == 128
+    assert sum(
+        isinstance(layer, torch.nn.Linear) for layer in reverse_engineer.model.network
+    ) == 3
+
     scores = reverse_engineer.predict_scores_features(sets[0][0])
     assert int(scores.argmax()) == 0
     scores = reverse_engineer.predict_scores_features(sets[1][0])
