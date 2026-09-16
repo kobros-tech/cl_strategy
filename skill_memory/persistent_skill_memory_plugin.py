@@ -37,6 +37,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._behavior_initialized = False
         self._pending_reference_inputs: dict[int, Tensor] = {}
         self.last_fingerprint_routes: list[dict] = []
+        self.fingerprint_route_history: list[dict] = []
+        self._fingerprint_batch_index = 0
 
     def _reverse_engineer_y(
         self,
@@ -340,6 +342,12 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         chosen = torch.tensor(chosen_skills, dtype=torch.long, device=x.device)
         return chosen, chosen_classes
 
+    def before_eval(self, strategy, **kwargs) -> None:
+        """Start a fresh, complete routing-analysis trace for this eval pass."""
+        super().before_eval(strategy, **kwargs)
+        self.fingerprint_route_history = []
+        self._fingerprint_batch_index = 0
+
     def after_eval_forward(self, strategy, **kwargs) -> None:
         if not self._eval_active or self.eval_routing != "probe":
             return super().after_eval_forward(strategy, **kwargs)
@@ -347,8 +355,21 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             return super().after_eval_forward(strategy, **kwargs)
 
         x = strategy.mbatch[0]
+        y = strategy.mbatch[1]
         slot_ids = sorted(self.memory.slots())
         chosen, class_matches = self._fingerprint_route(strategy, x, slot_ids)
+
+        # Labels are copied into the analysis trace only after routing has
+        # finished. They are never consumed by the routing decision.
+        for route, label in zip(
+            self.last_fingerprint_routes,
+            y.detach().cpu().tolist(),
+            strict=False,
+        ):
+            route["batch_index"] = self._fingerprint_batch_index
+            route["evaluation_y"] = int(label)
+        self.fingerprint_route_history.extend(self.last_fingerprint_routes)
+        self._fingerprint_batch_index += 1
 
         output_model = deepcopy(strategy.model)
         per_skill_logits = [
