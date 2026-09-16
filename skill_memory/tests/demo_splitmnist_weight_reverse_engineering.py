@@ -57,19 +57,34 @@ def evaluate_seen(strategy, test_stream, up_to_index: int) -> list[float]:
     return [float(results[key]) for key in keys]
 
 
+def _correct_candidate_rank(route: dict) -> int | None:
+    """Return the 1-based rank of the true class among candidate scores."""
+    true_class = route.get("evaluation_y")
+    candidates = route.get("candidates", [])
+    if true_class is None or not candidates:
+        return None
+    ranked = sorted(
+        candidates,
+        key=lambda item: float(item.get("score", float("-inf"))),
+        reverse=True,
+    )
+    for rank, candidate in enumerate(ranked, start=1):
+        if candidate.get("class") == true_class:
+            return rank
+    return None
+
+
 def flatten_route(route: dict, train_index: int) -> dict:
     """Convert one routing record into a compact analysis row."""
     candidates = route.get("candidates", [])
     ranked = sorted(
         candidates,
-        key=lambda item: (
-            bool(item.get("correct", False)),
-            float(item.get("continuous_evidence", -1.0)),
-        ),
+        key=lambda item: float(item.get("score", float("-inf"))),
         reverse=True,
     )
     top = ranked[0] if ranked else {}
     second = ranked[1] if len(ranked) > 1 else {}
+    correct_rank = _correct_candidate_rank(route)
     return {
         "training_step": train_index,
         "evaluation_experience": route.get("evaluation_experience"),
@@ -81,20 +96,71 @@ def flatten_route(route: dict, train_index: int) -> dict:
         "selected_skill": route.get("skill"),
         "model_predicted_class": route.get("model_predicted_class"),
         "model_correct": route.get("model_correct"),
+        "correct_class_rank": correct_rank,
         "top_candidate_class": top.get("class"),
         "top_candidate_skill": top.get("skill"),
-        "top_candidate_correct": top.get("correct"),
-        "top_class_score": top.get("class_score"),
-        "top_predicted_class": top.get("predicted_class"),
-        "top_binary_compatible": top.get("correct"),
-        "top_continuous_evidence": top.get("continuous_evidence"),
+        "top_candidate_correct": (
+            top.get("class") == route.get("evaluation_y")
+        ),
+        "top_class_score": top.get("score"),
+        "top_probability": top.get("probability"),
         "second_candidate_class": second.get("class"),
         "second_candidate_skill": second.get("skill"),
-        "second_candidate_correct": second.get("correct"),
-        "second_class_score": second.get("class_score"),
-        "second_predicted_class": second.get("predicted_class"),
-        "second_continuous_evidence": second.get("continuous_evidence"),
-        "reference_accuracy": top.get("reference_accuracy"),
+        "second_candidate_correct": (
+            second.get("class") == route.get("evaluation_y")
+        ),
+        "second_class_score": second.get("score"),
+        "second_probability": second.get("probability"),
+        "reference_accuracy": route.get("reference_accuracy"),
+    }
+
+
+def rank_summary(rows: list[dict]) -> dict:
+    """Summarize true-class rank without feeding labels into routing."""
+    ranks = [
+        int(row["correct_class_rank"])
+        for row in rows
+        if row.get("status") == "IDENTIFIED"
+        and row.get("correct_class_rank") is not None
+    ]
+    if not ranks:
+        return {
+            "samples": 0,
+            "top1_accuracy": 0.0,
+            "top2_accuracy": 0.0,
+            "top3_accuracy": 0.0,
+            "top5_accuracy": 0.0,
+            "top10_accuracy": 0.0,
+            "mean_reciprocal_rank": 0.0,
+            "mean_correct_class_rank": 0.0,
+            "rank_histogram": {},
+        }
+
+    return {
+        "samples": len(ranks),
+        "top1_accuracy": sum(rank <= 1 for rank in ranks) / len(ranks),
+        "top2_accuracy": sum(rank <= 2 for rank in ranks) / len(ranks),
+        "top3_accuracy": sum(rank <= 3 for rank in ranks) / len(ranks),
+        "top5_accuracy": sum(rank <= 5 for rank in ranks) / len(ranks),
+        "top10_accuracy": sum(rank <= 10 for rank in ranks) / len(ranks),
+        "mean_reciprocal_rank": sum(1.0 / rank for rank in ranks) / len(ranks),
+        "mean_correct_class_rank": float(np.mean(ranks)),
+        "rank_histogram": {
+            str(rank): ranks.count(rank) for rank in sorted(set(ranks))
+        },
+    }
+
+
+def rank_summary_by_experience(rows: list[dict]) -> dict:
+    """Return the same rank diagnostics separately for each eval experience."""
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        experience = row.get("evaluation_experience")
+        if experience is not None:
+            grouped.setdefault(str(experience), []).append(row)
+    return {
+        experience: rank_summary(experience_rows)
+        for experience, experience_rows in sorted(grouped.items())
     }
 
 
@@ -192,19 +258,17 @@ def write_analysis_files(
         "selected_skill",
         "model_predicted_class",
         "model_correct",
+        "correct_class_rank",
         "top_candidate_class",
         "top_candidate_skill",
         "top_candidate_correct",
         "top_class_score",
-        "top_predicted_class",
-        "top_binary_compatible",
-        "top_continuous_evidence",
+        "top_probability",
         "second_candidate_class",
         "second_candidate_skill",
         "second_candidate_correct",
         "second_class_score",
-        "second_predicted_class",
-        "second_continuous_evidence",
+        "second_probability",
         "reference_accuracy",
     ]
     with csv_path.open("w", newline="") as handle:
@@ -231,12 +295,19 @@ def write_analysis_files(
         "routed_forgetting": forgetting.tolist(),
         "accuracy_matrix_csv": matrix_path.name,
         "routing_by_evaluation_experience": routing_summary(rows),
+        "routing_rank_diagnostics": rank_summary(rows),
+        "routing_rank_by_evaluation_experience": rank_summary_by_experience(rows),
         "analysis_csv": csv_path.name,
         "metric_scope": {
             "accuracy_curve": "anonymous routed model accuracy",
             "forgetting": "anonymous routed model forgetting",
             "identified_class_accuracy": (
                 "class-identification accuracy conditional on IDENTIFIED"
+            ),
+            "rank_diagnostics": (
+                "post-routing diagnostic: evaluation labels are used only to "
+                "measure where the true class ranked among already-computed "
+                "candidate scores; labels are never routing inputs"
             ),
             "warning": (
                 "Routed accuracy and forgetting combine routing errors with "
@@ -249,6 +320,7 @@ def write_analysis_files(
     print("Analysis CSV saved to:", csv_path)
     print("Accuracy matrix CSV saved to:", matrix_path)
     print("Analysis JSON saved to:", json_path)
+    print("Routing rank diagnostics:", json.dumps(summary["routing_rank_diagnostics"], indent=2))
 
 
 def main() -> None:
