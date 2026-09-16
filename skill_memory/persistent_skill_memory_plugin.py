@@ -51,6 +51,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._behavior_initialized = False
         self._pending_reference_inputs: dict[int, Tensor] = {}
         self._reverse_output_dim: int | None = None
+        self._reverse_candidate_dim: int | None = None
         self.last_fingerprint_routes: list[dict] = []
         self.fingerprint_route_history: list[dict] = []
         self._fingerprint_batch_index = 0
@@ -69,13 +70,24 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         cls,
         x: Tensor,
         logits: Tensor,
+        candidate_weight: Tensor,
+        candidate_bias: float,
         output_dim: int,
     ) -> Tensor:
-        """Build normal-ML inputs from raw samples and full frozen responses."""
+        """Build normal-ML inputs for one candidate class.
+
+        The candidate class must be part of the input representation. Full
+        skill logits alone identify a skill, not a class inside a skill. Without
+        candidate-specific parameters, two class records belonging to the same
+        skill produce identical inputs but opposite training targets.
+        """
         samples = x.detach().float().cpu().reshape(x.shape[0], -1)
         padded = cls._pad_logits(logits.detach().float().cpu(), output_dim)
         probabilities = torch.softmax(padded, dim=-1)
-        return torch.cat((samples, padded, probabilities), dim=1)
+        weight = candidate_weight.detach().float().cpu().reshape(1, -1)
+        weight = weight.expand(samples.shape[0], -1)
+        bias = torch.full((samples.shape[0], 1), float(candidate_bias))
+        return torch.cat((samples, padded, probabilities, weight, bias), dim=1)
 
     def _frozen_logits(
         self,
@@ -190,42 +202,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 changed.add(int(skill_id))
         return changed
 
-    def _fit_reverse_router(self, strategy) -> None:
-        """Fit once from aligned frozen responses; never fit during evaluation."""
-        slot_ids = sorted(self.memory.slots())
-        records = [
-            record
-            for slot in slot_ids
-            for record in self.behavior.records_for_skill(slot)
-        ]
-        if not records:
-            self.reverse_engineer.fit_feature_pairs([])
-            self._reverse_output_dim = None
-            return
-
-        output_dim = 0
-        reference_logits: dict[tuple[int, int], Tensor] = {}
-        for record in records:
-            for slot in slot_ids:
-                logits = self._frozen_logits(
-                    strategy, slot, record.reference_inputs
-                )
-                reference_logits[(record.class_id, slot)] = logits
-                output_dim = max(output_dim, int(logits.shape[-1]))
-        self._reverse_output_dim = output_dim
-
-        pairs: list[tuple[Tensor, float]] = []
-        for record in records:
-            for slot in slot_ids:
-                logits = reference_logits[(record.class_id, slot)]
-                features = self._make_features(
-                    record.reference_inputs, logits, output_dim
-                )
-                for candidate in self.behavior.records_for_skill(slot):
-                    target = float(candidate.class_id == record.class_id)
-                    pairs.append((features, target))
-        self.reverse_engineer.fit_feature_pairs(pairs)
-
     def before_training_exp(self, strategy, **kwargs) -> None:
         super().before_training_exp(strategy, **kwargs)
 
@@ -268,8 +244,64 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         if self._behavior_initialized:
             self._fit_reverse_router(strategy)
 
+    def _fit_reverse_router(self, strategy) -> None:
+        """Fit once from aligned frozen responses; never fit during evaluation."""
+        slot_ids = sorted(self.memory.slots())
+        records = [
+            record
+            for slot in slot_ids
+            for record in self.behavior.records_for_skill(slot)
+        ]
+        if not records:
+            self.reverse_engineer.fit_feature_pairs([])
+            self._reverse_output_dim = None
+            self._reverse_candidate_dim = None
+            return
+
+        output_dim = 0
+        candidate_dim = 0
+        reference_logits: dict[tuple[int, int], Tensor] = {}
+        for record in records:
+            candidate_dim = max(
+                candidate_dim,
+                int(record.reference_weight.numel())
+                if record.reference_weight is not None
+                else 0,
+            )
+            for slot in slot_ids:
+                logits = self._frozen_logits(
+                    strategy, slot, record.reference_inputs
+                )
+                reference_logits[(record.class_id, slot)] = logits
+                output_dim = max(output_dim, int(logits.shape[-1]))
+        if candidate_dim == 0:
+            raise RuntimeError("reverse router requires stored candidate class weights")
+        self._reverse_output_dim = output_dim
+        self._reverse_candidate_dim = candidate_dim
+
+        pairs: list[tuple[Tensor, float]] = []
+        for record in records:
+            for slot in slot_ids:
+                logits = reference_logits[(record.class_id, slot)]
+                for candidate in self.behavior.records_for_skill(slot):
+                    if candidate.reference_weight is None:
+                        continue
+                    weight = candidate.reference_weight
+                    if weight.numel() != candidate_dim:
+                        continue
+                    features = self._make_features(
+                        record.reference_inputs,
+                        logits,
+                        weight,
+                        candidate.reference_bias,
+                        output_dim,
+                    )
+                    target = float(candidate.class_id == record.class_id)
+                    pairs.append((features, target))
+        self.reverse_engineer.fit_feature_pairs(pairs)
+
     def _route(self, strategy, x: Tensor, slot_ids: list[int]) -> tuple[Tensor, list[int]]:
-        """Route anonymously using only frozen responses and ML probabilities."""
+        """Route anonymously using frozen responses and ML probabilities."""
         if self.reverse_engineer.model is None or self._reverse_output_dim is None:
             raise RuntimeError("reverse router has not been fitted")
         records = [
@@ -286,10 +318,20 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         route_candidates: list[tuple[ClassBehaviorRecord, Tensor]] = []
         for record in records:
             logits = self._frozen_logits(strategy, record.skill_id, x)
-            features = self._make_features(x, logits, self._reverse_output_dim)
+            if record.reference_weight is None:
+                continue
+            features = self._make_features(
+                x,
+                logits,
+                record.reference_weight,
+                record.reference_bias,
+                self._reverse_output_dim,
+            )
             probability = self.reverse_engineer.predict_proba_features(features)
             route_candidates.append((record, probability))
 
+        if not route_candidates:
+            raise RuntimeError("reverse router has no candidates with class weights")
         probabilities = torch.stack([item[1] for item in route_candidates], dim=1)
         best = probabilities.argmax(dim=1)
         chosen_skills: list[int] = []
@@ -402,6 +444,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             "behavior": self.behavior.state_dict(),
             "reverse_engineer": self.reverse_engineer.state_dict(),
             "reverse_output_dim": self._reverse_output_dim,
+            "reverse_candidate_dim": self._reverse_candidate_dim,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -411,4 +454,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self.reverse_engineer.load_state_dict(state.get("reverse_engineer", {}))
         output_dim = state.get("reverse_output_dim")
         self._reverse_output_dim = None if output_dim is None else int(output_dim)
+        candidate_dim = state.get("reverse_candidate_dim")
+        self._reverse_candidate_dim = (
+            None if candidate_dim is None else int(candidate_dim)
+        )
         self._behavior_initialized = bool(behavior_state.get("records"))
