@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 
 from torch import Tensor
@@ -19,9 +20,10 @@ from .skill_memory_plugin import SkillMemoryPlugin
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     """Skill Memory with persistent binary class-behavior identification."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, reverse_engineer_y_fn: Callable | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
+        self.reverse_engineer_y = reverse_engineer_y_fn or reverse_engineer_y
         self._behavior_initialized = False
         self._pending_reference_inputs: dict[int, Tensor] = {}
         self.last_fingerprint_routes: list[dict] = []
@@ -36,7 +38,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
     ) -> ClassBehaviorRecord:
         model = deepcopy(strategy.model)
         logits = predict_logits(model, self.memory.state(skill_id), x)
-        reference_y = reverse_engineer_y(logits, class_id).detach().cpu()
+        reference_y = self.reverse_engineer_y(logits, class_id).detach().cpu().bool()
         return ClassBehaviorRecord(
             class_id=class_id,
             skill_id=skill_id,
@@ -152,20 +154,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             for record in self.behavior.records_for_skill(slot)
         ]
 
-        if not candidates:
-            self.last_fingerprint_routes = [
-                {
-                    "sample_index": index,
-                    "status": "FAILED",
-                    "class": None,
-                    "skill": None,
-                    "predicted_y": None,
-                    "expected_y": True,
-                }
-                for index in range(x.shape[0])
-            ]
-            return torch.zeros(x.shape[0], dtype=torch.long, device=x.device), [-1] * x.shape[0]
-
         chosen_skills: list[int] = []
         chosen_classes: list[int] = []
         routes: list[dict] = []
@@ -174,7 +162,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             matches: list[dict] = []
             for record in candidates:
                 logits = raw_logits[record.skill_id][sample_index : sample_index + 1]
-                predicted_y = reverse_engineer_y(logits, record.class_id)
+                predicted_y = self.reverse_engineer_y(logits, record.class_id)
                 comparison = compare_binary_behavior(predicted_y, record.expected_y)
                 matches.append(
                     {
@@ -210,8 +198,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     "status": status,
                     "class": None if selected is None else selected["class"],
                     "skill": None if selected is None else selected["skill"],
-                    "predicted_y": [item["predicted_y"] for item in matches],
-                    "expected_y": [item["expected_y"] for item in matches],
                     "candidates": matches,
                 }
             )
@@ -247,13 +233,18 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         if valid.any():
             rows = chosen[valid]
             positions = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-            strategy.mb_output[positions] = torch.stack(padded, dim=0)[
-                rows, positions
-            ]
+            stacked = torch.stack(padded, dim=0)
+            strategy.mb_output[positions] = stacked[rows, positions]
 
-        identified = sum(item["status"] == "IDENTIFIED" for item in self.last_fingerprint_routes)
-        ambiguous = sum(item["status"] == "AMBIGUOUS" for item in self.last_fingerprint_routes)
-        failed = sum(item["status"] == "FAILED" for item in self.last_fingerprint_routes)
+        identified = sum(
+            item["status"] == "IDENTIFIED" for item in self.last_fingerprint_routes
+        )
+        ambiguous = sum(
+            item["status"] == "AMBIGUOUS" for item in self.last_fingerprint_routes
+        )
+        failed = sum(
+            item["status"] == "FAILED" for item in self.last_fingerprint_routes
+        )
         self._log(
             "[BINARY fingerprint routing] "
             f"samples={x.shape[0]} identified={identified} "
