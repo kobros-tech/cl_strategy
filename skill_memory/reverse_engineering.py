@@ -17,7 +17,7 @@ class CandidateParameters:
 
 
 class _ReverseModel(nn.Module):
-    """Sample encoder plus candidate-conditioned binary classifier."""
+    """Learn a sample representation conditioned on candidate weights."""
 
     def __init__(self, sample_dim: int, weight_dim: int, hidden_size: int) -> None:
         super().__init__()
@@ -25,19 +25,16 @@ class _ReverseModel(nn.Module):
             nn.Linear(sample_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, weight_dim),
-            nn.ReLU(),
-        )
-        self.head = nn.Sequential(
-            nn.Linear(weight_dim * 3 + 1, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
         )
 
     def forward(self, samples: Tensor, candidate: Tensor) -> Tensor:
         embedding = self.encoder(samples)
-        interaction = embedding * candidate[:, :-1]
-        features = torch.cat((embedding, candidate[:, :-1], interaction, candidate[:, -1:]), dim=1)
-        return self.head(features)
+        candidate_weight = candidate[:, :-1]
+        candidate_bias = candidate[:, -1:]
+        return (
+            (embedding * candidate_weight).sum(dim=1, keepdim=True)
+            + candidate_bias
+        )
 
 
 class NormalMLReverseEngineer:
@@ -53,8 +50,8 @@ class NormalMLReverseEngineer:
     def __init__(
         self,
         hidden_size: int = 64,
-        epochs: int = 80,
-        learning_rate: float = 1e-3,
+        epochs: int = 120,
+        learning_rate: float = 1e-2,
         seed: int = 0,
     ) -> None:
         self.hidden_size = int(hidden_size)
