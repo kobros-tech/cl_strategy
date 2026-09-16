@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-root = Path(__file__).parents[1]
+ROOT = Path(__file__).parents[1]
 
 
 def _load_plugin():
@@ -31,6 +31,8 @@ def _load_plugin():
     dynamic.IncrementalClassifier = IncrementalClassifier
     dynamic.avalanche_model_adaptation = lambda model, experience: None
     models.dynamic_modules = dynamic
+    avalanche.models = models
+    training.plugins = plugins
     sys.modules.update(
         {
             "avalanche": avalanche,
@@ -42,8 +44,8 @@ def _load_plugin():
         }
     )
 
-    package = types.ModuleType("persistent_test_package")
-    package.__path__ = [str(root)]
+    package = types.ModuleType("binary_fingerprint_test")
+    package.__path__ = [str(ROOT)]
     sys.modules[package.__name__] = package
 
     for name in (
@@ -58,7 +60,7 @@ def _load_plugin():
         module_name = f"{package.__name__}.{name}"
         spec = importlib.util.spec_from_file_location(
             module_name,
-            root / f"{name}.py",
+            ROOT / f"{name}.py",
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
@@ -67,220 +69,191 @@ def _load_plugin():
     return sys.modules[f"{package.__name__}.persistent_skill_memory_plugin"]
 
 
-def _record(mod, class_id, skill_id, values):
+def _record(mod, class_id, skill_id):
     return mod.ClassBehaviorRecord(
         class_id=class_id,
         skill_id=skill_id,
         version=0,
-        reference_inputs=torch.ones(1, 2),
-        output_class_ids=tuple(sorted(values)),
-        reference_output=torch.tensor([values[c] for c in sorted(values)]),
-        reference_summary=torch.ones(4),
+        reference_inputs=torch.ones(2, 1),
+        reference_y=torch.tensor([True, True]),
     )
 
 
-def test_changed_skill_collection_respects_mutability():
+def _registry_record(registry, plugin, class_id, skill_id):
+    return registry.ClassRecord(
+        experience_index=0,
+        class_id=class_id,
+        decision=plugin.SCRATCH,
+        skill=skill_id,
+    )
+
+
+def test_binary_route_identifies_one_candidate_and_logs_evidence():
     mod = _load_plugin()
-    plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(
+        verbose=False,
+        reverse_engineer_y_fn=lambda logits, target: logits[:, target] > 0,
+    )
+    plugin.memory.store(0, {"slot": torch.tensor([0.0])})
+    plugin.memory.store(1, {"slot": torch.tensor([1.0])})
+
+    registry = sys.modules["binary_fingerprint_test.skill_registry"]
+    plugin.class_map.record(_registry_record(registry, plugin, 10, 0))
+    plugin.class_map.record(_registry_record(registry, plugin, 20, 1))
+    plugin.behavior.put(_record(mod, 10, 0))
+    plugin.behavior.put(_record(mod, 20, 1))
+
+    class Model:
+        pass
+
+    strategy = types.SimpleNamespace(model=Model())
+
+    def fake_predict(model, state, x):
+        del model
+        logits = torch.full((x.shape[0], 21), -1.0)
+        slot = int(state["slot"].item())
+        for row, value in enumerate(x[:, 0].tolist()):
+            if slot == 0 and value == 10:
+                logits[row, 10] = 1.0
+            if slot == 1 and value == 20:
+                logits[row, 20] = 1.0
+        return logits
+
+    mod.predict_logits = fake_predict
+    chosen, classes = plugin._fingerprint_route(
+        strategy,
+        torch.tensor([[10.0], [20.0]]),
+        [0, 1],
+    )
+
+    assert chosen.tolist() == [0, 1]
+    assert classes == [10, 20]
+    assert [item["status"] for item in plugin.last_fingerprint_routes] == [
+        "IDENTIFIED",
+        "IDENTIFIED",
+    ]
+    for item in plugin.last_fingerprint_routes:
+        assert len(item["candidates"]) == 2
+        assert all(
+            {"class", "skill", "predicted_y", "expected_y", "correct"}
+            <= set(candidate)
+            for candidate in item["candidates"]
+        )
+
+
+def test_binary_route_is_ambiguous_when_multiple_candidates_return_true():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(
+        verbose=False,
+        reverse_engineer_y_fn=lambda logits, target: torch.ones(
+            logits.shape[0], dtype=torch.bool
+        ),
+    )
+    plugin.memory.store(0, {"slot": torch.tensor([0.0])})
+    plugin.memory.store(1, {"slot": torch.tensor([1.0])})
+    registry = sys.modules["binary_fingerprint_test.skill_registry"]
+    plugin.class_map.record(_registry_record(registry, plugin, 10, 0))
+    plugin.class_map.record(_registry_record(registry, plugin, 20, 1))
+    plugin.behavior.put(_record(mod, 10, 0))
+    plugin.behavior.put(_record(mod, 20, 1))
+
+    class Model:
+        pass
+
+    mod.predict_logits = lambda model, state, x: torch.zeros(x.shape[0], 21)
+    chosen, classes = plugin._fingerprint_route(
+        types.SimpleNamespace(model=Model()),
+        torch.tensor([[0.0]]),
+        [0, 1],
+    )
+
+    assert chosen.tolist() == [-1]
+    assert classes == [-1]
+    assert plugin.last_fingerprint_routes[0]["status"] == "AMBIGUOUS"
+    assert len(plugin.last_fingerprint_routes[0]["candidates"]) == 2
+
+
+def test_binary_route_fails_when_no_candidate_returns_expected_y():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(
+        verbose=False,
+        reverse_engineer_y_fn=lambda logits, target: torch.zeros(
+            logits.shape[0], dtype=torch.bool
+        ),
+    )
+    plugin.memory.store(0, {"slot": torch.tensor([0.0])})
+    registry = sys.modules["binary_fingerprint_test.skill_registry"]
+    plugin.class_map.record(_registry_record(registry, plugin, 10, 0))
+    plugin.behavior.put(_record(mod, 10, 0))
+
+    class Model:
+        pass
+
+    mod.predict_logits = lambda model, state, x: torch.zeros(x.shape[0], 11)
+    chosen, classes = plugin._fingerprint_route(
+        types.SimpleNamespace(model=Model()),
+        torch.tensor([[0.0]]),
+        [0],
+    )
+
+    assert chosen.tolist() == [-1]
+    assert classes == [-1]
+    assert plugin.last_fingerprint_routes[0]["status"] == "FAILED"
+
+
+def test_multiclass_skill_keeps_class_identity_then_resolves_same_skill():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(
+        verbose=False,
+        reverse_engineer_y_fn=lambda logits, target: logits[:, target] > 0,
+    )
+    plugin.memory.store(0, {"slot": torch.tensor([0.0])})
+    registry = sys.modules["binary_fingerprint_test.skill_registry"]
+    for class_id in (10, 20):
+        plugin.class_map.record(_registry_record(registry, plugin, class_id, 0))
+        plugin.behavior.put(_record(mod, class_id, 0))
+
+    class Model:
+        pass
+
+    def fake_predict(model, state, x):
+        del model, state
+        logits = torch.full((x.shape[0], 21), -1.0)
+        for row, value in enumerate(x[:, 0].tolist()):
+            logits[row, int(value)] = 1.0
+        return logits
+
+    mod.predict_logits = fake_predict
+    chosen, classes = plugin._fingerprint_route(
+        types.SimpleNamespace(model=Model()),
+        torch.tensor([[10.0], [20.0]]),
+        [0],
+    )
+
+    assert chosen.tolist() == [0, 0]
+    assert classes == [10, 20]
+
+
+def test_immutable_reuse_does_not_mark_skill_changed():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(
+        verbose=False,
+        reuse_is_mutable=False,
+    )
     plugin.last_class_decisions = {
         0: {
-            0: {"decision": plugin.REUSE, "skill": 2},
-            1: {"decision": plugin.SCRATCH, "skill": 3},
+            10: {"decision": plugin.REUSE, "skill": 0},
+            20: {"decision": plugin.SCRATCH, "skill": 1},
         }
     }
 
-    plugin.reuse_is_mutable = True
-    assert plugin._collect_changed_skills(0) == {2, 3}
-
-    plugin.reuse_is_mutable = False
-    assert plugin._collect_changed_skills(0) == {3}
+    assert plugin._collect_changed_skills(0) == {1}
 
 
-def test_refresh_collects_decisions_after_training_hook():
-    mod = _load_plugin()
-    plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
-    plugin._current_training_experience_index = 0
-    plugin.last_class_decisions = {0: {7: {"decision": plugin.SCRATCH, "skill": 2}}}
-    plugin.class_map.record(
-        sys.modules["persistent_test_package.skill_registry"].ClassRecord(
-            experience_index=0,
-            class_id=7,
-            decision=plugin.SCRATCH,
-            skill=2,
-        )
-    )
-
-    refreshed = []
-    plugin._capture_new_class_inputs = lambda *args: None
-    plugin._refresh_skill = lambda strategy, skill_id, experience: refreshed.append(
-        skill_id
-    )
-    plugin._is_last_subexp = lambda experience: True
-    mod.SkillMemoryPlugin.after_training_exp = lambda self, strategy, **kwargs: None
-
-    experience = types.SimpleNamespace()
-    strategy = types.SimpleNamespace(experience=experience)
-    plugin.after_training_exp(strategy)
-
-    assert refreshed == [2]
-    assert plugin.behavior.skill_version(2) == 1
-
-
-def test_new_class_reference_inputs_survive_multiple_subexperiences():
-    mod = _load_plugin()
-    plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
-    plugin._current_training_experience_index = 0
-    plugin.last_class_decisions = {0: {7: {"decision": plugin.SCRATCH, "skill": 2}}}
-
-    captured = torch.tensor([[7.0, 8.0]])
-    mod.probe_class = lambda *args: (captured, torch.tensor([7]))
-    plugin._capture_new_class_inputs(types.SimpleNamespace(), 0)
-
-    assert torch.equal(plugin._pending_reference_inputs[7], captured)
-
-
-def test_multiclass_skill_routing_matches_persistent_class_behavior():
+def test_legacy_checkpoint_loads_without_behavior_records():
     mod = _load_plugin()
     plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
 
-    plugin.memory.store(0, {"slot": torch.tensor([0.0])})
-    plugin.memory.store(1, {"slot": torch.tensor([1.0])})
-
-    registry = sys.modules["persistent_test_package.skill_registry"]
-    for class_id, values in (
-        (0, {0: 1.0, 1: 0.0}),
-        (1, {0: 0.0, 1: 1.0}),
-        (2, {2: 1.0, 3: 0.0}),
-        (3, {2: 0.0, 3: 1.0}),
-    ):
-        skill_id = 0 if class_id < 2 else 1
-        plugin.class_map.record(
-            registry.ClassRecord(
-                experience_index=0,
-                class_id=class_id,
-                decision=plugin.SCRATCH,
-                skill=skill_id,
-            )
-        )
-        plugin.behavior.put(_record(mod, class_id, skill_id, values))
-
-    class Model:
-        pass
-
-    strategy = types.SimpleNamespace(model=Model())
-
-    def fake_predict(model, state, x):
-        del model
-        slot = int(state["slot"].item())
-        rows = []
-        for value in x[:, 0].tolist():
-            if slot == 0 and value < 2:
-                rows.append(
-                    [8.0, 0.0, 0.0, 0.0] if value == 0 else [0.0, 8.0, 0.0, 0.0]
-                )
-            elif slot == 1:
-                rows.append(
-                    [0.0, 0.0, 8.0, 0.0] if value == 2 else [0.0, 0.0, 0.0, 8.0]
-                )
-            else:
-                rows.append([0.0, 0.0, 0.0, 0.0])
-        return torch.tensor(rows)
-
-    mod.predict_logits = fake_predict
-    x = torch.tensor([[0.0], [1.0], [2.0], [3.0]])
-    chosen, probabilities, classes = plugin._fingerprint_route(
-        strategy,
-        x,
-        [0, 1],
-    )
-
-    assert chosen.tolist() == [0, 0, 1, 1]
-    assert classes == [0, 1, 2, 3]
-    assert probabilities.shape == (2, 4)
-
-
-def test_generated_fingerprints_produce_non_uniform_skill_evidence():
-    mod = _load_plugin()
-    plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
-    plugin.memory.store(0, {"slot": torch.tensor([0.0])})
-    plugin.memory.store(1, {"slot": torch.tensor([1.0])})
-
-    registry = sys.modules["persistent_test_package.skill_registry"]
-    for class_id, skill_id in ((0, 0), (1, 1)):
-        plugin.class_map.record(
-            registry.ClassRecord(
-                experience_index=0,
-                class_id=class_id,
-                decision=plugin.SCRATCH,
-                skill=skill_id,
-            )
-        )
-
-    zero_reference = torch.tensor([[12.0, 0.0, -3.0]])
-    one_reference = torch.tensor([[0.0, 12.0, -3.0]])
-    zero_output, zero_summary, class_ids = mod.extract_reference_behavior(
-        zero_reference,
-        [0, 1, 2],
-        target_class=0,
-    )
-    one_output, one_summary, _ = mod.extract_reference_behavior(
-        one_reference,
-        [0, 1, 2],
-        target_class=1,
-    )
-    plugin.behavior.put(
-        mod.ClassBehaviorRecord(
-            class_id=0,
-            skill_id=0,
-            version=0,
-            reference_inputs=torch.zeros(1, 1),
-            output_class_ids=class_ids,
-            reference_output=zero_output,
-            reference_summary=zero_summary,
-        )
-    )
-    plugin.behavior.put(
-        mod.ClassBehaviorRecord(
-            class_id=1,
-            skill_id=1,
-            version=0,
-            reference_inputs=torch.ones(1, 1),
-            output_class_ids=class_ids,
-            reference_output=one_output,
-            reference_summary=one_summary,
-        )
-    )
-
-    class Model:
-        pass
-
-    strategy = types.SimpleNamespace(model=Model())
-
-    def fake_predict(model, state, x):
-        del model
-        rows = []
-        for value in x[:, 0].tolist():
-            rows.append(
-                [12.0, 0.0, -3.0] if value == 0 else [0.0, 12.0, -3.0]
-            )
-        return torch.tensor(rows)
-
-    mod.predict_logits = fake_predict
-    _, probabilities, classes = plugin._fingerprint_route(
-        strategy,
-        torch.tensor([[0.0], [1.0]]),
-        [0, 1],
-    )
-
-    assert classes == [0, 1]
-    assert probabilities[0, 0] > probabilities[1, 0]
-    assert probabilities[0, 0] > 0.5
-    assert probabilities[1, 1] > probabilities[0, 1]
-    assert probabilities[1, 1] > 0.5
-
-
-def test_legacy_behavior_checkpoint_is_accepted():
-    mod = _load_plugin()
-    plugin = mod.PersistentFingerprintSkillMemoryPlugin(verbose=False)
     plugin.load_state_dict({})
-    assert not plugin._behavior_initialized
+
+    assert plugin._behavior_initialized is False
