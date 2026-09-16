@@ -16,6 +16,7 @@ from .behavior import (
     compare_binary_behavior,
     extract_features_from_weights,
     reverse_engineer_scores_from_weights,
+    reverse_engineer_y,
     reverse_engineer_y_from_weights,
 )
 from .probing import apply_skill_state_exact, predict_logits, probe_class
@@ -252,8 +253,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 record.reference_weight
             ).float()
             # The current classifier weight is recovered from the score model
-            # through the persistent skill state in the caller.  The reference
-            # weight is therefore retained for checkpoint compatibility, while
+            # through the persistent skill state in the caller. The reference
+            # weight is retained for checkpoint compatibility, while
             # feature/margin evidence remains sample-specific.
             del weight, current_weight
 
@@ -338,7 +339,20 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 if scores is None or not 0 <= record.class_id < scores.shape[-1]:
                     continue
                 predicted_class = int(scores[sample_index].argmax().item())
-                predicted_y = predicted_class == record.class_id
+                if self._custom_reverse_engineer_y is not None:
+                    predicted_y = bool(
+                        self._custom_reverse_engineer_y(
+                            scores, record.class_id
+                        )[sample_index]
+                        .detach()
+                        .item()
+                    )
+                else:
+                    predicted_y = bool(
+                        reverse_engineer_y(scores, record.class_id)[sample_index]
+                        .detach()
+                        .item()
+                    )
                 comparison = compare_binary_behavior(
                     torch.tensor([predicted_y]), record.expected_y
                 )
