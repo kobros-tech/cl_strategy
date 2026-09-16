@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from copy import deepcopy
 
+import torch
 from torch import Tensor
 
 from .behavior import (
