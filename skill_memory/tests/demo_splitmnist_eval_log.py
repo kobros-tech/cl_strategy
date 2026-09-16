@@ -43,6 +43,8 @@
 from __future__ import annotations
 
 import csv
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +56,41 @@ from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 from avalanche.training.templates import SupervisedTemplate
 
 from skill_memory import SkillMemory, SkillMemoryPlugin
+
+
+class Tee:
+    """Writes everything to several streams at once (e.g. real stdout + a log file).
+
+    Used below to mirror every `print(...)` -- including SkillMemoryPlugin's
+    own `verbose=True` logging, which goes through plain `print` -- into a
+    log file, without changing any of the existing print call sites.
+    """
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data) -> None:
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+# Every CSV/log pair from a run shares this timestamp so they're easy to
+# match up later. Both land in a gitignored `logs/` dir next to this file.
+run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_dir = Path(__file__).resolve().parent / "logs"
+log_dir.mkdir(exist_ok=True)
+terminal_log_path = log_dir / f"run_{run_id}.log"
+csv_log_path = log_dir / f"run_{run_id}.csv"
+
+_terminal_log_file = open(terminal_log_path, "w")
+_real_stdout = sys.stdout
+sys.stdout = Tee(_real_stdout, _terminal_log_file)
+print(f"Logging full terminal output to {terminal_log_path}")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
@@ -279,39 +316,45 @@ strategy = SupervisedTemplate(
 
 accuracy_history: list[list[float]] = []
 
-for t, train_exp in enumerate(train_stream):
-    strategy.train(train_exp)
+try:
+    for t, train_exp in enumerate(train_stream):
+        strategy.train(train_exp)
 
-    current_accuracies = evaluate_seen_experiences(
-        strategy, test_stream, t, pred_logger, train_step=t
-    )
-    accuracy_history.append(current_accuracies)
+        current_accuracies = evaluate_seen_experiences(
+            strategy, test_stream, t, pred_logger, train_step=t
+        )
+        accuracy_history.append(current_accuracies)
 
-    print(
-        f"Experience {t}: "
-        f"trained on {sorted(train_exp.classes_in_this_experience)}, "
-        f"mean seen accuracy = {np.mean(current_accuracies):.3f}"
-    )
+        print(
+            f"Experience {t}: "
+            f"trained on {sorted(train_exp.classes_in_this_experience)}, "
+            f"mean seen accuracy = {np.mean(current_accuracies):.3f}"
+        )
 
-    # Per-sample eval log for this training step: predicted y vs. real y.
-    print(f"\n--- eval log after training step {t} (predicted y vs. real y) ---")
-    pred_logger.print_log(train_step=t, only_errors=False, max_rows=40)
-    print()
+        # Per-sample eval log for this training step: predicted y vs. real y.
+        print(f"\n--- eval log after training step {t} (predicted y vs. real y) ---")
+        pred_logger.print_log(train_step=t, only_errors=False, max_rows=40)
+        print()
 
-accuracy_curve, forgetting_curve = compute_cl_metrics(accuracy_history)
+    accuracy_curve, forgetting_curve = compute_cl_metrics(accuracy_history)
 
-print("\n")
-print("Accuracy:", np.round(accuracy_curve, 3))
-print("Forgetting:", np.round(forgetting_curve, 3))
+    print("\n")
+    print("Accuracy:", np.round(accuracy_curve, 3))
+    print("Forgetting:", np.round(forgetting_curve, 3))
 
-# Full per-sample log (every evaluated sample across every training step),
-# for offline inspection -- this is the complete predicted-vs-real record,
-# unlike the truncated console printouts above.
-log_dir = Path(__file__).resolve().parent / "logs"
-log_dir.mkdir(exist_ok=True)
-pred_logger.to_csv(str(log_dir / "skill_memory_eval_log.csv"))
+    # Full per-sample log (every evaluated sample across every training
+    # step), for offline inspection -- this is the complete predicted-vs-real
+    # record, unlike the truncated console printouts above.
+    pred_logger.to_csv(str(csv_log_path))
 
-# Quick look at only the mistakes from the very last (final) evaluation pass.
-final_step = len(train_stream) - 1
-print(f"\n--- misclassified samples at final training step ({final_step}) ---")
-pred_logger.print_log(train_step=final_step, only_errors=True, max_rows=40)
+    # Quick look at only the mistakes from the very last (final) evaluation pass.
+    final_step = len(train_stream) - 1
+    print(f"\n--- misclassified samples at final training step ({final_step}) ---")
+    pred_logger.print_log(train_step=final_step, only_errors=True, max_rows=40)
+finally:
+    # Always restore real stdout and close the log file, even on error/Ctrl-C,
+    # so a partial transcript isn't left with a dangling file handle.
+    sys.stdout = _real_stdout
+    _terminal_log_file.close()
+    print(f"Terminal log saved to {terminal_log_path}")
+    print(f"Eval CSV saved to {csv_log_path}")
