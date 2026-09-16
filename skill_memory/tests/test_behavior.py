@@ -34,12 +34,28 @@ class _ToyModel(torch.nn.Module):
 def test_reverse_engineer_y_is_binary_and_uses_global_class_id():
     logits = torch.zeros(3, 100)
     logits[:, 42] = 10.0
+    logits[1, 42] = -1.0
     logits[1, 87] = 20.0
 
     predicted = behavior.reverse_engineer_y(logits, 42)
 
     assert predicted.dtype == torch.bool
     assert predicted.tolist() == [True, False, True]
+
+
+def test_reverse_engineer_y_is_not_multiclass_argmax():
+    logits = torch.tensor(
+        [
+            [3.0, 1.0, -1.0],
+            [4.0, 5.0, -1.0],
+        ]
+    )
+
+    class_zero = behavior.reverse_engineer_y(logits, 0)
+    class_one = behavior.reverse_engineer_y(logits, 1)
+
+    assert class_zero.tolist() == [True, True]
+    assert class_one.tolist() == [True, True]
 
 
 def test_reverse_engineer_scores_ignore_inactive_classifier_units():
