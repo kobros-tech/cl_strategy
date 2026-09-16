@@ -304,8 +304,6 @@ class NormalMLReverseEngineer:
         self.feature_dim = int(feature_dim)
         self.feature_mean = feature_mean.detach().cpu().clone()
         self.feature_std = feature_std.detach().cpu().clone()
-        if self.training_mode == "listwise":
-            self.hidden_size = max(self.hidden_size, 128)
         model = _FeatureReverseModel(self.feature_dim, self.hidden_size)
         model.load_state_dict(model_state)
         self.model = model.eval()
