@@ -234,6 +234,52 @@ def test_multiclass_skill_keeps_class_identity_then_resolves_same_skill():
     assert classes == [10, 20]
 
 
+def test_eval_output_uses_skill_id_not_slot_position():
+    mod = _load_plugin()
+    plugin = mod.PersistentFingerprintSkillMemoryPlugin(
+        verbose=False,
+        reverse_engineer_y_fn=lambda logits, target: logits[:, target] > 0,
+    )
+    plugin.memory.store(2, {"slot": torch.tensor([2.0])})
+    plugin.memory.store(7, {"slot": torch.tensor([7.0])})
+    registry = sys.modules["binary_fingerprint_test.skill_registry"]
+    plugin.class_map.record(_registry_record(registry, plugin, 10, 2))
+    plugin.class_map.record(_registry_record(registry, plugin, 20, 7))
+    plugin.behavior.put(_record(mod, 10, 2))
+    plugin.behavior.put(_record(mod, 20, 7))
+
+    class Model:
+        pass
+
+    def fake_predict(model, state, x):
+        del model
+        slot = int(state["slot"].item())
+        logits = torch.full((x.shape[0], 21), -1.0)
+        for row, value in enumerate(x[:, 0].tolist()):
+            target = 10 if value == 10 else 20
+            if (slot, target) in ((2, 10), (7, 20)):
+                logits[row, target] = 5.0
+            else:
+                logits[row, target] = -2.0
+        return logits
+
+    mod.predict_logits = fake_predict
+    strategy = types.SimpleNamespace(
+        model=Model(),
+        mbatch=(torch.tensor([[10.0], [20.0]]), torch.tensor([10, 20])),
+        mb_output=torch.zeros(2, 21),
+    )
+    plugin._eval_active = True
+    plugin.eval_routing = "probe"
+
+    plugin.after_eval_forward(strategy)
+
+    assert strategy.mb_output[0, 10].item() == 5.0
+    assert strategy.mb_output[1, 20].item() == 5.0
+    assert strategy.mb_output[0, 20].item() == -1.0e4
+    assert strategy.mb_output[1, 10].item() == -1.0e4
+
+
 def test_immutable_reuse_does_not_mark_skill_changed():
     mod = _load_plugin()
     plugin = mod.PersistentFingerprintSkillMemoryPlugin(
