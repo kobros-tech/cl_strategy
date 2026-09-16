@@ -79,9 +79,11 @@ class PredictionLogger(SupervisedPlugin):
         self.records: list[dict] = []
         self._train_step: int | None = None
         self._exp_id: int | None = None
+        self._sample_index = 0
 
     def set_train_step(self, step: int) -> None:
         self._train_step = step
+        self._sample_index = 0
 
     def before_eval_exp(self, strategy, **kwargs) -> None:
         experience = strategy.experience
@@ -98,6 +100,7 @@ class PredictionLogger(SupervisedPlugin):
             self.records.append(
                 {
                     "train_step": self._train_step,
+                    "sample_index": self._sample_index,
                     "experience": self._exp_id,
                     "true_y": int(y_true[i]),
                     "pred_y": int(y_pred[i]),
@@ -105,6 +108,7 @@ class PredictionLogger(SupervisedPlugin):
                     "correct": bool(y_true[i] == y_pred[i]),
                 }
             )
+            self._sample_index += 1
 
     def print_log(
         self,
@@ -120,14 +124,18 @@ class PredictionLogger(SupervisedPlugin):
             rows = [r for r in rows if not r["correct"]]
         shown = rows[:max_rows] if max_rows else rows
 
-        header = f"{'step':>4} {'exp':>4} {'true_y':>7} {'pred_y':>7} {'conf':>6}  ok"
+        header = (
+            f"{'step':>4} {'sample':>6} {'exp':>4} {'true_y':>7} "
+            f"{'pred_y':>7} {'conf':>6}  ok"
+        )
         print(header)
         print("-" * len(header))
         for r in shown:
             mark = "OK" if r["correct"] else "X"
             print(
-                f"{r['train_step']:>4} {r['experience']:>4} "
-                f"{r['true_y']:>7} {r['pred_y']:>7} {r['confidence']:>6.3f}  {mark}"
+                f"{r['train_step']:>4} {r['sample_index']:>6} "
+                f"{r['experience']:>4} {r['true_y']:>7} {r['pred_y']:>7} "
+                f"{r['confidence']:>6.3f}  {mark}"
             )
         if max_rows and len(rows) > max_rows:
             print(f"... ({len(rows) - max_rows} more rows not shown)")
@@ -135,7 +143,7 @@ class PredictionLogger(SupervisedPlugin):
             print("(no rows match this filter)")
 
     def print_misclassifications(self, train_step: int) -> None:
-        """Print every error for one training step, grouped by experience."""
+        """Print every misclassification for one training step."""
         rows = [
             r
             for r in self.records
@@ -159,9 +167,8 @@ class PredictionLogger(SupervisedPlugin):
             print("-" * 38)
             for row in exp_rows:
                 print(
-                    f"{self.records.index(row):>6}  "
-                    f"{row['true_y']:>6}  {row['pred_y']:>6}  "
-                    f"{row['confidence']:.4f}"
+                    f"{row['sample_index']:>6}  {row['true_y']:>6}  "
+                    f"{row['pred_y']:>6}  {row['confidence']:.4f}"
                 )
 
     def print_misclassification_summary(self, train_step: int) -> None:
@@ -189,6 +196,7 @@ class PredictionLogger(SupervisedPlugin):
         """Dump every evaluated sample to CSV."""
         fieldnames = [
             "train_step",
+            "sample_index",
             "experience",
             "true_y",
             "pred_y",
@@ -299,9 +307,9 @@ try:
             f"mean seen accuracy = {np.mean(current_accuracies):.3f}"
         )
 
-        # Keep the normal sample-level view, but make the complete error list
-        # explicit for every training step. The error list is intentionally
-        # not truncated so the text artifact is sufficient for diagnosis.
+        # The text artifact contains a complete error listing for every
+        # training step, not just the final step. The CSV contains every
+        # correct and incorrect prediction for offline analysis.
         pred_logger.print_misclassification_summary(train_step=t)
         pred_logger.print_misclassifications(train_step=t)
 
