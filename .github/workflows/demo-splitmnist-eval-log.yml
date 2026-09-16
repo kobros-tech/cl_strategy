@@ -27,6 +27,11 @@ jobs:
       - name: Run SplitMNIST weight reverse-engineering demo
         run: python skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py
 
+      - name: Run oracle-skill retention diagnostic
+        run: |
+          python skill_memory/tests/demo_splitmnist_oracle_retention.py \
+            | tee skill_memory/tests/logs/oracle_skill_retention_${{ github.run_id }}.txt
+
       - name: Upload routing analysis artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -36,5 +41,6 @@ jobs:
             skill_memory/tests/logs/weight_reverse_engineering_*.txt
             skill_memory/tests/logs/weight_reverse_engineering_*.csv
             skill_memory/tests/logs/weight_reverse_engineering_*.json
+            skill_memory/tests/logs/oracle_skill_retention_*.txt
           if-no-files-found: error
           retention-days: 14
