@@ -25,6 +25,8 @@ class _FeatureReverseModel(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(feature_dim, hidden_size),
             nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
             nn.Linear(hidden_size, 1),
         )
 
@@ -41,11 +43,10 @@ class NormalMLReverseEngineer:
     avoids the one-positive-versus-many-negative calibration problem of an
     independent binary classifier and naturally scales to large candidate sets.
 
-    Listwise scoring uses at least 128 hidden units by default. A wider scorer
-    gives the model more capacity to learn the nonlinear relationship between
-    samples, frozen responses, and candidate classifier parameters without
-    changing the candidate-set objective or introducing class-ID leakage.
-    The older binary-pair API is retained for compatibility and focused tests.
+    The scorer is a candidate-conditioned MLP. Candidate-specific behavior and
+    classifier parameters are part of each row, while the complete candidate
+    set is handled by the listwise loss at training time and softmax at routing
+    time. The integer class ID is never an input feature.
     """
 
     def __init__(
