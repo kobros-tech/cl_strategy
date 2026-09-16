@@ -27,11 +27,14 @@ jobs:
       - name: Run SplitMNIST weight reverse-engineering demo
         run: python skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py
 
-      - name: Upload SplitMNIST text log
+      - name: Upload routing analysis artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: splitmnist-weight-reverse-engineering-${{ github.run_id }}
-          path: skill_memory/tests/logs/weight_reverse_engineering_*.txt
+          path: |
+            skill_memory/tests/logs/weight_reverse_engineering_*.txt
+            skill_memory/tests/logs/weight_reverse_engineering_*.csv
+            skill_memory/tests/logs/weight_reverse_engineering_*.json
           if-no-files-found: error
           retention-days: 14
