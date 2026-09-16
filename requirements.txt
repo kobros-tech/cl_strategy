@@ -1,0 +1,12 @@
+# Runtime dependencies for the skill_memory package.
+# `pip install -r requirements.txt` pulls avalanche-lib's own transitive
+# deps automatically (torchvision, torchmetrics, scikit-learn, tqdm, etc.).
+#
+# If you have a specific CUDA build of torch/torchvision you want (e.g. for
+# GPU training), install that first per https://pytorch.org/get-started/locally/
+# and then run this file -- pip will see torch is already satisfied and skip
+# the CPU wheel.
+
+avalanche-lib>=0.6.0
+torch>=2.0
+numpy>=1.24

@@ -1,0 +1,7 @@
+# Extra dependencies needed to run the test suite (tests/test_*.py) on top
+# of requirements.txt.
+
+-r requirements.txt
+pytest>=7.0
+ruff>=0.6
+pre-commit>=3.0
