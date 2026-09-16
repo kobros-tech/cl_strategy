@@ -198,9 +198,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             state_dict = self.behavior.skill_state(int(skill_id), version)
             if state_dict is None:
                 state_dict = self.memory.state(int(skill_id))
-                self.behavior.put_skill_state(
-                    int(skill_id), version, state_dict
-                )
+                self.behavior.put_skill_state(int(skill_id), version, state_dict)
             self.behavior.put(
                 self._build_record(
                     strategy,
@@ -243,10 +241,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         else:
             margin = own
         margin_similarity = torch.exp(
-            -torch.abs(
-                margin.detach().cpu()
-                - float(record.reference_margin_mean)
-            )
+            -torch.abs(margin.detach().cpu() - float(record.reference_margin_mean))
             / max(float(record.reference_margin_std), 1e-6)
         ).item()
         components.append(float(margin_similarity))
@@ -263,7 +258,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             del weight, current_weight
 
         return {
-            "feature_similarity": components[0] if record.reference_feature_mean is not None else 0.0,
+            "feature_similarity": components[0]
+            if record.reference_feature_mean is not None
+            else 0.0,
             "margin_similarity": float(margin_similarity),
             "evidence": float(sum(components) / len(components)),
         }
@@ -354,9 +351,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     "reference_y": record.reference_y.tolist(),
                     "reference_accuracy": record.reference_accuracy,
                     "correct": bool(comparison["all_correct"]),
-                    "class_score": float(
-                        scores[sample_index, record.class_id].item()
-                    ),
+                    "class_score": float(scores[sample_index, record.class_id].item()),
                 }
                 if match["correct"]:
                     features = skill_features.get(record.skill_id)

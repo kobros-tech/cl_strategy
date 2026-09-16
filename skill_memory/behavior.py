@@ -64,7 +64,7 @@ class ClassBehaviorRecord:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> "ClassBehaviorRecord":
+    def from_state_dict(cls, state: dict[str, Any]) -> ClassBehaviorRecord:
         return cls(
             class_id=int(state["class_id"]),
             skill_id=int(state["skill_id"]),
@@ -127,9 +127,7 @@ class BehaviorFingerprintCache:
         }
         self._skill_state_versions[skill_id] = version
 
-    def skill_state(
-        self, skill_id: int, version: int
-    ) -> dict[str, Tensor] | None:
+    def skill_state(self, skill_id: int, version: int) -> dict[str, Tensor] | None:
         skill_id = int(skill_id)
         version = int(version)
         if self._skill_state_versions.get(skill_id) != version:
@@ -173,8 +171,7 @@ class BehaviorFingerprintCache:
             "skill_versions": dict(self._skill_versions),
             "skill_states": {
                 int(skill_id): {
-                    key: value.detach().cpu()
-                    for key, value in state.items()
+                    key: value.detach().cpu() for key, value in state.items()
                 }
                 for skill_id, state in self._skill_states.items()
             },
@@ -270,9 +267,7 @@ def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
     return _classifier_scores(classifier, features)
 
 
-def reverse_engineer_y_from_weights(
-    model, x: Tensor, target_class: int
-) -> Tensor:
+def reverse_engineer_y_from_weights(model, x: Tensor, target_class: int) -> Tensor:
     """Produce binary ``y`` for a candidate class using learned weights."""
     scores = reverse_engineer_scores_from_weights(model, x)
     if not 0 <= int(target_class) < scores.shape[-1]:
@@ -314,9 +309,7 @@ def identify_binary_behavior(
     return bool(compare_binary_behavior(predicted_y, expected_y)["all_correct"])
 
 
-def build_weight_behavior_statistics(
-    model, x: Tensor, class_id: int
-) -> dict[str, Any]:
+def build_weight_behavior_statistics(model, x: Tensor, class_id: int) -> dict[str, Any]:
     """Build continuous, weight-derived statistics for a persistent class."""
     classifier = _find_classifier(model).classifier
     features = extract_features_from_weights(model, x)
@@ -333,7 +326,10 @@ def build_weight_behavior_statistics(
         margin = own
     return {
         "feature_mean": features.mean(dim=0).detach().cpu(),
-        "feature_std": features.std(dim=0, unbiased=False).clamp_min(1e-6).detach().cpu(),
+        "feature_std": features.std(dim=0, unbiased=False)
+        .clamp_min(1e-6)
+        .detach()
+        .cpu(),
         "margin_mean": float(margin.mean().item()),
         "margin_std": max(float(margin.std(unbiased=False).item()), 1e-6),
         "weight": classifier.weight[class_id].detach().cpu().clone(),

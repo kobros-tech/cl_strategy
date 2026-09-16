@@ -114,22 +114,20 @@ def routing_summary(rows: list[dict]) -> dict:
             summary["identified_correct_class"] += int(
                 row["inferred_class"] == row["evaluation_y"]
             )
-            summary["identified_final_model_correct"] += int(
-                bool(row["model_correct"])
-            )
+            summary["identified_final_model_correct"] += int(bool(row["model_correct"]))
         summary["final_model_correct"] += int(bool(row["model_correct"]))
 
     for summary in by_experience.values():
         identified = summary["identified"]
         samples = summary["samples"]
-        summary["identified_class_accuracy"] = (
-            summary["identified_correct_class"] / max(identified, 1)
-        )
-        summary["identified_final_model_accuracy"] = (
-            summary["identified_final_model_correct"] / max(identified, 1)
-        )
-        summary["final_model_accuracy"] = (
-            summary["final_model_correct"] / max(samples, 1)
+        summary["identified_class_accuracy"] = summary[
+            "identified_correct_class"
+        ] / max(identified, 1)
+        summary["identified_final_model_accuracy"] = summary[
+            "identified_final_model_correct"
+        ] / max(identified, 1)
+        summary["final_model_accuracy"] = summary["final_model_correct"] / max(
+            samples, 1
         )
     return by_experience
 
@@ -245,7 +243,9 @@ def main() -> None:
         test_stream = benchmark.test_stream
 
         print("Device:", device)
-        print("Routing: persistent class fingerprint -> learned weights -> class -> skill")
+        print(
+            "Routing: persistent class fingerprint -> learned weights -> class -> skill"
+        )
         print("No experience ID or target class is supplied to routing.")
 
         model = SkillMemoryMLP(input_dim=784).to(device)
@@ -296,9 +296,7 @@ def main() -> None:
                 f"ambiguous={ambiguous}, failed={failed})"
             )
             for eval_index, accuracy in enumerate(accuracies):
-                print(
-                    f"  eval_exp={eval_index}: accuracy={accuracy:.3f}"
-                )
+                print(f"  eval_exp={eval_index}: accuracy={accuracy:.3f}")
 
         n = len(accuracy_history)
         accuracy_curve = np.array([accuracy_history[i][i] for i in range(n)])
@@ -319,7 +317,9 @@ def main() -> None:
                     for eval_index, accuracy in enumerate(accuracies)
                 )
             )
-        print("Final fingerprint records:", len(plugin.behavior.state_dict()["records"]))
+        print(
+            "Final fingerprint records:", len(plugin.behavior.state_dict()["records"])
+        )
         write_analysis_files(
             log_dir,
             run_id,
