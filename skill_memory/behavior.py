@@ -241,13 +241,33 @@ def extract_features_from_weights(model, x: Tensor) -> Tensor:
     return features
 
 
+def _classifier_scores(classifier, features: Tensor) -> Tensor:
+    """Compute scores with the same active-unit semantics as the classifier."""
+    scores = F.linear(
+        features,
+        classifier.weight.detach(),
+        classifier.bias.detach() if classifier.bias is not None else None,
+    )
+    active_units = getattr(classifier, "active_units", None)
+    if active_units is not None:
+        active_units = active_units.to(device=scores.device)
+        if active_units.numel() != scores.shape[-1]:
+            raise ValueError(
+                "active_units must have one entry per classifier output unit"
+            )
+        active_mask = active_units.to(torch.bool)
+        if not bool(active_mask.any()):
+            raise ValueError("classifier has no active output units")
+        scores = scores.masked_fill(~active_mask.unsqueeze(0), -torch.inf)
+    return scores
+
+
 def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
     """Reconstruct classifier scores directly from learned head weights."""
-    classifier = _find_classifier(model).classifier
+    incremental_classifier = _find_classifier(model)
+    classifier = incremental_classifier.classifier
     features = extract_features_from_weights(model, x)
-    weight = classifier.weight.detach()
-    bias = classifier.bias.detach() if classifier.bias is not None else None
-    return F.linear(features, weight, bias)
+    return _classifier_scores(classifier, features)
 
 
 def reverse_engineer_y_from_weights(
@@ -300,11 +320,7 @@ def build_weight_behavior_statistics(
     """Build continuous, weight-derived statistics for a persistent class."""
     classifier = _find_classifier(model).classifier
     features = extract_features_from_weights(model, x)
-    scores = F.linear(
-        features,
-        classifier.weight.detach(),
-        classifier.bias.detach() if classifier.bias is not None else None,
-    )
+    scores = _classifier_scores(classifier, features)
     class_id = int(class_id)
     if not 0 <= class_id < scores.shape[-1]:
         raise ValueError("class_id is outside the classifier output")
