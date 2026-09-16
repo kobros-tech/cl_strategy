@@ -1,50 +1,98 @@
-"""Skill Memory extension using binary reverse-engineered class behavior."""
+"""Skill Memory extension using a CL-independent normal ML router."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
+from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from .behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
     build_weight_behavior_statistics,
-    compare_binary_behavior,
-    extract_features_from_weights,
-    reverse_engineer_scores_from_weights,
-    reverse_engineer_y,
-    reverse_engineer_y_from_weights,
 )
 from .probing import apply_skill_state_exact, predict_logits, probe_class
+from .reverse_engineering import NormalMLReverseEngineer
 from .skill_memory_plugin import SkillMemoryPlugin
 
 
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
-    """Skill Memory with persistent binary class-behavior identification."""
+    """Skill Memory with anonymous class routing learned by standalone ML.
 
-    def __init__(self, *args, reverse_engineer_y_fn: Callable | None = None, **kwargs):
+    The router is trained only after training experiences, from frozen skill
+    snapshots and deterministic reference samples. Evaluation only performs
+    inference. No evaluation label, task ID, or experience ID is an input to the
+    routing model.
+    """
+
+    def __init__(
+        self,
+        *args,
+        reverse_engineer_y_fn: Callable | None = None,
+        reverse_hidden_size: int = 32,
+        reverse_epochs: int = 120,
+        reverse_learning_rate: float = 1e-2,
+        reverse_seed: int = 0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
         self._custom_reverse_engineer_y = reverse_engineer_y_fn
-        self.reverse_engineer_y = reverse_engineer_y_from_weights
+        self.reverse_engineer = NormalMLReverseEngineer(
+            hidden_size=reverse_hidden_size,
+            epochs=reverse_epochs,
+            learning_rate=reverse_learning_rate,
+            seed=reverse_seed,
+        )
         self._behavior_initialized = False
         self._pending_reference_inputs: dict[int, Tensor] = {}
+        self._reverse_output_dim: int | None = None
         self.last_fingerprint_routes: list[dict] = []
         self.fingerprint_route_history: list[dict] = []
         self._fingerprint_batch_index = 0
         self._evaluation_experience_index: int | None = None
 
-    def _reverse_engineer_y(self, model, state_dict, x: Tensor, class_id: int) -> Tensor:
-        """Run the configured reverse-engineering method without label leakage."""
-        if self._custom_reverse_engineer_y is not None:
-            logits = predict_logits(model, state_dict, x)
-            return self._custom_reverse_engineer_y(logits, class_id).detach().bool()
-        apply_skill_state_exact(model, state_dict)
-        return reverse_engineer_y_from_weights(model, x, class_id).detach().bool()
+    @staticmethod
+    def _pad_logits(logits: Tensor, output_dim: int) -> Tensor:
+        """Pad an older frozen skill response to the current class space."""
+        result = logits.new_full((logits.shape[0], output_dim), -1e4)
+        width = min(logits.shape[-1], output_dim)
+        result[:, :width] = logits[:, :width]
+        return result
+
+    @classmethod
+    def _make_features(
+        cls,
+        x: Tensor,
+        logits: Tensor,
+        output_dim: int,
+    ) -> Tensor:
+        """Build normal-ML inputs from raw samples and full frozen responses."""
+        samples = x.detach().float().cpu().reshape(x.shape[0], -1)
+        padded = cls._pad_logits(logits.detach().float().cpu(), output_dim)
+        probabilities = torch.softmax(padded, dim=-1)
+        return torch.cat((samples, padded, probabilities), dim=1)
+
+    def _frozen_logits(
+        self,
+        strategy,
+        skill_id: int,
+        x: Tensor,
+    ) -> Tensor:
+        """Evaluate one immutable stored skill without changing the live model."""
+        records = self.behavior.records_for_skill(skill_id)
+        if records:
+            version = records[0].version
+            state_dict = self.behavior.skill_state(skill_id, version)
+        else:
+            state_dict = None
+        if state_dict is None:
+            state_dict = self.memory.state(skill_id)
+        model = deepcopy(strategy.model)
+        return predict_logits(model, state_dict, x).detach().cpu()
 
     def _build_record(
         self,
@@ -55,12 +103,13 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         version: int,
         state_dict: dict | None = None,
     ) -> ClassBehaviorRecord:
-        """Create a class record from the frozen skill-generation state."""
+        """Create diagnostics from the frozen skill-generation state."""
         if state_dict is None:
             state_dict = self.memory.state(skill_id)
         model = deepcopy(strategy.model)
-        reference_y = self._reverse_engineer_y(model, state_dict, x, class_id).cpu()
         apply_skill_state_exact(model, state_dict)
+        logits = predict_logits(model, state_dict, x)
+        reference_y = logits[:, class_id].gt(0).detach().cpu()
         statistics = build_weight_behavior_statistics(model, x, class_id)
         return ClassBehaviorRecord(
             class_id=class_id,
@@ -77,7 +126,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         )
 
     def _capture_new_class_inputs(self, experience, experience_index: int) -> None:
-        """Keep deterministic probe inputs for newly introduced classes."""
+        """Keep deterministic reference inputs for newly introduced classes."""
         decisions = self.last_class_decisions.get(experience_index, {})
         for class_id, item in decisions.items():
             skill_id = item.get("skill")
@@ -97,7 +146,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self._pending_reference_inputs[class_id] = x.detach().cpu().clone()
 
     def _refresh_skill(self, strategy, skill_id: int, experience) -> None:
-        """Refresh every class fingerprint owned by the current skill generation."""
+        """Refresh diagnostics for one immutable skill generation."""
         version = self.behavior.skill_version(skill_id)
         state_dict = self.memory.state(skill_id)
         self.behavior.put_skill_state(skill_id, version, state_dict)
@@ -126,6 +175,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             )
 
     def _collect_changed_skills(self, experience_index: int) -> set[int]:
+        """Return skill generations whose frozen response actually changed."""
         decisions = self.last_class_decisions.get(experience_index, {})
         changed: set[int] = set()
         for item in decisions.values():
@@ -139,11 +189,62 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 changed.add(int(skill_id))
         return changed
 
+    def _fit_reverse_router(self, strategy) -> None:
+        """Fit once from frozen skill responses; never fit during evaluation."""
+        slot_ids = sorted(self.memory.slots())
+        records = [
+            record
+            for slot in slot_ids
+            for record in self.behavior.records_for_skill(slot)
+        ]
+        if not records:
+            self.reverse_engineer.fit_feature_pairs([])
+            self._reverse_output_dim = None
+            return
+
+        output_dim = int(strategy.model.mbatch_output_dim) if hasattr(
+            strategy.model, "mbatch_output_dim"
+        ) else 0
+        if output_dim <= 0:
+            output_dim = max(
+                predict_logits(
+                    deepcopy(strategy.model), self.memory.state(slot), record.reference_inputs
+                ).shape[-1]
+                for slot in slot_ids
+                for record in self.behavior.records_for_skill(slot)
+            )
+        self._reverse_output_dim = output_dim
+        cached_logits: dict[int, Tensor] = {}
+        for slot in slot_ids:
+            skill_records = self.behavior.records_for_skill(slot)
+            if not skill_records:
+                continue
+            state = self.behavior.skill_state(slot, skill_records[0].version)
+            if state is None:
+                state = self.memory.state(slot)
+            model = deepcopy(strategy.model)
+            cached_logits[slot] = predict_logits(
+                model, state, skill_records[0].reference_inputs
+            ).detach().cpu()
+
+        pairs: list[tuple[Tensor, float]] = []
+        for record in records:
+            for slot in slot_ids:
+                logits = cached_logits.get(slot)
+                if logits is None:
+                    continue
+                features = self._make_features(
+                    record.reference_inputs, logits, output_dim
+                )
+                target = float(slot == record.skill_id)
+                pairs.append((features, target))
+        self.reverse_engineer.fit_feature_pairs(pairs)
+
     def before_training_exp(self, strategy, **kwargs) -> None:
         super().before_training_exp(strategy, **kwargs)
 
     def after_training_exp(self, strategy, **kwargs) -> None:
-        """Refresh changed skills after the complete logical experience."""
+        """Update frozen references, then retrain the standalone router once."""
         experience = strategy.experience
         experience_index = self._current_training_experience_index
         is_last = self._is_last_subexp(experience)
@@ -163,204 +264,88 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self._refresh_skill(strategy, skill_id, experience)
         for class_id, x in sorted(pending.items()):
             skill_id = self.class_map.find_skill_for_class_anywhere(class_id)
-            if skill_id is None:
+            if skill_id is None or self.behavior.get(class_id, int(skill_id)) is not None:
                 continue
-            if self.behavior.get(class_id, int(skill_id)) is not None:
-                continue
-            version = self.behavior.skill_version(int(skill_id))
-            state_dict = self.behavior.skill_state(int(skill_id), version)
+            skill_id = int(skill_id)
+            version = self.behavior.skill_version(skill_id)
+            state_dict = self.behavior.skill_state(skill_id, version)
             if state_dict is None:
-                state_dict = self.memory.state(int(skill_id))
-                self.behavior.put_skill_state(int(skill_id), version, state_dict)
+                state_dict = self.memory.state(skill_id)
+                self.behavior.put_skill_state(skill_id, version, state_dict)
             self.behavior.put(
                 self._build_record(
-                    strategy, int(skill_id), int(class_id), x, version, state_dict
+                    strategy, skill_id, int(class_id), x, version, state_dict
                 )
             )
         self._pending_reference_inputs.clear()
         self._behavior_initialized = bool(self.behavior.state_dict()["records"])
+        if self._behavior_initialized:
+            self._fit_reverse_router(strategy)
 
-    @staticmethod
-    def _continuous_evidence(
-        record: ClassBehaviorRecord,
-        features: Tensor,
-        scores: Tensor,
-        sample_index: int,
-    ) -> dict[str, float]:
-        """Score one binary-compatible candidate using persistent evidence."""
-        feature = features[sample_index].detach().float().cpu()
-        components: list[float] = []
-        if record.reference_feature_mean is not None:
-            reference = record.reference_feature_mean.float()
-            cosine = F.cosine_similarity(
-                feature.unsqueeze(0), reference.unsqueeze(0), dim=1
-            ).item()
-            components.append((float(cosine) + 1.0) / 2.0)
-        class_id = record.class_id
-        row = scores[sample_index]
-        own = row[class_id]
-        if row.numel() > 1:
-            other = row.clone()
-            other[class_id] = -torch.inf
-            margin = own - other.max()
-        else:
-            margin = own
-        margin_similarity = torch.exp(
-            -torch.abs(margin.detach().cpu() - float(record.reference_margin_mean))
-            / max(float(record.reference_margin_std), 1e-6)
-        ).item()
-        components.append(float(margin_similarity))
-        return {
-            "feature_similarity": components[0]
-            if record.reference_feature_mean is not None
-            else 0.0,
-            "margin_similarity": float(margin_similarity),
-            "evidence": float(sum(components) / len(components)),
-        }
-
-    @staticmethod
-    def _select_continuous_candidate(compatible: list[dict]) -> dict | None:
-        """Select a candidate only when evidence has a clear top cluster."""
-        if len(compatible) <= 1:
-            return compatible[0] if compatible else None
-        if any("continuous_evidence" not in item for item in compatible):
-            return None
-        ranked = sorted(
-            compatible,
-            key=lambda item: float(item["continuous_evidence"]),
-            reverse=True,
-        )
-        gaps = [
-            float(ranked[index]["continuous_evidence"])
-            - float(ranked[index + 1]["continuous_evidence"])
-            for index in range(len(ranked) - 1)
-        ]
-        largest_gap_index = max(range(len(gaps)), key=gaps.__getitem__)
-        if largest_gap_index != 0:
-            return None
-        if len(gaps) == 1:
-            return ranked[0]
-        baseline = sum(gaps[1:]) / len(gaps[1:])
-        return ranked[0] if gaps[0] > baseline else None
-
-    def _fingerprint_route(
-        self,
-        strategy,
-        x: Tensor,
-        slot_ids: list[int],
-    ) -> tuple[Tensor, list[int]]:
-        """Identify a class, then resolve its canonical skill mapping."""
-        probe_model = deepcopy(strategy.model)
-        candidate_records = [
+    def _route(self, strategy, x: Tensor, slot_ids: list[int]) -> tuple[Tensor, list[int]]:
+        """Route anonymously using only the frozen responses and ML model."""
+        if self.reverse_engineer.model is None or self._reverse_output_dim is None:
+            raise RuntimeError("reverse router has not been fitted")
+        records = [
             record
             for slot in slot_ids
             for record in self.behavior.records_for_skill(slot)
         ]
-        skill_scores: dict[int, Tensor] = {}
-        skill_features: dict[int, Tensor] = {}
-        for slot in slot_ids:
-            records = self.behavior.records_for_skill(slot)
-            if not records:
-                continue
-            version = records[0].version
-            frozen_state = self.behavior.skill_state(slot, version)
-            if frozen_state is None:
-                frozen_state = self.memory.state(slot)
-            if self._custom_reverse_engineer_y is None:
-                apply_skill_state_exact(probe_model, frozen_state)
-                skill_features[slot] = extract_features_from_weights(probe_model, x)
-                skill_scores[slot] = reverse_engineer_scores_from_weights(
-                    probe_model, x
-                )
-            else:
-                skill_scores[slot] = predict_logits(probe_model, frozen_state, x)
+        if not records:
+            return (
+                torch.full((x.shape[0],), -1, dtype=torch.long, device=x.device),
+                [-1] * x.shape[0],
+            )
+
+        route_candidates: list[tuple[ClassBehaviorRecord, Tensor]] = []
+        for record in records:
+            logits = self._frozen_logits(strategy, record.skill_id, x)
+            features = self._make_features(x, logits, self._reverse_output_dim)
+            probability = self.reverse_engineer.predict_proba_features(features)
+            route_candidates.append((record, probability))
+
+        probabilities = torch.stack([item[1] for item in route_candidates], dim=1)
+        best = probabilities.argmax(dim=1)
         chosen_skills: list[int] = []
         chosen_classes: list[int] = []
-        routes: list[dict] = []
+        routes: list[dict[str, Any]] = []
         for sample_index in range(x.shape[0]):
-            matches: list[dict] = []
-            for record in candidate_records:
-                scores = skill_scores.get(record.skill_id)
-                if scores is None or not 0 <= record.class_id < scores.shape[-1]:
-                    continue
-                predicted_class = int(scores[sample_index].argmax().item())
-                if self._custom_reverse_engineer_y is not None:
-                    predicted_y = bool(
-                        self._custom_reverse_engineer_y(scores, record.class_id)[
-                            sample_index
-                        ]
-                        .detach()
-                        .item()
-                    )
-                else:
-                    predicted_y = bool(
-                        reverse_engineer_y(scores, record.class_id)[sample_index]
-                        .detach()
-                        .item()
-                    )
-                comparison = compare_binary_behavior(
-                    torch.tensor([predicted_y]), record.expected_y
-                )
-                match = {
-                    "class": record.class_id,
-                    "skill": record.skill_id,
-                    "predicted_y": predicted_y,
-                    "predicted_class": predicted_class,
-                    "expected_y": record.expected_y,
-                    "reference_y": record.reference_y.tolist(),
-                    "reference_accuracy": record.reference_accuracy,
-                    "correct": bool(comparison["all_correct"]),
-                    "class_score": float(scores[sample_index, record.class_id].item()),
-                }
-                if match["correct"]:
-                    features = skill_features.get(record.skill_id)
-                    if features is not None:
-                        evidence = self._continuous_evidence(
-                            record, features, scores, sample_index
-                        )
-                        match.update(
-                            {
-                                "feature_similarity": evidence["feature_similarity"],
-                                "margin_similarity": evidence["margin_similarity"],
-                                "continuous_evidence": evidence["evidence"],
-                            }
-                        )
-                matches.append(match)
-            compatible = [item for item in matches if item["correct"]]
-            selected = self._select_continuous_candidate(compatible)
-            if not compatible:
-                status = "FAILED"
-            elif selected is None:
-                status = "AMBIGUOUS"
-            else:
-                status = "IDENTIFIED"
-                chosen_classes.append(int(selected["class"]))
-                chosen_skills.append(int(selected["skill"]))
-            if status != "IDENTIFIED":
-                chosen_classes.append(-1)
-                chosen_skills.append(-1)
+            candidate_index = int(best[sample_index].item())
+            record, probability = route_candidates[candidate_index]
+            chosen_skills.append(record.skill_id)
+            chosen_classes.append(record.class_id)
             routes.append(
                 {
                     "sample_index": sample_index,
-                    "status": status,
-                    "class": None if selected is None else selected["class"],
-                    "skill": None if selected is None else selected["skill"],
-                    "candidates": matches,
+                    "status": "IDENTIFIED",
+                    "class": record.class_id,
+                    "skill": record.skill_id,
+                    "probability": float(probability[sample_index].item()),
+                    "candidates": [
+                        {
+                            "class": candidate.class_id,
+                            "skill": candidate.skill_id,
+                            "probability": float(
+                                candidate_probability[sample_index].item()
+                            ),
+                        }
+                        for candidate, candidate_probability in route_candidates
+                    ],
                 }
             )
         self.last_fingerprint_routes = routes
-        chosen = torch.tensor(chosen_skills, dtype=torch.long, device=x.device)
-        return chosen, chosen_classes
+        return (
+            torch.tensor(chosen_skills, dtype=torch.long, device=x.device),
+            chosen_classes,
+        )
 
     def before_eval(self, strategy, **kwargs) -> None:
-        """Start a fresh routing-analysis trace for each evaluation pass."""
         super().before_eval(strategy, **kwargs)
         self.fingerprint_route_history = []
         self._fingerprint_batch_index = 0
         self._evaluation_experience_index = None
 
     def before_eval_exp(self, strategy, **kwargs) -> None:
-        """Record the evaluation experience without using it for routing."""
         super().before_eval_exp(strategy, **kwargs)
         experience = strategy.experience
         index = getattr(experience, "current_experience", None)
@@ -376,7 +361,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         x = strategy.mbatch[0]
         y = strategy.mbatch[1]
         slot_ids = sorted(self.memory.slots())
-        chosen, class_matches = self._fingerprint_route(strategy, x, slot_ids)
+        chosen, class_matches = self._route(strategy, x, slot_ids)
         for route, label in zip(
             self.last_fingerprint_routes,
             y.detach().cpu().tolist(),
@@ -387,18 +372,14 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             route["evaluation_y"] = int(label)
         self.fingerprint_route_history.extend(self.last_fingerprint_routes)
         self._fingerprint_batch_index += 1
+
         output_model = deepcopy(strategy.model)
         per_skill_logits = [
             predict_logits(output_model, self.memory.state(slot), x)
             for slot in slot_ids
         ]
         output_dim = strategy.mb_output.shape[-1]
-        padded = []
-        for logits in per_skill_logits:
-            result = logits.new_full((logits.shape[0], output_dim), -1e4)
-            width = min(logits.shape[-1], output_dim)
-            result[:, :width] = logits[:, :width]
-            padded.append(result)
+        padded = [self._pad_logits(logits, output_dim) for logits in per_skill_logits]
         valid = chosen.ge(0)
         if valid.any():
             positions = torch.nonzero(valid, as_tuple=False).squeeze(-1)
@@ -410,6 +391,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             )
             stacked = torch.stack(padded, dim=0)
             strategy.mb_output[positions] = stacked[rows, positions]
+
         final_predictions = strategy.mb_output.detach().argmax(dim=-1).cpu().tolist()
         labels = y.detach().cpu().tolist()
         for route, prediction, label in zip(
@@ -420,29 +402,28 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         ):
             route["model_predicted_class"] = int(prediction)
             route["model_correct"] = int(prediction) == int(label)
-        identified = sum(
-            item["status"] == "IDENTIFIED" for item in self.last_fingerprint_routes
-        )
-        ambiguous = sum(
-            item["status"] == "AMBIGUOUS" for item in self.last_fingerprint_routes
-        )
-        failed = sum(
-            item["status"] == "FAILED" for item in self.last_fingerprint_routes
-        )
+
+        identified = len(self.last_fingerprint_routes)
         self._log(
-            "[WEIGHT fingerprint routing] "
+            "[NORMAL ML routing] "
             f"eval_exp={self._evaluation_experience_index} "
             f"samples={x.shape[0]} identified={identified} "
-            f"ambiguous={ambiguous} failed={failed} "
             f"matched_classes={class_matches[:5]}"
         )
 
     def state_dict(self) -> dict:
-        """Serialize only the persistent binary behavior state."""
-        return {"behavior": self.behavior.state_dict()}
+        """Serialize persistent references and the fitted reverse router."""
+        return {
+            "behavior": self.behavior.state_dict(),
+            "reverse_engineer": self.reverse_engineer.state_dict(),
+            "reverse_output_dim": self._reverse_output_dim,
+        }
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore binary behavior state; old checkpoints remain loadable."""
+        """Restore persistent references and a previously fitted router."""
         behavior_state = state.get("behavior", {})
         self.behavior.load_state_dict(behavior_state)
+        self.reverse_engineer.load_state_dict(state.get("reverse_engineer", {}))
+        output_dim = state.get("reverse_output_dim")
+        self._reverse_output_dim = None if output_dim is None else int(output_dim)
         self._behavior_initialized = bool(behavior_state.get("records"))
