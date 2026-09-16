@@ -3,7 +3,7 @@
 The original fingerprint router used reconstructed argmax behavior as a hard
 compatibility gate. That is not an independent fingerprint when each stored
 skill is trained on its own class: a one-class skill can predict its mastered
-class for unrelated inputs. This module keeps that binary result as a
+class for unrelated inputs. This module keeps the binary result as a
 diagnostic signal, but uses the persistent feature/margin evidence to make the
 actual class decision.
 """
@@ -91,7 +91,20 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
                     continue
 
                 predicted_class = int(scores[sample_index].argmax().item())
-                predicted_y = predicted_class == record.class_id
+                if self._custom_reverse_engineer_y is None:
+                    predicted_y = bool(
+                        reverse_engineer_y(scores, record.class_id)[sample_index]
+                        .detach()
+                        .item()
+                    )
+                else:
+                    predicted_y = bool(
+                        self._custom_reverse_engineer_y(scores, record.class_id)[
+                            sample_index
+                        ]
+                        .detach()
+                        .item()
+                    )
                 comparison = compare_binary_behavior(
                     torch.tensor([predicted_y]), record.expected_y
                 )
