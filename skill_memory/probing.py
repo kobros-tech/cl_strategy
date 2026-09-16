@@ -7,7 +7,8 @@ input-only evaluation routing.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -180,10 +181,9 @@ def restore_initial_state(
         value = initial.to(device=target.device, dtype=target.dtype)
         if target.shape == value.shape:
             target.copy_(value)
-        elif name.endswith("classifier.weight") and target.ndim == 2:
-            rows = min(target.shape[0], value.shape[0])
-            target[:rows].copy_(value[:rows])
-        elif name.endswith("classifier.bias") and target.ndim == 1:
+        elif (name.endswith("classifier.weight") and target.ndim == 2) or (
+            name.endswith("classifier.bias") and target.ndim == 1
+        ):
             rows = min(target.shape[0], value.shape[0])
             target[:rows].copy_(value[:rows])
         elif name.endswith("active_units"):
@@ -266,6 +266,137 @@ def expand_skill_logits(
     return result
 
 
+@dataclass(frozen=True)
+class RoutingResult:
+    """Input-only skill-routing result for one minibatch.
+
+    ``probabilities`` are softmax-normalized routing scores across the
+    available skills. They are useful as relative routing confidence, but
+    they are not calibrated probabilities of correctness.
+    """
+
+    skill_indices: Tensor
+    probabilities: Tensor
+    best_probability: Tensor
+    second_probability: Tensor
+    confidence_gap: Tensor
+
+
+def _routing_scores(
+    raw_skill_logits: Sequence[torch.Tensor],
+    states: Sequence[Mapping[str, torch.Tensor]],
+    skill_classes: Sequence[Sequence[int]],
+) -> torch.Tensor:
+    """Score each skill by probability mass on its owned classes."""
+    del states
+
+    scores = []
+    for logits, owned_classes in zip(raw_skill_logits, skill_classes, strict=False):
+        if not owned_classes:
+            scores.append(torch.zeros(logits.shape[0], device=logits.device))
+            continue
+
+        valid_classes = sorted(
+            class_id for class_id in owned_classes if 0 <= class_id < logits.shape[1]
+        )
+        if not valid_classes:
+            scores.append(torch.zeros(logits.shape[0], device=logits.device))
+            continue
+
+        if logits.shape[1] == 1:
+            # A single-output-unit skill (the shared head hasn't grown
+            # past its first class yet) has no other column to
+            # normalize against -- softmax over one value is trivially
+            # always 1.0, which would erase all signal. Use a sigmoid
+            # of the raw logit instead: still bounded to [0, 1], still
+            # monotonic in the raw value, and degenerates sensibly
+            # (a very negative logit -> low confidence, not a fixed 1.0).
+            scores.append(torch.sigmoid(logits[:, 0]))
+            continue
+
+        probabilities = torch.softmax(logits, dim=1)
+        scores.append(probabilities[:, valid_classes].sum(dim=1))
+
+    if not scores:
+        raise RuntimeError("No skills available for probe routing.")
+
+    return torch.stack(scores, dim=0)
+
+
+def _normalize_routing_scores(
+    scores: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Normalize [0, 1] routing scores without a hard threshold."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    powered = scores.clamp_min(0).pow(1.0 / temperature)
+    totals = powered.sum(dim=0, keepdim=True)
+    eps = torch.finfo(powered.dtype).eps
+    probabilities = powered / totals.clamp_min(eps)
+
+    zero_total = totals.squeeze(0) <= 0
+    if zero_total.any():
+        probabilities = probabilities.clone()
+        probabilities[:, zero_total] = 1.0 / probabilities.shape[0]
+
+    return probabilities
+
+
+def find_best_routing_skill(
+    raw_skill_logits: list[Tensor],
+    states: list[Mapping[str, Tensor]],
+    skill_classes: list[set[int]],
+    temperature: float = 1.0,
+) -> RoutingResult:
+    """Find the best stored skill for every unlabeled probe sample.
+
+    ``raw_skill_logits`` must contain one ``[batch, output_dim]`` tensor per
+    stored skill. The function never receives labels. For every sample it
+    computes each skill's own-class probability mass (see `_routing_scores`
+    -- the unsupervised counterpart of the training-time
+    `score_from_loss`/`score_floor=0.9` decision score), then normalizes
+    across skills via `_normalize_routing_scores` and returns the winning
+    skill with top-1/top-2 routing diagnostics.
+
+    Unlike an earlier version of this function, the per-skill scores fed
+    into this normalization are already bounded, comparable [0, 1]
+    probability masses (not raw, unnormalized logits), so this step is a
+    genuine relative-confidence display, not a no-op wrapper around a
+    still-broken ranking.
+
+    If every skill's owned-class probability mass is zero for a sample
+    (no skill claims a class present in its own output, or the sample's
+    "no usable columns" case), `_normalize_routing_scores` falls back to
+    a uniform distribution over skills for that sample rather than
+    silently defaulting to skill 0 -- an all-zero row would otherwise
+    make skill 0 win purely by array position, not by any evidence.
+
+    The returned values are normalized routing probabilities, not
+    calibrated probabilities of correctness.
+    """
+    scores = _routing_scores(raw_skill_logits, states, skill_classes)
+    probabilities = _normalize_routing_scores(scores, temperature)
+    skill_indices = probabilities.argmax(dim=0)
+
+    if probabilities.shape[0] == 1:
+        best_probability = probabilities[0]
+        second_probability = torch.zeros_like(best_probability)
+    else:
+        top2 = torch.topk(probabilities, k=2, dim=0).values
+        best_probability = top2[0]
+        second_probability = top2[1]
+
+    return RoutingResult(
+        skill_indices=skill_indices,
+        probabilities=probabilities,
+        best_probability=best_probability,
+        second_probability=second_probability,
+        confidence_gap=best_probability - second_probability,
+    )
+
+
 def route_probe_logits(
     raw_skill_logits: list[Tensor],
     states: list[Mapping[str, Tensor]],
@@ -273,30 +404,10 @@ def route_probe_logits(
 ) -> Tensor:
     """Select the best skill for each probe sample.
 
-    Raw logits use global class-column indexing. A skill is scored only
-    using the logits corresponding to classes owned by that skill.
+    This compatibility wrapper preserves the v0.1.4 return type while the
+    richer ``find_best_routing_skill`` API exposes routing probabilities and
+    diagnostics.
     """
-    del states
-
-    scores = []
-
-    for logits, owned_classes in zip(raw_skill_logits, skill_classes, strict=False):
-        if not owned_classes:
-            scores.append(logits.new_full((logits.shape[0],), -1e4))
-            continue
-
-        valid_classes = [
-            class_id for class_id in owned_classes if 0 <= class_id < logits.shape[1]
-        ]
-
-        if not valid_classes:
-            scores.append(logits.new_full((logits.shape[0],), -1e4))
-            continue
-
-        class_logits = logits[:, valid_classes]
-        scores.append(class_logits.max(dim=1).values)
-
-    if not scores:
-        raise RuntimeError("Cannot route probe samples without any skills")
-
-    return torch.stack(scores, dim=0).argmax(dim=0)
+    return find_best_routing_skill(
+        raw_skill_logits, states, skill_classes
+    ).skill_indices

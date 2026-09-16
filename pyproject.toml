@@ -1,3 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skill-memory"
+version = "0.1.4"
+description = "Class-level, probe-based Skill Memory plugin for Avalanche continual learning"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "avalanche-lib>=0.6.0",
+    "torch>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.6", "pre-commit>=3.0"]
+
+[tool.setuptools]
+packages = ["skill_memory"]
+
+[tool.setuptools.package-data]
+skill_memory = ["README.md", "README_PERSISTENT_FINGERPRINTS.md"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py311"
@@ -10,13 +35,14 @@ select = [
     "B",
     "UP",
 ]
+
 ignore = [
     "E731",
 ]
 
 [tool.ruff.lint.isort]
 known-first-party = [
-    "cl_strategy",
+    "skill_memory",
 ]
 
 [tool.ruff.format]
