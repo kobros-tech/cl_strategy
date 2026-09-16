@@ -178,6 +178,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                         "skill": record.skill_id,
                         "predicted_y": bool(predicted_y.item()),
                         "expected_y": record.expected_y,
+                        "reference_y": record.reference_y.tolist(),
                         "reference_accuracy": record.reference_accuracy,
                         "correct": bool(comparison["all_correct"]),
                     }
@@ -239,8 +240,13 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         valid = chosen.ge(0)
         if valid.any():
-            rows = chosen[valid]
             positions = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+            skill_to_row = {skill_id: row for row, skill_id in enumerate(slot_ids)}
+            rows = torch.tensor(
+                [skill_to_row[int(skill)] for skill in chosen[valid].tolist()],
+                device=chosen.device,
+                dtype=torch.long,
+            )
             stacked = torch.stack(padded, dim=0)
             strategy.mb_output[positions] = stacked[rows, positions]
 
