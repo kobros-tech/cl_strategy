@@ -72,7 +72,7 @@ class SkillMemoryMLP(nn.Module):
 
 
 class PredictionLogger(SupervisedPlugin):
-    """Capture the routed prediction and ground truth for every eval sample."""
+    """Capture the strategy's final routed prediction for every eval sample."""
 
     def __init__(self):
         super().__init__()
@@ -86,10 +86,15 @@ class PredictionLogger(SupervisedPlugin):
         self._sample_index = 0
 
     def before_eval_exp(self, strategy, **kwargs) -> None:
+        # This is logging metadata only. It is never supplied to or used by
+        # SkillMemoryPlugin routing; routing remains probe-based and
+        # per-sample. Keeping the metadata lets us group errors by benchmark
+        # experience after the fact.
         experience = strategy.experience
         self._exp_id = getattr(experience, "current_experience", None)
 
-    def after_eval_forward(self, strategy, **kwargs) -> None:
+    def after_eval_iteration(self, strategy, **kwargs) -> None:
+        """Log predictions after all eval-forward plugins have run."""
         y_true = strategy.mbatch[1].detach().cpu()
         logits = strategy.mb_output.detach().cpu()
         probs = torch.softmax(logits, dim=1)
@@ -109,38 +114,6 @@ class PredictionLogger(SupervisedPlugin):
                 }
             )
             self._sample_index += 1
-
-    def print_log(
-        self,
-        train_step: int | None = None,
-        only_errors: bool = False,
-        max_rows: int | None = 40,
-    ) -> None:
-        """Print sample-level predictions, optionally filtered to errors."""
-        rows = self.records
-        if train_step is not None:
-            rows = [r for r in rows if r["train_step"] == train_step]
-        if only_errors:
-            rows = [r for r in rows if not r["correct"]]
-        shown = rows[:max_rows] if max_rows else rows
-
-        header = (
-            f"{'step':>4} {'sample':>6} {'exp':>4} {'true_y':>7} "
-            f"{'pred_y':>7} {'conf':>6}  ok"
-        )
-        print(header)
-        print("-" * len(header))
-        for r in shown:
-            mark = "OK" if r["correct"] else "X"
-            print(
-                f"{r['train_step']:>4} {r['sample_index']:>6} "
-                f"{r['experience']:>4} {r['true_y']:>7} {r['pred_y']:>7} "
-                f"{r['confidence']:>6.3f}  {mark}"
-            )
-        if max_rows and len(rows) > max_rows:
-            print(f"... ({len(rows) - max_rows} more rows not shown)")
-        if not rows:
-            print("(no rows match this filter)")
 
     def print_misclassifications(self, train_step: int) -> None:
         """Print every misclassification for one training step."""
@@ -217,20 +190,24 @@ def evaluate_seen_experiences(
     pred_logger: PredictionLogger,
     train_step: int,
 ) -> list[float]:
-    """Evaluate each seen experience separately."""
-    accuracies = []
+    """Evaluate all seen experiences in one strategy evaluation call.
+
+    The benchmark experience boundaries are retained only for evaluation
+    metrics and post-hoc diagnostics. SkillMemoryPlugin receives no target
+    experience or class selection signal and continues to route each sample
+    with its configured probe-based evaluator.
+    """
     pred_logger.set_train_step(train_step)
-    for i in range(up_to_index + 1):
-        results = strategy.eval([test_stream[i]])
-        acc_keys = [k for k in results if k.startswith("Top1_Acc_Exp")]
-        if not acc_keys:
-            raise RuntimeError(
-                "No 'Top1_Acc_Exp' metric found -- is the default "
-                "EvaluationPlugin (accuracy_metrics(experience=True)) still "
-                "attached to the strategy?"
-            )
-        accuracies.append(float(results[acc_keys[0]]))
-    return accuracies
+    seen_stream = [test_stream[i] for i in range(up_to_index + 1)]
+    results = strategy.eval(seen_stream)
+
+    acc_keys = sorted(k for k in results if k.startswith("Top1_Acc_Exp"))
+    if len(acc_keys) != up_to_index + 1:
+        raise RuntimeError(
+            "Expected one Top1_Acc_Exp metric per seen experience, "
+            f"found {len(acc_keys)} for {up_to_index + 1} experiences."
+        )
+    return [float(results[key]) for key in acc_keys]
 
 
 def compute_cl_metrics(accuracy_history: list[list[float]]):
