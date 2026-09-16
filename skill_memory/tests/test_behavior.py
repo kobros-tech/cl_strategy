@@ -53,7 +53,9 @@ def test_reverse_engineer_scores_ignore_inactive_classifier_units():
 
     x = torch.tensor([[1.0, 0.0]])
     actual = model(x).argmax(dim=-1)
-    reconstructed = behavior.reverse_engineer_scores_from_weights(model, x).argmax(dim=-1)
+    reconstructed = behavior.reverse_engineer_scores_from_weights(model, x).argmax(
+        dim=-1
+    )
 
     assert actual.tolist() == [1]
     assert reconstructed.tolist() == [1]
