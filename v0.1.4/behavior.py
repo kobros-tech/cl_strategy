@@ -1,4 +1,4 @@
-"""Persistent class-behavior fingerprints for anonymous probe routing."""
+"""Persistent binary class-behavior fingerprints for anonymous routing."""
 
 from __future__ import annotations
 
@@ -11,16 +11,20 @@ from torch import Tensor
 
 @dataclass
 class ClassBehaviorRecord:
-    """Persistent reference behavior for one canonical class."""
+    """Persistent binary behavior for one canonical class."""
 
     class_id: int
     skill_id: int
     version: int
     reference_inputs: Tensor
-    output_class_ids: tuple[int, ...]
-    reference_output: Tensor
-    reference_summary: Tensor
+    reference_y: Tensor
+    expected_y: bool = True
     valid: bool = True
+
+    @property
+    def reference_accuracy(self) -> float:
+        result = compare_binary_behavior(self.reference_y, self.expected_y)
+        return float(result["accuracy"])
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -28,28 +32,26 @@ class ClassBehaviorRecord:
             "skill_id": self.skill_id,
             "version": self.version,
             "reference_inputs": self.reference_inputs.detach().cpu(),
-            "output_class_ids": self.output_class_ids,
-            "reference_output": self.reference_output.detach().cpu(),
-            "reference_summary": self.reference_summary.detach().cpu(),
+            "reference_y": self.reference_y.detach().cpu().bool(),
+            "expected_y": self.expected_y,
             "valid": self.valid,
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> ClassBehaviorRecord:
+    def from_state_dict(cls, state: dict[str, Any]) -> "ClassBehaviorRecord":
         return cls(
             class_id=int(state["class_id"]),
             skill_id=int(state["skill_id"]),
             version=int(state["version"]),
             reference_inputs=state["reference_inputs"].detach().cpu(),
-            output_class_ids=tuple(int(x) for x in state["output_class_ids"]),
-            reference_output=state["reference_output"].detach().cpu(),
-            reference_summary=state["reference_summary"].detach().cpu(),
+            reference_y=state["reference_y"].detach().cpu().bool(),
+            expected_y=bool(state.get("expected_y", True)),
             valid=bool(state.get("valid", True)),
         )
 
 
 class BehaviorFingerprintCache:
-    """Version-aware persistent cache of class behavior references."""
+    """Version-aware persistent cache of binary class behavior references."""
 
     def __init__(self) -> None:
         self._records: dict[int, ClassBehaviorRecord] = {}
@@ -59,7 +61,6 @@ class BehaviorFingerprintCache:
         return self._skill_versions.get(int(skill_id), 0)
 
     def bump_skill(self, skill_id: int) -> int:
-        """Start a new reference generation for one mutable skill."""
         skill_id = int(skill_id)
         version = self.skill_version(skill_id) + 1
         self._skill_versions[skill_id] = version
@@ -96,7 +97,6 @@ class BehaviorFingerprintCache:
         ]
 
     def all_records_for_skill(self, skill_id: int) -> list[ClassBehaviorRecord]:
-        """Return current and invalidated records for one skill."""
         skill_id = int(skill_id)
         return [
             record for record in self._records.values() if record.skill_id == skill_id
@@ -119,184 +119,37 @@ class BehaviorFingerprintCache:
             self._records[record.class_id] = record
 
 
-def _normalize(values: Tensor) -> Tensor:
-    return values / values.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+def reverse_engineer_y(logits: Tensor, target_class: int) -> Tensor:
+    """Produce binary ``y`` for a candidate class from classifier output."""
+    if logits.ndim != 2:
+        raise ValueError("logits must have shape [batch, classes]")
+    if not 0 <= int(target_class) < logits.shape[-1]:
+        raise ValueError("target_class is outside the classifier output")
+    return logits.argmax(dim=-1).eq(int(target_class))
 
 
-def summarize_behavior(logits: Tensor, owned_classes: list[int]) -> Tensor:
-    """Return a compact, scale-normalized behavior summary."""
-    if not owned_classes:
-        return torch.zeros(4, dtype=logits.dtype, device=logits.device)
-
-    valid = [c for c in owned_classes if 0 <= c < logits.shape[-1]]
-    if not valid:
-        return torch.zeros(4, dtype=logits.dtype, device=logits.device)
-
-    probabilities = torch.softmax(logits, dim=-1)[:, valid]
-    top2 = torch.topk(
-        probabilities,
-        k=min(2, probabilities.shape[-1]),
-        dim=-1,
-    ).values
-    margin = top2[:, 0] - (top2[:, 1] if top2.shape[-1] > 1 else 0.0)
-    summary = torch.stack(
-        [
-            probabilities.mean(dim=-1),
-            probabilities.std(dim=-1, unbiased=False),
-            top2[:, 0],
-            margin,
-        ],
-        dim=-1,
-    ).mean(dim=0)
-    return _normalize(summary.unsqueeze(0)).squeeze(0)
-
-
-def extract_reference_behavior(
-    logits: Tensor,
-    class_ids: list[int],
-    target_class: int,
-) -> tuple[Tensor, Tensor, tuple[int, ...]]:
-    """Extract a class-aligned probability fingerprint from reference inputs."""
-    valid = tuple(sorted({c for c in class_ids if 0 <= c < logits.shape[-1]}))
-    if target_class not in valid:
-        raise ValueError("target class is not represented by the reference output")
-
-    output = torch.softmax(logits, dim=-1)[:, list(valid)].mean(dim=0).detach().cpu()
-    summary = summarize_behavior(logits, list(valid)).detach().cpu()
-    return output, summary, valid
-
-
-def probe_behavior_fingerprint(
-    logits: Tensor,
-    output_class_ids: tuple[int, ...],
-    reference_output: Tensor,
-    reference_summary: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Return probability-fingerprint similarity for each probe sample."""
-    reference_ids = tuple(int(c) for c in output_class_ids)
-    if len(reference_ids) != reference_output.shape[-1]:
-        raise ValueError("reference class IDs do not match reference output width")
-    if not reference_ids:
-        empty = torch.full((logits.shape[0],), -1.0, device=logits.device)
-        return empty, torch.zeros(4, device=logits.device)
-
-    current_ids = tuple(range(logits.shape[-1]))
-    union_ids = tuple(sorted(set(reference_ids).union(current_ids)))
-    reference_index = {class_id: i for i, class_id in enumerate(reference_ids)}
-
-    reference = torch.zeros(
-        len(union_ids), device=logits.device, dtype=logits.dtype
-    )
-    for position, class_id in enumerate(union_ids):
-        reference_position = reference_index.get(class_id)
-        if reference_position is not None:
-            reference[position] = reference_output[reference_position].to(
-                device=logits.device, dtype=logits.dtype
-            )
-
-    current = torch.zeros(
-        logits.shape[0], len(union_ids), device=logits.device, dtype=logits.dtype
-    )
-    current_positions = {
-        class_id: position for position, class_id in enumerate(union_ids)
+def compare_binary_behavior(
+    predicted_y: Tensor,
+    expected_y: bool,
+) -> dict[str, Any]:
+    """Compare predicted binary ``y`` values with an expected value."""
+    predicted_y = predicted_y.detach().cpu().bool()
+    expected = torch.full_like(predicted_y, expected_y, dtype=torch.bool)
+    correct = predicted_y.eq(expected)
+    return {
+        "predicted_y": predicted_y,
+        "expected_y": bool(expected_y),
+        "correct": correct,
+        "accuracy": float(correct.float().mean().item())
+        if correct.numel()
+        else 0.0,
+        "all_correct": bool(correct.all().item()) if correct.numel() else False,
     }
-    current_probabilities = torch.softmax(logits, dim=-1)
-    for class_id in current_ids:
-        current[:, current_positions[class_id]] = current_probabilities[:, class_id]
-
-    current = _normalize(current)
-    reference = _normalize(reference.unsqueeze(0)).squeeze(0)
-    output_similarity = torch.nn.functional.cosine_similarity(
-        current, reference.unsqueeze(0), dim=-1
-    )
-
-    summary_ids = [c for c in reference_ids if 0 <= c < logits.shape[-1]]
-    summary = summarize_behavior(logits, summary_ids)
-    reference_summary = reference_summary.to(
-        device=logits.device, dtype=logits.dtype
-    )
-    summary_similarity = torch.nn.functional.cosine_similarity(
-        summary.unsqueeze(0), reference_summary.unsqueeze(0), dim=-1
-    )
-
-    similarity = 0.8 * output_similarity + 0.2 * summary_similarity
-    return similarity, summary
 
 
-def fingerprint_similarity(
-    left: ClassBehaviorRecord,
-    right: ClassBehaviorRecord,
-) -> float:
-    """Measure cosine similarity between two stored class fingerprints.
-
-    The comparison is based only on persistent reference behavior. It does not
-    run a probe sample and therefore cannot establish anonymous routing by
-    itself; it is a diagnostic for fingerprint separation and evolution.
-    """
-    left_index = {class_id: i for i, class_id in enumerate(left.output_class_ids)}
-    right_index = {class_id: i for i, class_id in enumerate(right.output_class_ids)}
-    union_ids = sorted(set(left_index).union(right_index))
-    if not union_ids:
-        return 0.0
-
-    left_vector = left.reference_output.new_zeros(len(union_ids))
-    right_vector = right.reference_output.new_zeros(len(union_ids))
-    for position, class_id in enumerate(union_ids):
-        left_position = left_index.get(class_id)
-        right_position = right_index.get(class_id)
-        if left_position is not None:
-            left_vector[position] = left.reference_output[left_position]
-        if right_position is not None:
-            right_vector[position] = right.reference_output[right_position]
-
-    similarity = torch.nn.functional.cosine_similarity(
-        left_vector.unsqueeze(0), right_vector.unsqueeze(0), dim=-1
-    )
-    return float(similarity.item())
-
-
-def pairwise_reference_similarity(
-    records: list[ClassBehaviorRecord],
-) -> dict[tuple[int, int], float]:
-    """Return pairwise stored-fingerprint similarity for diagnostic analysis.
-
-    This measures reference separation only. It must not be interpreted as
-    proof that anonymous samples will route correctly, because it does not
-    evaluate a sample through the competing skill snapshots.
-    """
-    result: dict[tuple[int, int], float] = {}
-    ordered = sorted(records, key=lambda record: record.class_id)
-    for index, left in enumerate(ordered):
-        for right in ordered[index + 1 :]:
-            result[(left.class_id, right.class_id)] = fingerprint_similarity(
-                left, right
-            )
-    return result
-
-
-def compare_fingerprint_evolution(
-    before: dict[int, ClassBehaviorRecord],
-    after: dict[int, ClassBehaviorRecord],
-) -> dict[int, dict[str, float | str]]:
-    """Compare persistent fingerprints before and after a training event.
-
-    Existing classes receive cosine similarity and drift (`1 - similarity`).
-    Newly created classes are reported as ``status='new'``. This intentionally
-    uses the same fixed reference inputs across generations, so measured drift
-    reflects model-behavior change rather than probe-sample changes.
-    """
-    result: dict[int, dict[str, float | str]] = {}
-    for class_id, record in sorted(after.items()):
-        previous = before.get(class_id)
-        if previous is None:
-            result[class_id] = {"status": "new"}
-            continue
-        similarity = fingerprint_similarity(previous, record)
-        result[class_id] = {
-            "status": "updated",
-            "similarity": similarity,
-            "drift": 1.0 - similarity,
-        }
-    for class_id in sorted(set(before).difference(after)):
-        result[class_id] = {"status": "removed"}
-    return result
+def identify_binary_behavior(
+    predicted_y: Tensor,
+    expected_y: bool = True,
+) -> bool:
+    """Return whether every anonymous probe agrees with expected ``y``."""
+    return bool(compare_binary_behavior(predicted_y, expected_y)["all_correct"])
