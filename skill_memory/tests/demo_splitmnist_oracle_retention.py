@@ -81,10 +81,13 @@ def main() -> None:
         history.append(accuracies)
         assignments = plugin.class_map.class_skill_for_experience(train_index)
         decisions = plugin.last_class_decisions.get(train_index, {})
+        decision_text = ", ".join(
+            f"{class_id}: {decision['decision']}"
+            for class_id, decision in sorted(decisions.items())
+        )
         print(
             f"Step {train_index}: classes={sorted(train_exp.classes_in_this_experience)} "
-            f"class->skill={assignments} "
-            f"decisions={{{', '.join(f'{c}: {d[\"decision\"]}' for c, d in sorted(decisions.items()))}}}"
+            f"class->skill={assignments} decisions={{{decision_text}}}"
         )
         print(
             "  oracle_eval="
