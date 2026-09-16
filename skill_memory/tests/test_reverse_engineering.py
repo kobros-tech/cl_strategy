@@ -1,6 +1,9 @@
 import torch
 
-from skill_memory.reverse_engineering import CandidateParameters, NormalMLReverseEngineer
+from skill_memory.reverse_engineering import (
+    CandidateParameters,
+    NormalMLReverseEngineer,
+)
 
 
 def test_normal_ml_reverse_engineer_learns_candidate_identity():
