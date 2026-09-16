@@ -69,9 +69,10 @@ def test_normal_ml_reverse_engineer_listwise_selects_correct_candidate():
     reverse_engineer.fit_candidate_sets(sets)
 
     assert reverse_engineer.hidden_size == 128
-    assert sum(
-        isinstance(layer, torch.nn.Linear) for layer in reverse_engineer.model.network
-    ) == 3
+    assert reverse_engineer.num_heads == 8
+    assert reverse_engineer.num_layers == 3
+    assert isinstance(reverse_engineer.model.encoder, torch.nn.TransformerEncoder)
+    assert isinstance(reverse_engineer.model.output, torch.nn.Linear)
 
     scores = reverse_engineer.predict_scores_features(sets[0][0])
     assert int(scores.argmax()) == 0
@@ -92,10 +93,12 @@ def test_normal_ml_reverse_engineer_scales_to_100_candidates():
         candidate_sets.append((torch.stack(rows), target))
 
     reverse_engineer = NormalMLReverseEngineer(
-        epochs=60,
-        hidden_size=32,
-        batch_size=32,
+        epochs=20,
+        hidden_size=128,
+        batch_size=16,
         seed=13,
+        num_heads=8,
+        num_layers=2,
     )
     reverse_engineer.fit_candidate_sets(candidate_sets)
 
