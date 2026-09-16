@@ -62,16 +62,17 @@ def flatten_route(route: dict, train_index: int) -> dict:
     candidates = route.get("candidates", [])
     top = candidates[0] if candidates else {}
     second = candidates[1] if len(candidates) > 1 else {}
-    evaluation_y = route.get("evaluation_y")
-    inferred_class = route.get("class")
     return {
         "training_step": train_index,
+        "evaluation_experience": route.get("evaluation_experience"),
         "batch_index": route.get("batch_index", -1),
         "sample_index": route.get("sample_index", -1),
-        "evaluation_y": evaluation_y,
+        "evaluation_y": route.get("evaluation_y"),
         "status": route.get("status"),
-        "inferred_class": inferred_class,
+        "inferred_class": route.get("class"),
         "selected_skill": route.get("skill"),
+        "model_predicted_class": route.get("model_predicted_class"),
+        "model_correct": route.get("model_correct"),
         "top_candidate_class": top.get("class"),
         "top_candidate_skill": top.get("skill"),
         "top_candidate_correct": top.get("correct"),
@@ -87,19 +88,102 @@ def flatten_route(route: dict, train_index: int) -> dict:
     }
 
 
-def write_analysis_files(log_dir: Path, run_id: str, rows: list[dict]) -> None:
-    """Write CSV and JSON routing-analysis artifacts."""
+def routing_summary(rows: list[dict]) -> dict:
+    """Summarize routing and final-model correctness by eval experience."""
+    by_experience: dict[str, dict] = {}
+    for row in rows:
+        experience = row.get("evaluation_experience")
+        if experience is None:
+            continue
+        key = str(experience)
+        summary = by_experience.setdefault(
+            key,
+            {
+                "samples": 0,
+                "identified": 0,
+                "ambiguous": 0,
+                "failed": 0,
+                "identified_correct_class": 0,
+                "identified_final_model_correct": 0,
+                "final_model_correct": 0,
+            },
+        )
+        summary["samples"] += 1
+        summary[row["status"].lower()] += 1
+        if row["status"] == "IDENTIFIED":
+            summary["identified_correct_class"] += int(
+                row["inferred_class"] == row["evaluation_y"]
+            )
+            summary["identified_final_model_correct"] += int(
+                bool(row["model_correct"])
+            )
+        summary["final_model_correct"] += int(bool(row["model_correct"]))
+
+    for summary in by_experience.values():
+        identified = summary["identified"]
+        samples = summary["samples"]
+        summary["identified_class_accuracy"] = (
+            summary["identified_correct_class"] / max(identified, 1)
+        )
+        summary["identified_final_model_accuracy"] = (
+            summary["identified_final_model_correct"] / max(identified, 1)
+        )
+        summary["final_model_accuracy"] = (
+            summary["final_model_correct"] / max(samples, 1)
+        )
+    return by_experience
+
+
+def write_accuracy_matrix(
+    log_dir: Path,
+    run_id: str,
+    accuracy_history: list[list[float]],
+) -> Path:
+    """Write train-step x evaluation-experience accuracy matrix."""
+    path = log_dir / f"weight_reverse_engineering_accuracy_{run_id}.csv"
+    max_experiences = max((len(row) for row in accuracy_history), default=0)
+    fieldnames = ["training_step"] + [
+        f"eval_exp_{index}" for index in range(max_experiences)
+    ]
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for train_index, accuracies in enumerate(accuracy_history):
+            row = {"training_step": train_index}
+            row.update(
+                {
+                    f"eval_exp_{index}": accuracy
+                    for index, accuracy in enumerate(accuracies)
+                }
+            )
+            writer.writerow(row)
+    return path
+
+
+def write_analysis_files(
+    log_dir: Path,
+    run_id: str,
+    rows: list[dict],
+    accuracy_history: list[list[float]],
+    accuracy_curve: np.ndarray,
+    forgetting: np.ndarray,
+) -> None:
+    """Write CSV/JSON artifacts that separate routing from final metrics."""
     csv_path = log_dir / f"weight_reverse_engineering_{run_id}.csv"
     json_path = log_dir / f"weight_reverse_engineering_{run_id}.json"
+    matrix_path = write_accuracy_matrix(log_dir, run_id, accuracy_history)
 
     fieldnames = [
         "training_step",
+        "evaluation_experience",
         "batch_index",
         "sample_index",
         "evaluation_y",
         "status",
         "inferred_class",
         "selected_skill",
+        "model_predicted_class",
+        "model_correct",
         "top_candidate_class",
         "top_candidate_skill",
         "top_candidate_correct",
@@ -133,10 +217,15 @@ def write_analysis_files(log_dir: Path, run_id: str, rows: list[dict]) -> None:
             )
             / max(identified, 1)
         ),
+        "accuracy_curve": accuracy_curve.tolist(),
+        "forgetting": forgetting.tolist(),
+        "accuracy_matrix_csv": matrix_path.name,
+        "routing_by_evaluation_experience": routing_summary(rows),
         "analysis_csv": csv_path.name,
     }
     json_path.write_text(json.dumps(summary, indent=2))
     print("Analysis CSV saved to:", csv_path)
+    print("Accuracy matrix CSV saved to:", matrix_path)
     print("Analysis JSON saved to:", json_path)
 
 
@@ -206,6 +295,10 @@ def main() -> None:
                 f"last_batch_routes=(identified={identified}, "
                 f"ambiguous={ambiguous}, failed={failed})"
             )
+            for eval_index, accuracy in enumerate(accuracies):
+                print(
+                    f"  eval_exp={eval_index}: accuracy={accuracy:.3f}"
+                )
 
         n = len(accuracy_history)
         accuracy_curve = np.array([accuracy_history[i][i] for i in range(n)])
@@ -217,8 +310,24 @@ def main() -> None:
 
         print("Accuracy:", np.round(accuracy_curve, 3))
         print("Forgetting:", np.round(forgetting, 3))
+        print("Evaluation accuracy matrix:")
+        for train_index, accuracies in enumerate(accuracy_history):
+            print(
+                f"  train_step={train_index}: "
+                + ", ".join(
+                    f"Exp{eval_index}={accuracy:.3f}"
+                    for eval_index, accuracy in enumerate(accuracies)
+                )
+            )
         print("Final fingerprint records:", len(plugin.behavior.state_dict()["records"]))
-        write_analysis_files(log_dir, run_id, analysis_rows)
+        write_analysis_files(
+            log_dir,
+            run_id,
+            analysis_rows,
+            accuracy_history,
+            accuracy_curve,
+            forgetting,
+        )
         print("Log saved to:", log_path)
     finally:
         sys.stdout = real_stdout
