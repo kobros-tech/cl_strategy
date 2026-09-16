@@ -61,11 +61,15 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         class_id: int,
         x: Tensor,
         version: int,
+        state_dict: dict | None = None,
     ) -> ClassBehaviorRecord:
+        """Create a class record from the frozen skill-generation state."""
+        if state_dict is None:
+            state_dict = self.memory.state(skill_id)
         model = deepcopy(strategy.model)
         reference_y = self._reverse_engineer_y(
             model,
-            self.memory.state(skill_id),
+            state_dict,
             x,
             class_id,
         ).cpu()
@@ -98,8 +102,10 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self._pending_reference_inputs[class_id] = x.detach().cpu().clone()
 
     def _refresh_skill(self, strategy, skill_id: int, experience) -> None:
-        """Refresh every class fingerprint owned by the current skill."""
+        """Refresh every class fingerprint owned by the current skill generation."""
         version = self.behavior.skill_version(skill_id)
+        state_dict = self.memory.state(skill_id)
+        self.behavior.put_skill_state(skill_id, version, state_dict)
         classes = sorted(self.class_map.classes_for_skill(skill_id))
         existing = {
             record.class_id: record
@@ -121,7 +127,14 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     self.probe_seed,
                 )
             self.behavior.put(
-                self._build_record(strategy, skill_id, class_id, x, version)
+                self._build_record(
+                    strategy,
+                    skill_id,
+                    class_id,
+                    x,
+                    version,
+                    state_dict,
+                )
             )
 
     def _collect_changed_skills(self, experience_index: int) -> set[int]:
@@ -171,6 +184,12 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             if self.behavior.get(class_id, int(skill_id)) is not None:
                 continue
             version = self.behavior.skill_version(int(skill_id))
+            state_dict = self.behavior.skill_state(int(skill_id), version)
+            if state_dict is None:
+                state_dict = self.memory.state(int(skill_id))
+                self.behavior.put_skill_state(
+                    int(skill_id), version, state_dict
+                )
             self.behavior.put(
                 self._build_record(
                     strategy,
@@ -178,6 +197,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     int(class_id),
                     x,
                     version,
+                    state_dict,
                 )
             )
 
@@ -190,7 +210,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         x: Tensor,
         slot_ids: list[int],
     ) -> tuple[Tensor, list[int]]:
-        """Identify a class from learned weights, then resolve its skill."""
+        """Identify a class from frozen skill-generation weights, then resolve its skill."""
         probe_model = deepcopy(strategy.model)
         candidate_records = [
             record
@@ -199,14 +219,22 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         ]
         skill_scores: dict[int, Tensor] = {}
         for slot in slot_ids:
-            state = self.memory.state(slot)
+            records = self.behavior.records_for_skill(slot)
+            if not records:
+                continue
+            version = records[0].version
+            frozen_state = self.behavior.skill_state(slot, version)
+            if frozen_state is None:
+                # Backward-compatible fallback for checkpoints created before
+                # frozen skill-generation states were persisted.
+                frozen_state = self.memory.state(slot)
             if self._custom_reverse_engineer_y is None:
-                apply_skill_state_exact(probe_model, state)
+                apply_skill_state_exact(probe_model, frozen_state)
                 skill_scores[slot] = reverse_engineer_scores_from_weights(
                     probe_model, x
                 )
             else:
-                skill_scores[slot] = predict_logits(probe_model, state, x)
+                skill_scores[slot] = predict_logits(probe_model, frozen_state, x)
 
         chosen_skills: list[int] = []
         chosen_classes: list[int] = []
@@ -215,7 +243,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         for sample_index in range(x.shape[0]):
             matches: list[dict] = []
             for record in candidate_records:
-                scores = skill_scores[record.skill_id]
+                scores = skill_scores.get(record.skill_id)
+                if scores is None:
+                    continue
                 if not 0 <= record.class_id < scores.shape[-1]:
                     continue
                 predicted_class = int(scores[sample_index].argmax().item())
@@ -337,9 +367,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             stacked = torch.stack(padded, dim=0)
             strategy.mb_output[positions] = stacked[rows, positions]
 
-        # Capture the prediction actually consumed by Avalanche's metric
-        # after routing. This separates a routing decision from the final
-        # model output and makes evaluation failures reconstructable.
         final_predictions = strategy.mb_output.detach().argmax(dim=-1).cpu().tolist()
         labels = y.detach().cpu().tolist()
         for route, prediction, label in zip(
