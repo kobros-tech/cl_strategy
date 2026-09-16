@@ -94,4 +94,8 @@ def test_legacy_checkpoint_without_behavior_state_loads():
 
     cache.load_state_dict({})
 
-    assert cache.state_dict() == {"skill_versions": {}, "records": []}
+    state = cache.state_dict()
+    assert state["skill_versions"] == {}
+    assert state["skill_states"] == {}
+    assert state["skill_state_versions"] == {}
+    assert state["records"] == []
