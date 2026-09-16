@@ -94,7 +94,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             candidate_probability = torch.zeros((samples.shape[0], 1))
         else:
             candidate_logit = padded[:, candidate_class_id].reshape(-1, 1)
-            candidate_probability = probabilities[:, candidate_class_id].reshape(-1, 1)
+            candidate_probability = probabilities[:, candidate_class_id].reshape(
+                -1, 1
+            )
         weight = candidate_weight.detach().float().cpu().reshape(1, -1)
         weight = weight.expand(samples.shape[0], -1)
         bias = torch.full((samples.shape[0], 1), float(candidate_bias))
@@ -103,11 +105,14 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             interaction = samples * weight
             sample_norm = samples.norm(dim=1, keepdim=True).clamp_min(1e-8)
             weight_norm = weight.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            cosine = (interaction.sum(dim=1, keepdim=True) / (sample_norm * weight_norm))
+            cosine = interaction.sum(dim=1, keepdim=True) / (
+                sample_norm * weight_norm
+            )
+            dot_product = interaction.sum(dim=1, keepdim=True)
         else:
             interaction = torch.zeros_like(weight)
+            dot_product = torch.zeros((samples.shape[0], 1))
             cosine = torch.zeros((samples.shape[0], 1))
-        dot_product = (samples * weight).sum(dim=1, keepdim=True) if samples.shape[1] == weight.shape[1] else torch.zeros((samples.shape[0], 1))
 
         return torch.cat(
             (
@@ -315,7 +320,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             if record.reference_weight is not None
             and record.reference_weight.numel() == candidate_dim
         ]
-        class_to_candidate = {record.class_id: index for index, record in enumerate(candidates)}
+        class_to_candidate = {
+            record.class_id: index for index, record in enumerate(candidates)
+        }
         if len(class_to_candidate) != len(candidates):
             raise RuntimeError("reverse router requires one candidate record per class")
 
