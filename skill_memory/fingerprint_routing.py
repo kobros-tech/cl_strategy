@@ -21,12 +21,23 @@ from .behavior import (
     reverse_engineer_scores_from_weights,
     reverse_engineer_y,
 )
+from .global_fingerprint_refresh import refresh_all_fingerprints
 from .persistent_skill_memory_plugin import PersistentFingerprintSkillMemoryPlugin as _BaseFingerprintPlugin
 from .probing import apply_skill_state_exact, predict_logits
 
 
 class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
     """Persistent fingerprint router with independent continuous evidence."""
+
+    def after_training_exp(self, strategy, **kwargs) -> None:
+        """Synchronize every class fingerprint after a logical experience."""
+        super().after_training_exp(strategy, **kwargs)
+        experience = strategy.experience
+        if not self._is_last_subexp(experience):
+            return
+        if self._current_training_experience_index is None:
+            return
+        self.last_fingerprint_refresh = refresh_all_fingerprints(self, strategy)
 
     def _fingerprint_route(
         self,
