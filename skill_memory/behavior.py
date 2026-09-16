@@ -6,14 +6,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from avalanche.models.dynamic_modules import IncrementalClassifier
 from torch import Tensor
-import torch.nn.functional as F
 
 
 @dataclass
 class ClassBehaviorRecord:
-    """Persistent binary behavior for one canonical class."""
+    """Persistent behavior and continuous evidence for one canonical class."""
 
     class_id: int
     skill_id: int
@@ -22,6 +22,12 @@ class ClassBehaviorRecord:
     reference_y: Tensor
     expected_y: bool = True
     valid: bool = True
+    reference_feature_mean: Tensor | None = None
+    reference_feature_std: Tensor | None = None
+    reference_margin_mean: float = 0.0
+    reference_margin_std: float = 1.0
+    reference_weight: Tensor | None = None
+    reference_bias: float = 0.0
 
     @property
     def reference_accuracy(self) -> float:
@@ -37,6 +43,24 @@ class ClassBehaviorRecord:
             "reference_y": self.reference_y.detach().cpu().bool(),
             "expected_y": self.expected_y,
             "valid": self.valid,
+            "reference_feature_mean": (
+                None
+                if self.reference_feature_mean is None
+                else self.reference_feature_mean.detach().cpu()
+            ),
+            "reference_feature_std": (
+                None
+                if self.reference_feature_std is None
+                else self.reference_feature_std.detach().cpu()
+            ),
+            "reference_margin_mean": self.reference_margin_mean,
+            "reference_margin_std": self.reference_margin_std,
+            "reference_weight": (
+                None
+                if self.reference_weight is None
+                else self.reference_weight.detach().cpu()
+            ),
+            "reference_bias": self.reference_bias,
         }
 
     @classmethod
@@ -49,11 +73,17 @@ class ClassBehaviorRecord:
             reference_y=state["reference_y"].detach().cpu().bool(),
             expected_y=bool(state.get("expected_y", True)),
             valid=bool(state.get("valid", True)),
+            reference_feature_mean=state.get("reference_feature_mean"),
+            reference_feature_std=state.get("reference_feature_std"),
+            reference_margin_mean=float(state.get("reference_margin_mean", 0.0)),
+            reference_margin_std=max(float(state.get("reference_margin_std", 1.0)), 1e-6),
+            reference_weight=state.get("reference_weight"),
+            reference_bias=float(state.get("reference_bias", 0.0)),
         )
 
 
 class BehaviorFingerprintCache:
-    """Version-aware persistent cache of binary class behavior references."""
+    """Version-aware persistent cache of class behavior references."""
 
     def __init__(self) -> None:
         self._records: dict[int, ClassBehaviorRecord] = {}
@@ -129,15 +159,8 @@ def _find_classifier(model) -> IncrementalClassifier:
     raise ValueError("reverse engineering requires an IncrementalClassifier head")
 
 
-def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
-    """Reconstruct classifier scores directly from learned head weights.
-
-    The classifier is an affine map ``scores = features @ W.T + b``.  We
-    capture the representation entering the learned classifier and then
-    explicitly reconstruct that affine map from ``weight`` and ``bias``.
-    This is deliberately different from calling ``model(x)`` and treating
-    the returned logits as the reverse-engineering algorithm.
-    """
+def extract_features_from_weights(model, x: Tensor) -> Tensor:
+    """Capture the representation entering the learned classifier head."""
     classifier = _find_classifier(model).classifier
     captured: dict[str, Tensor] = {}
 
@@ -163,7 +186,13 @@ def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
             "classifier input must have shape [batch, features] for "
             "weight-based reverse engineering"
         )
+    return features
 
+
+def reverse_engineer_scores_from_weights(model, x: Tensor) -> Tensor:
+    """Reconstruct classifier scores directly from learned head weights."""
+    classifier = _find_classifier(model).classifier
+    features = extract_features_from_weights(model, x)
     weight = classifier.weight.detach()
     bias = classifier.bias.detach() if classifier.bias is not None else None
     return F.linear(features, weight, bias)
@@ -211,3 +240,38 @@ def identify_binary_behavior(
 ) -> bool:
     """Return whether every anonymous probe agrees with expected ``y``."""
     return bool(compare_binary_behavior(predicted_y, expected_y)["all_correct"])
+
+
+def build_weight_behavior_statistics(
+    model, x: Tensor, class_id: int
+) -> dict[str, Any]:
+    """Build continuous, weight-derived statistics for a persistent class."""
+    classifier = _find_classifier(model).classifier
+    features = extract_features_from_weights(model, x)
+    scores = F.linear(
+        features,
+        classifier.weight.detach(),
+        classifier.bias.detach() if classifier.bias is not None else None,
+    )
+    class_id = int(class_id)
+    if not 0 <= class_id < scores.shape[-1]:
+        raise ValueError("class_id is outside the classifier output")
+    own = scores[:, class_id]
+    if scores.shape[-1] > 1:
+        other = scores.clone()
+        other[:, class_id] = -torch.inf
+        margin = own - other.max(dim=-1).values
+    else:
+        margin = own
+    return {
+        "feature_mean": features.mean(dim=0).detach().cpu(),
+        "feature_std": features.std(dim=0, unbiased=False).clamp_min(1e-6).detach().cpu(),
+        "margin_mean": float(margin.mean().item()),
+        "margin_std": max(float(margin.std(unbiased=False).item()), 1e-6),
+        "weight": classifier.weight[class_id].detach().cpu().clone(),
+        "bias": (
+            float(classifier.bias[class_id].item())
+            if classifier.bias is not None
+            else 0.0
+        ),
+    }
