@@ -1,18 +1,19 @@
 repos:
   # Basic repository hygiene
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+    rev: v4.6.0
     hooks:
       - id: check-merge-conflict
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: check-yaml
       - id: check-added-large-files
+        args: ["--maxkb=500"]
 
   # Python formatting and linting
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.13.0
+    rev: v0.16.7
     hooks:
-      - id: ruff-check
-        args: [--fix]
+      - id: ruff
+        args: ["--fix"]
       - id: ruff-format
