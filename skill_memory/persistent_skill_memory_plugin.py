@@ -38,6 +38,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         reverse_seed: int = 0,
         reverse_batch_size: int = 256,
         reverse_training_mode: str = "listwise",
+        record_candidate_diagnostics: bool = True,
         **kwargs,
     ):
         kwargs.setdefault("reuse_is_mutable", False)
@@ -60,6 +61,13 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self.fingerprint_route_history: list[dict] = []
         self._fingerprint_batch_index = 0
         self._evaluation_experience_index: int | None = None
+        # When False, `_route` skips building the per-sample, per-candidate
+        # "candidates" breakdown (one dict + one GPU->CPU sync per candidate
+        # per sample). That breakdown only feeds `routing_rank_diagnostics`,
+        # so callers that never inspect diagnostics (the common eval-time
+        # path) can turn it off to remove that overhead entirely instead of
+        # building it and throwing it away afterwards.
+        self.record_candidate_diagnostics = bool(record_candidate_diagnostics)
 
     @staticmethod
     def _pad_logits(logits: Tensor, output_dim: int) -> Tensor:
@@ -94,9 +102,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             candidate_probability = torch.zeros((samples.shape[0], 1))
         else:
             candidate_logit = padded[:, candidate_class_id].reshape(-1, 1)
-            candidate_probability = probabilities[:, candidate_class_id].reshape(
-                -1, 1
-            )
+            candidate_probability = probabilities[:, candidate_class_id].reshape(-1, 1)
         weight = candidate_weight.detach().float().cpu().reshape(1, -1)
         weight = weight.expand(samples.shape[0], -1)
         bias = torch.full((samples.shape[0], 1), float(candidate_bias))
@@ -105,9 +111,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             interaction = samples * weight
             sample_norm = samples.norm(dim=1, keepdim=True).clamp_min(1e-8)
             weight_norm = weight.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            cosine = interaction.sum(dim=1, keepdim=True) / (
-                sample_norm * weight_norm
-            )
+            cosine = interaction.sum(dim=1, keepdim=True) / (sample_norm * weight_norm)
             dot_product = interaction.sum(dim=1, keepdim=True)
         else:
             interaction = torch.zeros_like(weight)
@@ -267,7 +271,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             self._refresh_skill(strategy, skill_id, experience)
         for class_id, x in sorted(pending.items()):
             skill_id = self.class_map.find_skill_for_class_anywhere(class_id)
-            if skill_id is None or self.behavior.get(class_id, int(skill_id)) is not None:
+            if skill_id is None:
+                continue
+            if self.behavior.get(class_id, int(skill_id)) is not None:
                 continue
             skill_id = int(skill_id)
             version = self.behavior.skill_version(skill_id)
@@ -361,7 +367,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             candidate_sets.extend((rows, target_index) for rows in feature_rows)
         self.reverse_engineer.fit_candidate_sets(candidate_sets)
 
-    def _route(self, strategy, x: Tensor, slot_ids: list[int]) -> tuple[Tensor, list[int]]:
+    def _route(
+        self, strategy, x: Tensor, slot_ids: list[int]
+    ) -> tuple[Tensor, list[int]]:
         """Route anonymously by listwise scoring of the complete candidate set."""
         if self.reverse_engineer.model is None or self._reverse_output_dim is None:
             raise RuntimeError("reverse router has not been fitted")
@@ -405,31 +413,29 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             record, score = route_candidates[candidate_index]
             chosen_skills.append(record.skill_id)
             chosen_classes.append(record.class_id)
-            routes.append(
-                {
-                    "sample_index": sample_index,
-                    "status": "IDENTIFIED",
-                    "class": record.class_id,
-                    "skill": record.skill_id,
-                    "score": float(score[sample_index].item()),
-                    "probability": float(
-                        probabilities[sample_index, candidate_index].item()
-                    ),
-                    "candidates": [
-                        {
-                            "class": candidate.class_id,
-                            "skill": candidate.skill_id,
-                            "score": float(candidate_score[sample_index].item()),
-                            "probability": float(
-                                probabilities[sample_index, index].item()
-                            ),
-                        }
-                        for index, (candidate, candidate_score) in enumerate(
-                            route_candidates
-                        )
-                    ],
-                }
-            )
+            route = {
+                "sample_index": sample_index,
+                "status": "IDENTIFIED",
+                "class": record.class_id,
+                "skill": record.skill_id,
+                "score": float(score[sample_index].item()),
+                "probability": float(
+                    probabilities[sample_index, candidate_index].item()
+                ),
+            }
+            if self.record_candidate_diagnostics:
+                route["candidates"] = [
+                    {
+                        "class": candidate.class_id,
+                        "skill": candidate.skill_id,
+                        "score": float(candidate_score[sample_index].item()),
+                        "probability": float(probabilities[sample_index, index].item()),
+                    }
+                    for index, (candidate, candidate_score) in enumerate(
+                        route_candidates
+                    )
+                ]
+            routes.append(route)
         self.last_fingerprint_routes = routes
         return (
             torch.tensor(chosen_skills, dtype=torch.long, device=x.device),

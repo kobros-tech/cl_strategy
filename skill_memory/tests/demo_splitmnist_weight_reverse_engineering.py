@@ -58,7 +58,7 @@ def evaluate_seen(strategy, test_stream, up_to_index: int) -> list[float]:
     for key, value in results.items():
         if not key.startswith(prefix):
             continue
-        suffix = key[len(prefix):]
+        suffix = key[len(prefix) :]
         if "/Exp" not in suffix:
             continue
         try:
@@ -169,9 +169,7 @@ def rank_summary(rows: list[dict]) -> dict:
         "top10_accuracy": sum(rank <= 10 for rank in ranks) / len(ranks),
         "mean_reciprocal_rank": sum(1.0 / rank for rank in ranks) / len(ranks),
         "mean_correct_class_rank": float(np.mean(ranks)),
-        "rank_histogram": {
-            str(rank): ranks.count(rank) for rank in sorted(set(ranks))
-        },
+        "rank_histogram": {str(rank): ranks.count(rank) for rank in sorted(set(ranks))},
     }
 
 
@@ -489,7 +487,9 @@ def main() -> None:
                     for route in plugin.fingerprint_route_history
                 )
                 routes = plugin.last_fingerprint_routes
-                identified = sum(route.get("status") == "IDENTIFIED" for route in routes)
+                identified = sum(
+                    route.get("status") == "IDENTIFIED" for route in routes
+                )
                 ambiguous = sum(route.get("status") == "AMBIGUOUS" for route in routes)
                 failed = sum(route.get("status") == "FAILED" for route in routes)
                 print(

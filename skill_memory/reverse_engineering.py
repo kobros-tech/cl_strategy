@@ -68,7 +68,23 @@ class _BinaryFeatureReverseModel(nn.Module):
 
 
 class NormalMLReverseEngineer:
-    """Learn anonymous candidate/class compatibility as a normal ML problem."""
+    """Learn anonymous candidate/class compatibility as a normal ML problem.
+
+    Two training modes are supported:
+
+    - ``"listwise"`` (default): for every reference sample, all currently
+      known class candidates form one candidate set and cross-entropy trains
+      the model to put the correct class at the top. Candidate tokens attend
+      to one another, so the scorer reasons about the complete candidate set
+      rather than scoring every candidate independently.
+    - ``"binary"``: the legacy pairwise-compatibility API, retained for
+      backward compatibility with callers built around ``fit_feature_pairs``.
+
+    In both modes, candidate identity is represented only through
+    model-derived behavior features. The integer class ID is never an input
+    feature, so no evaluation-time ground-truth leakage is possible through
+    this model.
+    """
 
     def __init__(
         self,
@@ -172,7 +188,12 @@ class NormalMLReverseEngineer:
         self,
         candidate_sets: list[tuple[Tensor, Tensor | int]],
     ) -> None:
-        """Fit listwise compatibility scores over complete candidate sets."""
+        """Fit listwise compatibility scores over complete candidate sets.
+
+        Each item is ``(features, target_index)`` where ``features`` has shape
+        ``[candidates, feature_dim]`` and ``target_index`` identifies the
+        correct candidate. Candidate order has no learned positional meaning.
+        """
         if not candidate_sets:
             self.model = None
             self.feature_dim = None
@@ -185,7 +206,9 @@ class NormalMLReverseEngineer:
         for features, target in candidate_sets:
             features = features.detach().float().cpu()
             if features.ndim != 2:
-                raise ValueError("candidate-set features must be [candidates, features]")
+                raise ValueError(
+                    "candidate-set features must be [candidates, features]"
+                )
             target_index = (
                 int(target) if not isinstance(target, Tensor) else int(target.item())
             )
@@ -197,8 +220,7 @@ class NormalMLReverseEngineer:
         candidate_count = normalized_sets[0].shape[0]
         feature_dim = normalized_sets[0].shape[1]
         if any(
-            item.shape != (candidate_count, feature_dim)
-            for item in normalized_sets
+            item.shape != (candidate_count, feature_dim) for item in normalized_sets
         ):
             raise ValueError("candidate sets must have identical shapes")
         features = torch.stack(normalized_sets, dim=0)
@@ -268,9 +290,7 @@ class NormalMLReverseEngineer:
             weight = params.weight.detach().float().cpu().reshape(1, -1)
             weight = weight.expand(samples.shape[0], -1)
             bias = torch.full((samples.shape[0], 1), float(params.bias))
-            feature_pairs.append(
-                (torch.cat((samples, weight, bias), dim=1), target)
-            )
+            feature_pairs.append((torch.cat((samples, weight, bias), dim=1), target))
         self.fit_feature_pairs(feature_pairs)
 
     def predict_proba(

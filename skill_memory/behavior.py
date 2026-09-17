@@ -64,7 +64,7 @@ class ClassBehaviorRecord:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, Any]) -> "ClassBehaviorRecord":
+    def from_state_dict(cls, state: dict[str, Any]) -> ClassBehaviorRecord:
         return cls(
             class_id=int(state["class_id"]),
             skill_id=int(state["skill_id"]),
@@ -85,7 +85,13 @@ class ClassBehaviorRecord:
 
 
 class BehaviorFingerprintCache:
-    """Version-aware persistent cache of class behavior references."""
+    """Version-aware persistent cache of class behavior references.
+
+    A fingerprint must not be recomputed from the live model merely because a
+    later experience changed that model. The binary behavior records therefore
+    share a frozen skill snapshot for each skill generation. A mutable REUSE
+    creates a new generation and deliberately replaces that snapshot.
+    """
 
     def __init__(self) -> None:
         self._records: dict[int, ClassBehaviorRecord] = {}
@@ -290,7 +296,15 @@ def reverse_engineer_y_from_weights(model, x: Tensor, target_class: int) -> Tens
 
 
 def reverse_engineer_y(logits: Tensor, target_class: int) -> Tensor:
-    """Return binary ``y`` from a candidate class score threshold."""
+    """Return binary ``y`` from a candidate class score threshold.
+
+    ``y`` is intentionally not defined as ``argmax(logits) == target_class``.
+    Argmax is a multiclass decision and therefore makes exactly one candidate
+    compatible for every sample, including the class produced by a
+    misclassification. A class fingerprint instead tests the candidate's own
+    reconstructed score against the zero decision boundary, allowing zero,
+    one, or multiple candidates to be compatible.
+    """
     if logits.ndim != 2:
         raise ValueError("logits must have shape [batch, classes]")
     if not 0 <= int(target_class) < logits.shape[-1]:
@@ -341,16 +355,11 @@ def build_weight_behavior_statistics(model, x: Tensor, class_id: int) -> dict[st
         margin = own
     return {
         "feature_mean": features.mean(dim=0).detach().cpu(),
-        "feature_std": features.std(unbiased=False)
-        .clamp_min(1e-6)
-        .detach()
-        .cpu(),
+        "feature_std": features.std(unbiased=False).clamp_min(1e-6).detach().cpu(),
         "margin_mean": float(margin.mean().item()),
         "margin_std": max(float(margin.std(unbiased=False).item()), 1e-6),
         "weight": linear.weight[class_id].detach().cpu().clone(),
         "bias": (
-            float(linear.bias[class_id].item())
-            if linear.bias is not None
-            else 0.0
+            float(linear.bias[class_id].item()) if linear.bias is not None else 0.0
         ),
     }

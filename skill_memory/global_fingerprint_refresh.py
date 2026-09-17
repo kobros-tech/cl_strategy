@@ -6,9 +6,18 @@ from typing import Any
 
 
 def refresh_all_fingerprints(plugin: Any, strategy: Any) -> dict[str, int]:
-    """Rebuild persisted class fingerprints from current canonical skill weights."""
+    """Rebuild persisted class fingerprints from current canonical skill weights.
+
+    A record only counts as "refreshed" once it has actually been written
+    back via ``plugin.behavior.put``. A class whose skill mapping still
+    exists but whose rebuilt record came back invalid (``None``) is counted
+    under ``records_invalid`` instead, so a stale fingerprint is never
+    reported as if it had been updated.
+    """
     records = list(plugin.behavior.state_dict().get("records", []))
-    refreshed = 0
+    attempted = 0
+    written = 0
+    invalid = 0
     skipped = 0
     touched_skills: set[int] = set()
 
@@ -31,15 +40,20 @@ def refresh_all_fingerprints(plugin: Any, strategy: Any) -> dict[str, int]:
             version,
             state_dict,
         )
-        refreshed += 1
+        attempted += 1
+        if refreshed_record is None:
+            invalid += 1
+            continue
+        plugin.behavior.put(refreshed_record)
+        written += 1
         touched_skills.add(skill_id)
-        if refreshed_record is not None:
-            plugin.behavior.put(refreshed_record)
 
     plugin._behavior_initialized = bool(plugin.behavior.state_dict().get("records"))
     return {
         "records_seen": len(records),
-        "records_refreshed": refreshed,
+        "records_attempted": attempted,
+        "records_refreshed": written,
+        "records_invalid": invalid,
         "records_skipped": skipped,
         "skills_refreshed": len(touched_skills),
     }

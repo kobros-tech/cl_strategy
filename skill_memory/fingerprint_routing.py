@@ -11,8 +11,12 @@ from .persistent_skill_memory_plugin import (
 class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
     """Persistent router with lightweight defaults and optional diagnostics.
 
-    ``diagnose=False`` keeps route-history retention and diagnostic aggregation
-    disabled. Set it to ``True`` when detailed routing records are needed.
+    ``diagnose=False`` (the default) disables route-history retention *and*
+    the underlying per-candidate diagnostic breakdown in `_route` itself, so
+    the listwise routing forward pass skips the extra per-sample,
+    per-candidate dict construction and GPU->CPU syncs entirely rather than
+    building it and discarding it. Set ``diagnose=True`` when detailed
+    routing records (`last_routing_diagnostics`) are needed.
     """
 
     def __init__(
@@ -25,6 +29,7 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
     ) -> None:
         self.diagnose = bool(diagnose)
         self.last_routing_diagnostics: dict = {}
+        kwargs.setdefault("record_candidate_diagnostics", self.diagnose)
         super().__init__(
             *args,
             reverse_epochs=reverse_epochs,

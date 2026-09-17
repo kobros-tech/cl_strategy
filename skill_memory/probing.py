@@ -233,9 +233,10 @@ def expand_skill_logits(
 
 
 # Compatibility re-exports only. The implementations live in evaluation.py;
-# probing itself contains no routing/decision logic.
-from .evaluation import (  # noqa: E402
-    RoutingResult,
-    find_best_routing_skill,
-    route_probe_logits,
-)
+# probing itself contains no routing/decision logic. The `as`-aliases below
+# are required so linters treat these as intentional re-exports rather than
+# unused imports; removing them silently breaks `skill_memory_plugin.py`'s
+# `from .probing import find_best_routing_skill`.
+from .evaluation import RoutingResult as RoutingResult  # noqa: E402
+from .evaluation import find_best_routing_skill as find_best_routing_skill  # noqa: E402
+from .evaluation import route_probe_logits as route_probe_logits  # noqa: E402

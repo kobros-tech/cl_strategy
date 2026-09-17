@@ -6,7 +6,6 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
-
 # Lightweight Avalanche stubs.
 avalanche = types.ModuleType("avalanche")
 models = types.ModuleType("avalanche.models")
