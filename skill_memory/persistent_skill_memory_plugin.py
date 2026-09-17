@@ -33,7 +33,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         *args,
         reverse_engineer_y_fn: Callable | None = None,
         reverse_hidden_size: int = 64,
-        reverse_epochs: int = 200,
+        reverse_epochs: int = 60,
         reverse_learning_rate: float = 1e-3,
         reverse_seed: int = 0,
         reverse_batch_size: int = 256,
