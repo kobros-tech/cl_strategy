@@ -157,9 +157,9 @@ def test_reference_logits_are_reused_across_router_refits(monkeypatch):
     first_fit_calls = len(calls)
 
     # The first fit evaluates every reference record against every candidate
-    # skill. With 2 records and 2 skills that is 2 x 2 = 4 record/skill pairs,
-    # but each record is represented by two reference samples, so the frozen
-    # inference is called once per pair with a batch of 2 samples.
+    # skill. There are 4 records total (2 per skill) and 2 candidate skills,
+    # so this is 4 x 2 = 8 frozen-inference calls. Each call receives the
+    # record's two reference samples as one batch.
     assert first_fit_calls == 8
     assert all(batch_size == 2 for _, batch_size in calls)
 
