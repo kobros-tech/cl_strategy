@@ -74,6 +74,12 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         # skill's frozen state between one fit and the following
         # evaluation batches.
         self._frozen_model_cache: dict[int, Any] = {}
+        # Reference logits are immutable for a given skill generation and
+        # reference class. Keep them across router refits so old
+        # record/skill pairs are not recomputed after every new experience.
+        # The skill generation is part of the key, so a mutable REUSE or
+        # SCRATCH replacement naturally gets a fresh cache entry.
+        self._reference_logits_cache: dict[tuple[int, int, int], Tensor] = {}
         # When False, `_route` skips building the per-sample, per-candidate
         # "candidates" breakdown (one dict + one GPU->CPU sync per candidate
         # per sample). That breakdown only feeds `routing_rank_diagnostics`,
@@ -378,7 +384,13 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         frozen_cache: dict[tuple[int, int], Tensor] = {}
         for slot in slot_ids:
             for record in records:
-                logits = self._frozen_logits(strategy, slot, record.reference_inputs)
+                key = (int(slot), int(record.version), int(record.class_id))
+                logits = self._reference_logits_cache.get(key)
+                if logits is None:
+                    logits = self._frozen_logits(
+                        strategy, slot, record.reference_inputs
+                    )
+                    self._reference_logits_cache[key] = logits.clone()
                 frozen_cache[(record.class_id, slot)] = logits
                 output_dim = max(output_dim, int(logits.shape[-1]))
         if candidate_dim == 0:
@@ -430,23 +442,30 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             target_index = class_to_candidate.get(record.class_id)
             if target_index is None:
                 continue
-            feature_rows: list[Tensor] = []
-            for sample_index in range(record.reference_inputs.shape[0]):
-                rows = []
-                for candidate in candidates:
-                    logits = candidate_logits[(record.class_id, candidate.skill_id)]
-                    rows.append(
-                        self._make_features(
-                            record.reference_inputs[sample_index : sample_index + 1],
-                            logits[sample_index : sample_index + 1],
-                            candidate.reference_weight,
-                            candidate.reference_bias,
-                            output_dim,
-                            candidate.class_id,
-                        ).squeeze(0)
+
+            # _make_features already accepts a batch of reference samples.
+            # Build one [samples, candidates, features] tensor per record
+            # instead of invoking it once for every sample/candidate pair.
+            # This removes the innermost Python loop and repeated tensor/CPU
+            # allocations without changing feature values or candidate order.
+            candidate_features = []
+            for candidate in candidates:
+                logits = candidate_logits[(record.class_id, candidate.skill_id)]
+                candidate_features.append(
+                    self._make_features(
+                        record.reference_inputs,
+                        logits,
+                        candidate.reference_weight,
+                        candidate.reference_bias,
+                        output_dim,
+                        candidate.class_id,
                     )
-                feature_rows.append(torch.stack(rows, dim=0))
-            candidate_sets.extend((rows, target_index) for rows in feature_rows)
+                )
+            features = torch.stack(candidate_features, dim=1)
+            candidate_sets.extend(
+                (features[sample_index], target_index)
+                for sample_index in range(features.shape[0])
+            )
         self.reverse_engineer.fit_candidate_sets(candidate_sets)
 
     def _route(
