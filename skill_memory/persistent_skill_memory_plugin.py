@@ -97,10 +97,24 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         samples = x.detach().float().cpu().reshape(x.shape[0], -1)
         padded = cls._pad_logits(logits.detach().float().cpu(), output_dim)
         probabilities = torch.softmax(padded, dim=-1)
-        if candidate_class_id is None or not 0 <= candidate_class_id < output_dim:
+        if candidate_class_id is None:
             candidate_logit = torch.zeros((samples.shape[0], 1))
             candidate_probability = torch.zeros((samples.shape[0], 1))
         else:
+            if not 0 <= candidate_class_id < output_dim:
+                # A candidate's own class logit must live within its own
+                # frozen response once `_fit_reverse_router` has widened
+                # `output_dim` to cover every current candidate's class_id
+                # (see the comment there). Reaching this branch means that
+                # invariant broke silently upstream - route with a zeroed
+                # feature instead of a real signal, which would look like a
+                # routing failure rather than a bug. Fail loudly instead.
+                raise RuntimeError(
+                    f"candidate class_id {candidate_class_id} is outside the "
+                    f"routed output space (output_dim={output_dim}); the "
+                    "reverse router's output_dim was not widened to cover "
+                    "this candidate before routing"
+                )
             candidate_logit = padded[:, candidate_class_id].reshape(-1, 1)
             candidate_probability = probabilities[:, candidate_class_id].reshape(-1, 1)
         weight = candidate_weight.detach().float().cpu().reshape(1, -1)
@@ -307,6 +321,11 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         output_dim = 0
         candidate_dim = 0
+        # `_frozen_logits` deepcopies the live model on every call, so avoid
+        # recomputing the same (class_id, slot) frozen response twice: this
+        # loop's results are reused below when building `candidate_logits`
+        # instead of being recomputed there from scratch.
+        frozen_cache: dict[tuple[int, int], Tensor] = {}
         for record in records:
             candidate_dim = max(
                 candidate_dim,
@@ -316,6 +335,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             )
             for slot in slot_ids:
                 logits = self._frozen_logits(strategy, slot, record.reference_inputs)
+                frozen_cache[(record.class_id, slot)] = logits
                 output_dim = max(output_dim, int(logits.shape[-1]))
         if candidate_dim == 0:
             raise RuntimeError("reverse router requires stored candidate class weights")
@@ -332,16 +352,34 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         if len(class_to_candidate) != len(candidates):
             raise RuntimeError("reverse router requires one candidate record per class")
 
+        # A candidate's own class logit lives at column `candidate.class_id` in
+        # that candidate's frozen response (Avalanche's IncrementalClassifier
+        # indexes its output units by the raw class label, not a compacted
+        # per-skill position). `output_dim` above is only the *observed*
+        # width of the frozen responses seen so far; if it ends up smaller
+        # than a candidate's own class_id (e.g. a stale/older skill capped
+        # the max, or a candidate's classifier was queried before it grew to
+        # cover its own class), `_pad_logits` would silently truncate away
+        # that exact column and every candidate beyond it would score as an
+        # all-zero feature instead of raising. Explicitly widen output_dim so
+        # every current candidate's own column is always in range.
+        if candidates:
+            output_dim = max(output_dim, max(c.class_id for c in candidates) + 1)
+
         self._reverse_output_dim = output_dim
         self._reverse_candidate_dim = candidate_dim
         candidate_logits: dict[tuple[int, int], Tensor] = {}
         for record in records:
             for candidate in candidates:
                 key = (record.class_id, candidate.skill_id)
-                if key not in candidate_logits:
-                    candidate_logits[key] = self._frozen_logits(
+                cached = frozen_cache.get(key)
+                candidate_logits[key] = (
+                    cached
+                    if cached is not None
+                    else self._frozen_logits(
                         strategy, candidate.skill_id, record.reference_inputs
                     )
+                )
 
         candidate_sets: list[tuple[Tensor, int]] = []
         for record in records:
