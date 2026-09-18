@@ -48,15 +48,6 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _class_indices(dataset, class_id: int, limit: int) -> list[int]:
-    indices = [
-        index
-        for index in range(len(dataset))
-        if int(dataset[index][1]) == class_id
-    ]
-    return indices[:limit]
-
-
 def _limit_per_class(dataset, samples_per_class: int):
     if samples_per_class < 1:
         raise ValueError("samples_per_class must be positive")
@@ -71,6 +62,7 @@ def _limit_per_class(dataset, samples_per_class: int):
         if all(count >= samples_per_class for count in counts):
             break
     return Subset(dataset, selected)
+
 
 def _make_model() -> nn.Module:
     model = models.resnet18(weights=None)
