@@ -137,3 +137,29 @@ def test_refit_after_a_skill_mutation_does_not_serve_a_stale_cached_model():
     refreshed_logits = plugin._frozen_logits(strategy, 0, torch.ones(1, 2))
 
     assert not torch.allclose(original_logits, refreshed_logits)
+
+
+def test_reference_logits_are_reused_across_router_refits(monkeypatch):
+    """Old record/skill pairs should not run frozen inference again."""
+    plugin = _plugin_with_skills(n_slots=2, classes_per_slot=2)
+    strategy = SimpleNamespace(model=_TinyModel())
+
+    calls: list[tuple[int, int]] = []
+    real_frozen_logits = plugin._frozen_logits
+
+    def counting_frozen_logits(strategy_arg, skill_id, x):
+        calls.append((skill_id, x.shape[0]))
+        return real_frozen_logits(strategy_arg, skill_id, x)
+
+    monkeypatch.setattr(plugin, "_frozen_logits", counting_frozen_logits)
+
+    plugin._fit_reverse_router(strategy)
+    first_fit_calls = len(calls)
+    assert first_fit_calls == 4  # 2 skills x 2 reference classes
+
+    calls.clear()
+    plugin._fit_reverse_router(strategy)
+
+    # The second fit has the same skill generations and reference inputs, so
+    # every frozen reference response comes from the persistent cache.
+    assert calls == []
