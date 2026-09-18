@@ -17,7 +17,7 @@ import torch
 from avalanche.benchmarks import nc_benchmark
 from avalanche.training.supervised import Naive
 from torch import nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Subset
 from torchvision import datasets, models, transforms
 
 from skill_memory import PersistentFingerprintSkillMemoryPlugin
@@ -28,7 +28,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="./data")
     parser.add_argument("--output", default="cifar100_router_diagnostic.json")
     parser.add_argument("--n-experiences", type=int, default=4)
-    parser.add_argument("--classes-per-experience", type=int, default=5)
     parser.add_argument("--train-samples-per-class", type=int, default=100)
     parser.add_argument("--eval-samples-per-class", type=int, default=100)
     parser.add_argument("--train-epochs", type=int, default=1)
@@ -58,30 +57,20 @@ def _class_indices(dataset, class_id: int, limit: int) -> list[int]:
     return indices[:limit]
 
 
-def _make_experience_datasets(
-    dataset,
-    n_experiences: int,
-    classes_per_experience: int,
-    samples_per_class: int,
-):
-    total_classes = n_experiences * classes_per_experience
-    if total_classes > 100:
-        raise ValueError("n_experiences * classes_per_experience must be <= 100")
-
-    experiences = []
-    for experience_id in range(n_experiences):
-        classes = range(
-            experience_id * classes_per_experience,
-            (experience_id + 1) * classes_per_experience,
-        )
-        indices = [
-            index
-            for class_id in classes
-            for index in _class_indices(dataset, class_id, samples_per_class)
-        ]
-        experiences.append(Subset(dataset, indices))
-    return experiences
-
+def _limit_per_class(dataset, samples_per_class: int):
+    if samples_per_class < 1:
+        raise ValueError("samples_per_class must be positive")
+    selected = []
+    counts = [0] * 100
+    for index in range(len(dataset)):
+        class_id = int(dataset[index][1])
+        if counts[class_id] >= samples_per_class:
+            continue
+        selected.append(index)
+        counts[class_id] += 1
+        if all(count >= samples_per_class for count in counts):
+            break
+    return Subset(dataset, selected)
 
 def _make_model() -> nn.Module:
     model = models.resnet18(weights=None)
@@ -161,36 +150,18 @@ def main() -> None:
         transform=transform,
     )
 
-    train_experiences = _make_experience_datasets(
-        train_set,
-        args.n_experiences,
-        args.classes_per_experience,
-        args.train_samples_per_class,
-    )
-    eval_experiences = _make_experience_datasets(
-        test_set,
-        args.n_experiences,
-        args.classes_per_experience,
-        args.eval_samples_per_class,
-    )
+    train_subset = _limit_per_class(train_set, args.train_samples_per_class)
+    test_subset = _limit_per_class(test_set, args.eval_samples_per_class)
 
-    class_order = [
-        list(
-            range(
-                experience_id * args.classes_per_experience,
-                (experience_id + 1) * args.classes_per_experience,
-            )
-        )
-        for experience_id in range(args.n_experiences)
-    ]
-
+    class_order = list(range(100))
     scenario = nc_benchmark(
-        train_dataset=train_set,
-        test_dataset=test_set,
+        train_dataset=train_subset,
+        test_dataset=test_subset,
         n_experiences=args.n_experiences,
         task_labels=False,
         shuffle=False,
         seed=args.seed,
+        fixed_class_order=class_order,
     )
 
     model = _make_model()
@@ -226,7 +197,6 @@ def main() -> None:
     result = {
         "seed": args.seed,
         "n_experiences": args.n_experiences,
-        "classes_per_experience": args.classes_per_experience,
         "class_order": class_order,
         "routing": diagnostics,
         "class_skill_assignments": {
