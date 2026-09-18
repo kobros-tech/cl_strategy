@@ -242,6 +242,31 @@ class NormalMLReverseEngineer:
         with torch.no_grad():
             return self.model(normalized.unsqueeze(0)).squeeze(0).squeeze(-1)
 
+    def predict_scores_candidate_sets(self, features: Tensor) -> Tensor:
+        """Score batched candidate sets with shape [batch, candidates, features].
+
+        Listwise training treats the candidate dimension as the Transformer
+        sequence. Evaluation must preserve that same dimension; otherwise a
+        tensor shaped [batch, features] would make the Transformer attend
+        across samples instead of across competing candidates.
+        """
+        if (
+            self.model is None
+            or self.feature_dim is None
+            or self.feature_mean is None
+            or self.feature_std is None
+        ):
+            raise RuntimeError("reverse-engineering model has not been fitted")
+        features = features.detach().float().cpu()
+        if features.ndim != 3 or features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                "candidate-set features must have shape "
+                "[batch, candidates, features]"
+            )
+        normalized = (features - self.feature_mean) / self.feature_std
+        with torch.no_grad():
+            return self.model(normalized).squeeze(-1)
+
     def predict_proba_features(self, features: Tensor) -> Tensor:
         """Return independent binary probabilities for compatibility mode."""
         return torch.sigmoid(self.predict_scores_features(features))
