@@ -47,3 +47,31 @@ def test_routing_uses_owned_global_class_columns():
     )
 
     assert chosen.tolist() == [0, 1]
+
+
+def test_routing_raises_instead_of_silently_zeroing_a_skill_with_narrow_output():
+    """A skill's *own* raw output must already have a column for every class
+    it owns (Avalanche's IncrementalClassifier only ever grows a skill's own
+    classifier to cover the classes that skill was actually trained on - see
+    _routing_scores' docstring). If a skill's owned classes fall outside its
+    own raw output width, class bookkeeping and the model have drifted apart
+    and the skill would otherwise always score zero and never win routing -
+    a routing failure that looks like the wrong bug. This must raise instead
+    of silently returning a zero score for that skill.
+    """
+    # Skill owns global class 37 but its own raw output is only 5-wide.
+    narrow_logits = torch.zeros(2, 5)
+    wide_logits = torch.zeros(2, 40)
+    wide_logits[:, 37] = 5.0
+
+    try:
+        route_probe_logits(
+            [narrow_logits, wide_logits],
+            [{"classifier.weight": torch.tensor([[1.0]])}] * 2,
+            [{37}, {37}],
+        )
+    except RuntimeError as exc:
+        assert "37" in str(exc)
+        assert "drifted apart" in str(exc)
+    else:
+        raise AssertionError("expected a RuntimeError for the narrow-output skill")

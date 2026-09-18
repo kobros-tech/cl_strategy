@@ -25,7 +25,25 @@ def _routing_scores(
     states: Sequence[Mapping[str, torch.Tensor]],
     skill_classes: Sequence[Sequence[int]],
 ) -> torch.Tensor:
-    """Score each skill by probability mass on its owned classes."""
+    """Score each skill by probability mass on its owned classes.
+
+    ``logits`` here are a skill's own *raw*, unpadded forward-pass output
+    (see the caller in ``skill_memory_plugin.after_eval_forward``), not a
+    globally-padded tensor. Avalanche's ``IncrementalClassifier`` indexes its
+    output units directly by raw class label (verified against
+    ``avalanche.models.IncrementalClassifier`` - a skill's classifier only
+    ever grows to cover the classes it was actually trained on), so once a
+    skill owns a class, that class's column must already exist in the
+    skill's own raw logits. If it doesn't, class bookkeeping (``skill_classes``)
+    and the model's own output space have silently drifted apart - most
+    likely because the skill's classifier was queried with input from a
+    class it was never trained on, or a benchmark relabels class ids from
+    zero per experience, breaking the whole class_id convention. Either way,
+    silently treating that class as "not present" would make the skill score
+    zero and never win routing regardless of how well it actually matches
+    the input, which looks exactly like a routing failure rather than a
+    bookkeeping bug - so this raises instead of silently dropping the class.
+    """
     del states
 
     scores = []
@@ -34,16 +52,26 @@ def _routing_scores(
             scores.append(torch.zeros(logits.shape[0], device=logits.device))
             continue
 
-        valid_classes = sorted(
-            class_id for class_id in owned_classes if 0 <= class_id < logits.shape[1]
-        )
-        if not valid_classes:
-            scores.append(torch.zeros(logits.shape[0], device=logits.device))
-            continue
-
         if logits.shape[1] == 1:
+            # A one-unit head is a binary "is this the owned class" score,
+            # not a per-class-id column - it doesn't use the class_id-as-
+            # column-index convention the strict check below assumes.
             scores.append(torch.sigmoid(logits[:, 0]))
             continue
+
+        out_of_range = sorted(
+            class_id
+            for class_id in owned_classes
+            if not 0 <= class_id < logits.shape[1]
+        )
+        if out_of_range:
+            raise RuntimeError(
+                f"skill owns classes {out_of_range} but its raw output only "
+                f"has {logits.shape[1]} columns; class bookkeeping and the "
+                "model's own output space have drifted apart (see "
+                "_routing_scores docstring)"
+            )
+        valid_classes = sorted(owned_classes)
 
         probabilities = torch.softmax(logits, dim=1)
         scores.append(probabilities[:, valid_classes].sum(dim=1))

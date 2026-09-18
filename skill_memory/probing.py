@@ -151,6 +151,20 @@ def incremental_out_features(
     return None
 
 
+def incremental_active_units(
+    model: nn.Module, state_dict: Mapping[str, Tensor]
+) -> Tensor | None:
+    """Return the stored ``active_units`` mask for a skill's classifier head."""
+    for module_name, module in model.named_modules():
+        if not isinstance(module, IncrementalClassifier):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        active = state_dict.get(f"{prefix}active_units")
+        if active is not None:
+            return active
+    return None
+
+
 def restore_initial_state(
     model: nn.Module, initial_state: Mapping[str, Tensor]
 ) -> None:
