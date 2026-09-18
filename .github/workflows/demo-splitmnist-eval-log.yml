@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+      - "refactor/**"
+      - "fix/**"
   pull_request:
     branches:
       - main

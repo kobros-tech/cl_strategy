@@ -12,4 +12,5 @@ dist/
 # it; if pre-commit's check-added-large-files already flagged a tracked
 # copy, run `git rm --cached <path>` once to untrack it.
 logs/
+data/
 *.csv
