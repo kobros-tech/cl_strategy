@@ -493,14 +493,39 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         final_predictions = strategy.mb_output.detach().argmax(dim=-1).cpu().tolist()
         labels = y.detach().cpu().tolist()
-        for route, prediction, label in zip(
-            self.last_fingerprint_routes,
-            final_predictions,
-            labels,
-            strict=False,
+        skill_to_row = {skill_id: row for row, skill_id in enumerate(slot_ids)}
+        for sample_index, (route, prediction, label) in enumerate(
+            zip(
+                self.last_fingerprint_routes,
+                final_predictions,
+                labels,
+                strict=False,
+            )
         ):
+            label = int(label)
             route["model_predicted_class"] = int(prediction)
-            route["model_correct"] = int(prediction) == int(label)
+            route["model_correct"] = int(prediction) == label
+
+            # These fields are diagnostics only. They are computed after the
+            # label-free route has already been selected and are never fed back
+            # into routing or prediction.
+            oracle_skill = self.class_map.find_skill_for_class_anywhere(label)
+            route["oracle_skill"] = (
+                None if oracle_skill is None else int(oracle_skill)
+            )
+            route["routing_correct"] = (
+                oracle_skill is not None and int(route["skill"]) == int(oracle_skill)
+            )
+            if oracle_skill in skill_to_row:
+                oracle_row = skill_to_row[int(oracle_skill)]
+                oracle_prediction = int(
+                    padded[oracle_row][sample_index].argmax().item()
+                )
+                route["oracle_model_predicted_class"] = oracle_prediction
+                route["oracle_model_correct"] = oracle_prediction == label
+            else:
+                route["oracle_model_predicted_class"] = None
+                route["oracle_model_correct"] = False
 
         self._log(
             "[NORMAL ML routing] "
