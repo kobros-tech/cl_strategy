@@ -380,21 +380,25 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         if len({record.class_id for record in records}) != len(records):
             raise RuntimeError("reverse router requires one candidate record per class")
 
-        route_candidates: list[tuple[ClassBehaviorRecord, Tensor]] = []
+        candidate_features: list[Tensor] = []
         for record in records:
             logits = self._frozen_logits(strategy, record.skill_id, x)
-            features = self._make_features(
-                x,
-                logits,
-                record.reference_weight,
-                record.reference_bias,
-                self._reverse_output_dim,
-                record.class_id,
+            candidate_features.append(
+                self._make_features(
+                    x,
+                    logits,
+                    record.reference_weight,
+                    record.reference_bias,
+                    self._reverse_output_dim,
+                    record.class_id,
+                )
             )
-            score = self.reverse_engineer.predict_scores_features(features)
-            route_candidates.append((record, score))
 
-        scores = torch.stack([item[1] for item in route_candidates], dim=1)
+        # Listwise training treats candidates as the Transformer sequence.
+        # Stack as [samples, candidates, features] so inference uses the same
+        # semantics instead of making the Transformer attend across samples.
+        features = torch.stack(candidate_features, dim=1)
+        scores = self.reverse_engineer.predict_scores_candidate_sets(features)
         probabilities = torch.softmax(scores, dim=1)
         best = probabilities.argmax(dim=1)
         chosen_skills: list[int] = []
@@ -402,7 +406,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         routes: list[dict[str, Any]] = []
         for sample_index in range(x.shape[0]):
             candidate_index = int(best[sample_index].item())
-            record, score = route_candidates[candidate_index]
+            record = records[candidate_index]
             chosen_skills.append(record.skill_id)
             chosen_classes.append(record.class_id)
             routes.append(
@@ -411,7 +415,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                     "status": "IDENTIFIED",
                     "class": record.class_id,
                     "skill": record.skill_id,
-                    "score": float(score[sample_index].item()),
+                    "score": float(scores[sample_index, candidate_index].item()),
                     "probability": float(
                         probabilities[sample_index, candidate_index].item()
                     ),
@@ -419,14 +423,12 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                         {
                             "class": candidate.class_id,
                             "skill": candidate.skill_id,
-                            "score": float(candidate_score[sample_index].item()),
+                            "score": float(scores[sample_index, index].item()),
                             "probability": float(
                                 probabilities[sample_index, index].item()
                             ),
                         }
-                        for index, (candidate, candidate_score) in enumerate(
-                            route_candidates
-                        )
+                        for index, candidate in enumerate(records)
                     ],
                 }
             )
