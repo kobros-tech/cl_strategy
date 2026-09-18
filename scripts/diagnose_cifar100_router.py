@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from avalanche.benchmarks.scenarios import CLScenario
+from avalanche.benchmarks import nc_benchmark
 from avalanche.training.supervised import Naive
 from torch import nn
 from torch.utils.data import DataLoader, Subset
@@ -184,19 +184,13 @@ def main() -> None:
         for experience_id in range(args.n_experiences)
     ]
 
-    class ExperienceStream:
-        def __init__(self, datasets_):
-            self.experiences = datasets_
-
-        def __iter__(self):
-            return iter(self.experiences)
-
-        def __len__(self):
-            return len(self.experiences)
-
-    scenario = CLScenario(
-        train_stream=ExperienceStream(train_experiences),
-        test_stream=ExperienceStream(eval_experiences),
+    scenario = nc_benchmark(
+        train_dataset=train_set,
+        test_dataset=test_set,
+        n_experiences=args.n_experiences,
+        task_labels=False,
+        shuffle=False,
+        seed=args.seed,
     )
 
     model = _make_model()
