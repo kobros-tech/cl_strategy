@@ -344,6 +344,7 @@ def write_analysis_files(
     accuracy_history: list[list[float]],
     accuracy_curve: np.ndarray,
     forgetting: np.ndarray,
+    alignment_report: dict,
 ) -> None:
     """Write artifacts that keep routing diagnostics separate from metrics."""
     csv_path = log_dir / f"weight_reverse_engineering_{run_id}.csv"
@@ -404,6 +405,7 @@ def write_analysis_files(
         "routing_rank_diagnostics": rank_summary(rows),
         "routing_rank_by_evaluation_experience": rank_summary_by_experience(rows),
         "routing_score_margin_diagnostics": score_margin_summary(rows),
+        "class_index_alignment_report": alignment_report,
         "analysis_csv": csv_path.name,
         "metric_scope": {
             "accuracy_curve": "anonymous routed model accuracy",
@@ -535,6 +537,8 @@ def main() -> None:
                 "Final fingerprint records:",
                 len(plugin.behavior.state_dict()["records"]),
             )
+            print("Class-index alignment report:")
+            print(json.dumps(plugin.last_alignment_report, indent=2, sort_keys=True))
 
             write_analysis_files(
                 log_dir,
@@ -543,6 +547,7 @@ def main() -> None:
                 accuracy_history,
                 accuracy_curve,
                 forgetting,
+                plugin.last_alignment_report,
             )
         finally:
             sys.stdout = real_stdout
