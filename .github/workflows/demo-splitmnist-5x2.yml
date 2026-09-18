@@ -1,0 +1,93 @@
+name: SplitMNIST 5x2 benchmark and class oracle
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "refactor/**"
+      - "fix/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  download-splitmnist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package
+        run: python -m pip install -e .
+
+      - name: Restore or download SplitMNIST dataset
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: splitmnist-dataset-v1-${{ runner.os }}
+
+      - name: Prepare SplitMNIST 5x2 dataset
+        run: |
+          python skill_memory/tests/demo_splitmnist_oracle_retention.py \
+            --dataset-root data \
+            --n-experiences 5 \
+            --download-only
+
+  run-splitmnist-5x2:
+    needs: download-splitmnist
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package
+        run: python -m pip install -e .
+
+      - name: Restore SplitMNIST dataset cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: splitmnist-dataset-v1-${{ runner.os }}
+
+      - name: Run 5 experiences x 2 classes strategy
+        run: |
+          python skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py \
+            --n-experiences 5 \
+            --dataset-root data
+
+      - name: Run 5 experiences x 2 classes class oracle
+        run: |
+          python skill_memory/tests/demo_splitmnist_oracle_retention.py \
+            --dataset-root data \
+            --n-experiences 5 \
+            | tee splitmnist_5x2_oracle_${{ github.run_id }}.txt
+
+      - name: Upload 5x2 strategy and oracle results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: splitmnist-5x2-results-${{ github.run_id }}
+          path: |
+            skill_memory/tests/logs/weight_reverse_engineering_*.txt
+            skill_memory/tests/logs/weight_reverse_engineering_*.csv
+            skill_memory/tests/logs/weight_reverse_engineering_*.json
+            splitmnist_5x2_oracle_*.txt
+          if-no-files-found: warn
+          retention-days: 14
