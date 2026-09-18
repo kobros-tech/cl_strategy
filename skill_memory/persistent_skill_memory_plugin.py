@@ -61,6 +61,19 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self.fingerprint_route_history: list[dict] = []
         self._fingerprint_batch_index = 0
         self._evaluation_experience_index: int | None = None
+        # Cache of already-deepcopied-and-loaded models, keyed by skill_id.
+        # `_frozen_logits` used to deepcopy(strategy.model) + load state on
+        # *every* call; for `_fit_reverse_router` that meant records x slots
+        # deepcopies (~10,000 for a 100-skill/100-class setup), and for
+        # `_route` it meant re-deepcopying the same candidate's model on
+        # every evaluation batch. Cleared at the start of every
+        # `_fit_reverse_router` call (see there), so it always reflects the
+        # currently fitted generation of skills and never serves a stale
+        # model - within that window it is safe to reuse across every
+        # `_fit_reverse_router`/`_route` call, since nothing mutates a
+        # skill's frozen state between one fit and the following
+        # evaluation batches.
+        self._frozen_model_cache: dict[int, Any] = {}
         # When False, `_route` skips building the per-sample, per-candidate
         # "candidates" breakdown (one dict + one GPU->CPU sync per candidate
         # per sample). That breakdown only feeds `routing_rank_diagnostics`,
@@ -148,13 +161,17 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             dim=1,
         )
 
-    def _frozen_logits(
-        self,
-        strategy,
-        skill_id: int,
-        x: Tensor,
-    ) -> Tensor:
-        """Evaluate one immutable stored skill without changing the live model."""
+    def _load_frozen_model(self, strategy, skill_id: int) -> Any:
+        """Return a deepcopied, state-loaded model for one skill, cached.
+
+        Deepcopy + `apply_skill_state_exact` happens at most once per
+        skill_id between cache clears (see `_frozen_model_cache`'s
+        docstring in `__init__`), regardless of how many records or
+        evaluation batches subsequently query this skill.
+        """
+        cached = self._frozen_model_cache.get(skill_id)
+        if cached is not None:
+            return cached
         records = self.behavior.records_for_skill(skill_id)
         if records:
             version = records[0].version
@@ -164,7 +181,22 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         if state_dict is None:
             state_dict = self.memory.state(skill_id)
         model = deepcopy(strategy.model)
-        return predict_logits(model, state_dict, x).detach().cpu()
+        apply_skill_state_exact(model, state_dict)
+        model.eval()
+        self._frozen_model_cache[skill_id] = model
+        return model
+
+    def _frozen_logits(
+        self,
+        strategy,
+        skill_id: int,
+        x: Tensor,
+    ) -> Tensor:
+        """Evaluate one immutable stored skill without changing the live model."""
+        model = self._load_frozen_model(strategy, skill_id)
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            return model(x.to(device)).detach().cpu()
 
     def _build_record(
         self,
@@ -307,6 +339,13 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
     def _fit_reverse_router(self, strategy) -> None:
         """Fit from candidate sets using the same candidate behavior as routing."""
+        # Fresh generation boundary: any models cached from the previous fit
+        # (or the evaluation batches that followed it) are no longer
+        # guaranteed to match the current skill states, so start clean here
+        # rather than risk serving a stale model. Populated once below and
+        # then reused for the rest of this fit *and* every `_route` call in
+        # the evaluation phase that follows it.
+        self._frozen_model_cache = {}
         slot_ids = sorted(self.memory.slots())
         records = [
             record
@@ -321,11 +360,6 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
         output_dim = 0
         candidate_dim = 0
-        # `_frozen_logits` deepcopies the live model on every call, so avoid
-        # recomputing the same (class_id, slot) frozen response twice: this
-        # loop's results are reused below when building `candidate_logits`
-        # instead of being recomputed there from scratch.
-        frozen_cache: dict[tuple[int, int], Tensor] = {}
         for record in records:
             candidate_dim = max(
                 candidate_dim,
@@ -333,7 +367,17 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 if record.reference_weight is not None
                 else 0,
             )
-            for slot in slot_ids:
+        # `_load_frozen_model` (inside `_frozen_logits`) deepcopies the live
+        # model once per skill_id and caches it, so every record sharing a
+        # slot reuses the same loaded model instead of re-deepcopying it.
+        # This turns what used to be `len(records) * len(slot_ids)`
+        # deepcopies into `len(slot_ids)` - e.g. ~100 instead of ~10,000 for
+        # a 100-record / 100-skill setup - with identical results, since
+        # nothing about what's computed changes, only how many times the
+        # same frozen response gets recomputed.
+        frozen_cache: dict[tuple[int, int], Tensor] = {}
+        for slot in slot_ids:
+            for record in records:
                 logits = self._frozen_logits(strategy, slot, record.reference_inputs)
                 frozen_cache[(record.class_id, slot)] = logits
                 output_dim = max(output_dim, int(logits.shape[-1]))

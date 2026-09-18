@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .diagnostics import routing_rank_diagnostics
+from .diagnostics import class_index_alignment_report, routing_rank_diagnostics
 from .persistent_skill_memory_plugin import (
     PersistentFingerprintSkillMemoryPlugin as _BaseFingerprintPlugin,
 )
@@ -16,7 +16,11 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
     the listwise routing forward pass skips the extra per-sample,
     per-candidate dict construction and GPU->CPU syncs entirely rather than
     building it and discarding it. Set ``diagnose=True`` when detailed
-    routing records (`last_routing_diagnostics`) are needed.
+    routing records (`last_routing_diagnostics`) are needed - this also
+    computes `last_alignment_report` once per completed training experience
+    (see `class_index_alignment_report`), which is the concrete, runnable
+    check for whether a skill's owned global class ids actually fit its own
+    classifier's output space on this benchmark.
     """
 
     def __init__(
@@ -29,12 +33,31 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
     ) -> None:
         self.diagnose = bool(diagnose)
         self.last_routing_diagnostics: dict = {}
+        self.last_alignment_report: dict = {}
         kwargs.setdefault("record_candidate_diagnostics", self.diagnose)
         super().__init__(
             *args,
             reverse_epochs=reverse_epochs,
             reverse_batch_size=reverse_batch_size,
             **kwargs,
+        )
+
+    def after_training_exp(self, strategy, **kwargs) -> None:
+        super().after_training_exp(strategy, **kwargs)
+        if not self.diagnose:
+            self.last_alignment_report = {}
+            return
+        slot_ids = sorted(self.memory.slots())
+        if not slot_ids:
+            self.last_alignment_report = {}
+            return
+        self.last_alignment_report = class_index_alignment_report(
+            strategy.model,
+            states=[self.memory.state(slot) for slot in slot_ids],
+            slot_ids=slot_ids,
+            owned_classes_by_slot=[
+                self.class_map.classes_for_skill(slot) for slot in slot_ids
+            ],
         )
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
