@@ -473,7 +473,7 @@ def main() -> None:
                 class_train_batch_size=64,
                 reuse_is_mutable=True,
                 eval_routing="probe",
-                record_candidate_diagnostics=True,
+                diagnose=True,
                 verbose=True,
             )
             strategy = SupervisedTemplate(
