@@ -1,42 +1,11 @@
-import importlib.util
-import sys
-import types
-from pathlib import Path
+import pytest
 
 import torch
 
-# Lightweight Avalanche stubs.
-avalanche = types.ModuleType("avalanche")
-models = types.ModuleType("avalanche.models")
-dynamic = types.ModuleType("avalanche.models.dynamic_modules")
-
-
-class IncrementalClassifier:
-    pass
-
-
-dynamic.IncrementalClassifier = IncrementalClassifier
-dynamic.avalanche_model_adaptation = lambda model, experience: None
-models.dynamic_modules = dynamic
-avalanche.models = models
-sys.modules.update(
-    {
-        "avalanche": avalanche,
-        "avalanche.models": models,
-        "avalanche.models.dynamic_modules": dynamic,
-    }
+from skill_memory.evaluation.routing import (
+    find_best_routing_skill,
+    route_probe_logits,
 )
-
-root = Path(__file__).parents[1] / "utils"
-pkg = types.ModuleType("routingpkg")
-pkg.__path__ = [str(root)]
-sys.modules["routingpkg"] = pkg
-
-path = root / "probing.py"
-spec = importlib.util.spec_from_file_location("routingpkg.probing", path)
-mod = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = mod
-spec.loader.exec_module(mod)
 
 
 def _inputs():
@@ -57,7 +26,7 @@ def _inputs():
 def test_find_best_routing_skill_selects_one_skill_per_sample():
     logits, states, classes = _inputs()
 
-    result = mod.find_best_routing_skill(logits, states, classes)
+    result = find_best_routing_skill(logits, states, classes)
 
     assert result.skill_indices.tolist() == [0, 1, 2]
     assert result.probabilities.shape == (3, 3)
@@ -157,7 +126,7 @@ def test_routing_input_contract_has_no_labels():
 def test_route_probe_logits_remains_compatible():
     logits, states, classes = _inputs()
 
-    legacy = mod.route_probe_logits(logits, states, classes)
+    legacy = route_probe_logits(logits, states, classes)
     richer = mod.find_best_routing_skill(logits, states, classes).skill_indices
 
     assert torch.equal(legacy, richer)
