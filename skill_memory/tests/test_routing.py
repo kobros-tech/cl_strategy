@@ -27,7 +27,7 @@ sys.modules.update(
     }
 )
 
-root = Path(__file__).parents[1]
+root = Path(__file__).parents[1] / "utils"
 pkg = types.ModuleType("routingpkg")
 pkg.__path__ = [str(root)]
 sys.modules["routingpkg"] = pkg
