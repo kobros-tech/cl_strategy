@@ -580,7 +580,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._evaluation_experience_index = None if index is None else int(index)
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
-        if not self._eval_active or self.eval_routing != "probe":
+        if not self._eval_active or self.eval_routing != "ml_probe":
             return super().after_eval_forward(strategy, **kwargs)
         if len(self.memory) == 0 or not self._behavior_initialized:
             return super().after_eval_forward(strategy, **kwargs)
@@ -649,7 +649,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 route["model_correct"] = int(prediction) == int(label)
 
             self._log(
-                "[NORMAL ML routing] "
+                "[ML PROBE routing] "
                 f"eval_exp={self._evaluation_experience_index} "
                 f"samples={x.shape[0]} identified={len(self.last_fingerprint_routes)}"
             )
