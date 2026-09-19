@@ -615,7 +615,14 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
             device = next(model.parameters()).device
             with torch.no_grad():
                 logits = model(x.to(device)).detach()
-            per_skill_logits.append(self._pad_logits(logits, output_dim).to(x.device))
+            per_skill_logits.append(
+                expand_skill_logits(
+                    logits,
+                    self.memory.state(slot),
+                    self.class_map.classes_for_skill(slot),
+                    output_dim,
+                ).to(x.device)
+            )
 
         valid = chosen.ge(0)
         if valid.any():
