@@ -559,7 +559,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
 
     def before_eval(self, strategy, **kwargs) -> None:
         super().before_eval(strategy, **kwargs)
-        if self.diagnose if hasattr(self, "diagnose") else self.record_candidate_diagnostics:
+        if self.record_candidate_diagnostics:
             self.fingerprint_route_history = []
         self._fingerprint_batch_index = 0
         self._evaluation_experience_index = None
