@@ -85,9 +85,9 @@ jobs:
         with:
           name: splitmnist-5x2-results-${{ github.run_id }}
           path: |
-            skill_memory/tests/logs/weight_reverse_engineering_*.txt
-            skill_memory/tests/logs/weight_reverse_engineering_*.csv
-            skill_memory/tests/logs/weight_reverse_engineering_*.json
+            skill_memory/demos/logs/weight_reverse_engineering_*.txt
+            skill_memory/demos/logs/weight_reverse_engineering_*.csv
+            skill_memory/demos/logs/weight_reverse_engineering_*.json
             splitmnist_5x2_oracle_*.txt
           if-no-files-found: warn
           retention-days: 14
