@@ -37,7 +37,7 @@ jobs:
 
       - name: Prepare SplitMNIST 5x2 dataset
         run: |
-          python skill_memory/tests/demo_splitmnist_oracle_retention.py \
+          python skill_memory/demos/demo_splitmnist_oracle_retention.py \
             --dataset-root data \
             --n-experiences 5 \
             --download-only
@@ -68,13 +68,13 @@ jobs:
 
       - name: Run 5 experiences x 2 classes strategy
         run: |
-          python skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py \
+          python skill_memory/demos/demo_splitmnist_weight_reverse_engineering.py \
             --n-experiences 5 \
             --dataset-root data
 
       - name: Run 5 experiences x 2 classes class oracle
         run: |
-          python skill_memory/tests/demo_splitmnist_oracle_retention.py \
+          python skill_memory/demos/demo_splitmnist_oracle_retention.py \
             --dataset-root data \
             --n-experiences 5 \
             | tee splitmnist_5x2_oracle_${{ github.run_id }}.txt

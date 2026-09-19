@@ -6,7 +6,7 @@ import torch
 from avalanche.models.dynamic_modules import IncrementalClassifier
 
 ROOT = Path(__file__).parents[1]
-spec = importlib.util.spec_from_file_location("binary_behavior", ROOT / "behavior.py")
+spec = importlib.util.spec_from_file_location("binary_behavior", ROOT / "evaluation" / "behavior.py")
 behavior = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = behavior
 spec.loader.exec_module(behavior)

@@ -36,11 +36,11 @@ jobs:
           key: splitmnist-dataset-v1-${{ runner.os }}
 
       - name: Run SplitMNIST weight reverse-engineering demo
-        run: python skill_memory/tests/demo_splitmnist_weight_reverse_engineering.py
+        run: python skill_memory/demos/demo_splitmnist_weight_reverse_engineering.py
 
       - name: Run oracle-skill retention diagnostic
         run: |
-          python skill_memory/tests/demo_splitmnist_oracle_retention.py \
+          python skill_memory/demos/demo_splitmnist_oracle_retention.py \
             | tee skill_memory/tests/logs/oracle_skill_retention_${{ github.run_id }}.txt
 
       - name: Upload routing analysis artifacts
