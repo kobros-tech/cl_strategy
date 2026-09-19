@@ -1,10 +1,9 @@
-"""Simple SplitMNIST ML-vs-ER evaluation demo.
+"""SplitMNIST training baselines evaluated with Skill Memory routing.
 
-This demo is independent from SkillMemory routing.
-
-The same SplitMNIST benchmark is trained with either ordinary supervised ML
-or Avalanche Experience Replay. After each training experience, the model is
-evaluated on all experiences seen so far.
+ML and ER remain the training methods. Skill Memory is used only as the
+evaluation layer: after each training experience, a frozen post-experience
+model snapshot is registered as an evaluation skill. The same routing
+mechanisms can then select among those snapshots without changing training.
 """
 
 from __future__ import annotations
@@ -18,6 +17,10 @@ from avalanche.benchmarks.classic import SplitMNIST
 from avalanche.models.dynamic_modules import IncrementalClassifier
 from avalanche.training import Naive
 from avalanche.training.plugins import ReplayPlugin
+
+from skill_memory.cl import SkillMemoryPlugin
+from skill_memory.cl.skill_registry import ClassRecord, SkillMemory
+from skill_memory.utils.probing import classes_in_experience
 
 
 class SplitMNISTMLP(nn.Module):
@@ -39,70 +42,66 @@ class SplitMNISTMLP(nn.Module):
         return self.classifier(self.features(x))
 
 
+class SnapshotEvaluationPlugin(SkillMemoryPlugin):
+    """Record baseline model snapshots without affecting baseline training."""
+
+    def before_training_exp(self, strategy, **kwargs):
+        return None
+
+    def after_training_exp(self, strategy, **kwargs):
+        experience = strategy.experience
+        index = int(getattr(experience, "current_experience", 0))
+        skill = self.memory.allocate()
+        self.memory.store(
+            skill,
+            strategy.model.state_dict(),
+            metadata={
+                "evaluation_snapshot": True,
+                "experience_index": index,
+            },
+        )
+        for class_id in classes_in_experience(experience):
+            self.class_map.record(
+                ClassRecord(
+                    experience_index=index,
+                    class_id=class_id,
+                    decision="snapshot",
+                    skill=skill,
+                )
+            )
+        self._log(
+            f"Evaluation snapshot {skill}: experience {index}, "
+            f"classes={classes_in_experience(experience)}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare ordinary ML and Avalanche Experience Replay "
-        "on SplitMNIST."
+        description="Train ML or ER, then evaluate with Skill Memory routing."
     )
     parser.add_argument("--dataset-root", default="data")
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--n-experiences", type=int, default=10)
+    parser.add_argument("--eval-routing", choices=("class_oracle", "cl_probe", "none"),
+                        default="class_oracle")
+    parser.add_argument("--train-epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--replay-memory-size", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--use-cl",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Use Avalanche Experience Replay instead of ordinary ML.",
     )
-    parser.add_argument("--train-epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--replay-memory-size", type=int, default=200)
-    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
-def build_strategy(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    *,
-    use_cl: bool,
-    train_epochs: int,
-    batch_size: int,
-    device: torch.device,
-    replay_memory_size: int,
-):
-    """Build the requested Avalanche strategy."""
-
-    plugins = []
-    if use_cl:
-        plugins.append(ReplayPlugin(mem_size=replay_memory_size))
-
-    return Naive(
-        model=model,
-        optimizer=optimizer,
-        criterion=criterion,
-        train_mb_size=batch_size,
-        train_epochs=train_epochs,
-        eval_mb_size=batch_size,
-        device=device,
-        plugins=plugins,
-    )
-
-
-def evaluate_seen(
-    strategy,
-    test_stream,
-    up_to_index: int,
-) -> tuple[list[float], list[float]]:
-    """Evaluate all experiences seen so far."""
-
+def evaluate_seen(strategy, test_stream, up_to_index: int):
+    """Evaluate all experiences seen so far through Skill Memory routing."""
     results = strategy.eval([test_stream[i] for i in range(up_to_index + 1)])
-
     loss_keys = sorted(key for key in results if key.startswith("Loss_Exp"))
-    acc_keys = sorted(
-        key for key in results if key.startswith("Top1_Acc_Exp")
-    )
-
+    acc_keys = sorted(key for key in results if key.startswith("Top1_Acc_Exp"))
     expected = up_to_index + 1
     if len(loss_keys) != expected or len(acc_keys) != expected:
         raise RuntimeError(
@@ -110,35 +109,31 @@ def evaluate_seen(
             f"found losses={len(loss_keys)}, accuracies={len(acc_keys)}, "
             f"expected={expected}."
         )
-
-    return (
-        [float(results[key]) for key in loss_keys],
-        [float(results[key]) for key in acc_keys],
-    )
+    return [float(results[key]) for key in loss_keys], [
+        float(results[key]) for key in acc_keys
+    ]
 
 
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    mode = "ER-CL" if args.use_cl else "ML"
 
+    mode = "ER" if args.use_cl else "ML"
     benchmark = SplitMNIST(
         n_experiences=args.n_experiences,
         seed=args.seed,
         dataset_root=args.dataset_root,
     )
 
-    print(f"Mode: {mode}")
+    print(f"Training method: {mode}")
+    print(f"Evaluation routing: {args.eval_routing}")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
-
     for index, experience in enumerate(benchmark.train_stream):
         print(
-            f"  Exp {index}: "
-            f"classes={sorted(experience.classes_in_this_experience)} "
+            f"  Exp {index}: classes={sorted(experience.classes_in_this_experience)} "
             f"samples={len(experience.dataset)}"
         )
 
@@ -149,41 +144,43 @@ def main() -> None:
     model = SplitMNISTMLP().to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     criterion = nn.CrossEntropyLoss()
+    snapshot_plugin = SnapshotEvaluationPlugin(
+        memory=SkillMemory(max_skills=args.n_experiences),
+        eval_routing=args.eval_routing,
+        verbose=True,
+    )
+    plugins = [snapshot_plugin]
+    if args.use_cl:
+        plugins.append(ReplayPlugin(mem_size=args.replay_memory_size))
 
-    strategy = build_strategy(
-        model,
-        optimizer,
-        criterion,
-        use_cl=args.use_cl,
+    strategy = Naive(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        train_mb_size=args.batch_size,
         train_epochs=args.train_epochs,
-        batch_size=args.batch_size,
+        eval_mb_size=args.batch_size,
         device=device,
-        replay_memory_size=args.replay_memory_size,
+        plugins=plugins,
     )
 
-    loss_history: list[list[float]] = []
     accuracy_history: list[list[float]] = []
+    loss_history: list[list[float]] = []
 
     for train_index, train_exp in enumerate(benchmark.train_stream):
         strategy.train(train_exp)
-
         losses, accuracies = evaluate_seen(
-            strategy,
-            benchmark.test_stream,
-            train_index,
+            strategy, benchmark.test_stream, train_index
         )
         loss_history.append(losses)
         accuracy_history.append(accuracies)
-
         print(
-            f"Step {train_index}: "
-            f"classes={sorted(train_exp.classes_in_this_experience)}"
+            f"Step {train_index}: classes="
+            f"{sorted(train_exp.classes_in_this_experience)}"
         )
         print(
             "  loss="
-            + ", ".join(
-                f"Exp{i}={value:.4f}" for i, value in enumerate(losses)
-            )
+            + ", ".join(f"Exp{i}={value:.4f}" for i, value in enumerate(losses))
         )
         print(
             "  accuracy="
@@ -198,7 +195,6 @@ def main() -> None:
     diagonal_accuracy = np.array(
         [accuracy_history[i][i] for i in range(len(accuracy_history))]
     )
-
     forgetting = np.zeros(len(accuracy_history))
     for exp_index in range(len(accuracy_history)):
         seen = [row[exp_index] for row in accuracy_history[exp_index:]]
@@ -206,7 +202,8 @@ def main() -> None:
             forgetting[exp_index] = max(seen[:-1]) - seen[-1]
 
     print("\n=== Summary ===")
-    print(f"mode={mode}")
+    print(f"training_method={mode}")
+    print(f"eval_routing={args.eval_routing}")
     print("loss_curve:", np.round(diagonal_loss, 4))
     print("accuracy_curve:", np.round(diagonal_accuracy, 4))
     print("forgetting:", np.round(forgetting, 4))
