@@ -29,7 +29,7 @@ from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 from torch import Tensor
 
 from .decision import decide_class
-from .probing import (
+from .utils.probing import (
     apply_skill_state_exact,
     classes_in_experience,
     expand_skill_logits,

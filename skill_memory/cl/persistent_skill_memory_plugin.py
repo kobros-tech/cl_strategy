@@ -9,14 +9,14 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from .behavior import (
+from .evaluation.behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
     build_weight_behavior_statistics,
 )
-from .probing import apply_skill_state_exact, predict_logits, probe_class
-from .reverse_engineering import NormalMLReverseEngineer
-from .skill_memory_plugin import SkillMemoryPlugin
+from .utils.probing import apply_skill_state_exact, predict_logits, probe_class
+from .evaluation.reverse_engineering import NormalMLReverseEngineer
+from .cl.skill_memory_plugin import SkillMemoryPlugin
 
 
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
