@@ -251,6 +251,6 @@ def expand_skill_logits(
 # are required so linters treat these as intentional re-exports rather than
 # unused imports; removing them silently breaks `skill_memory_plugin.py`'s
 # `from .probing import find_best_routing_skill`.
-from .evaluation.routing import RoutingResult as RoutingResult  # noqa: E402
-from .evaluation.routing import find_best_routing_skill as find_best_routing_skill  # noqa: E402
-from .evaluation.routing import route_probe_logits as route_probe_logits  # noqa: E402
+from ..evaluation.routing import RoutingResult
+from ..evaluation.routing import find_best_routing_skill
+from ..evaluation.routing import route_probe_logits
