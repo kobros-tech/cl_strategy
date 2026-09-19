@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .diagnostics import class_index_alignment_report, routing_rank_diagnostics
-from .persistent_skill_memory_plugin import (
+from ..cl.persistent_skill_memory_plugin import (
     PersistentFingerprintSkillMemoryPlugin as _BaseFingerprintPlugin,
 )
 
