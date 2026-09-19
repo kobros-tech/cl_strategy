@@ -9,13 +9,13 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from .evaluation.behavior import (
+from ..evaluation.behavior import (
     BehaviorFingerprintCache,
     ClassBehaviorRecord,
     build_weight_behavior_statistics,
 )
-from .utils.probing import apply_skill_state_exact, predict_logits, probe_class
-from .evaluation.reverse_engineering import NormalMLReverseEngineer
+from ..utils.probing import apply_skill_state_exact, predict_logits, probe_class
+from ..evaluation.reverse_engineering import NormalMLReverseEngineer
 from .cl.skill_memory_plugin import SkillMemoryPlugin
 
 

@@ -8,7 +8,7 @@ from typing import Any
 from torch import nn
 from torch.utils.data import ConcatDataset
 
-from .evaluation.probing import (
+from ..utils.probing import (
     _sample_batches,
     class_subset,
     evaluate_state,
