@@ -1,4 +1,4 @@
-name: SplitMNIST 5x2 benchmark and class oracle
+name: SplitMNIST 2x5 Skill Memory ER-CL
 
 on:
   workflow_dispatch:
@@ -35,14 +35,14 @@ jobs:
           path: data
           key: splitmnist-dataset-v1-${{ runner.os }}
 
-      - name: Prepare SplitMNIST 5x2 dataset
+      - name: Prepare SplitMNIST 2x5 dataset
         run: |
-          python skill_memory/demos/demo_splitmnist_oracle_retention.py \
+          python skill_memory/demos/demo_splitmnist_ml_er.py \
             --dataset-root data \
-            --n-experiences 5 \
+            --n-experiences 2 \
             --download-only
 
-  run-splitmnist-5x2:
+  run-splitmnist-2x5-er-cl:
     needs: download-splitmnist
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -66,28 +66,21 @@ jobs:
           path: data
           key: splitmnist-dataset-v1-${{ runner.os }}
 
-      - name: Run 5 experiences x 2 classes strategy
+      - name: Run Skill Memory with ER-CL evaluation
         run: |
-          python skill_memory/demos/demo_splitmnist_weight_reverse_engineering.py \
-            --n-experiences 5 \
-            --dataset-root data
-
-      - name: Run 5 experiences x 2 classes class oracle
-        run: |
-          python skill_memory/demos/demo_splitmnist_oracle_retention.py \
+          python skill_memory/demos/demo_splitmnist_ml_er.py \
             --dataset-root data \
-            --n-experiences 5 \
-            | tee splitmnist_5x2_oracle_${{ github.run_id }}.txt
+            --n-experiences 2 \
+            --eval-method cl \
+            --max-skills 20 \
+            --seed 0 \
+            | tee splitmnist_2x5_er_cl_${{ github.run_id }}.txt
 
-      - name: Upload 5x2 strategy and oracle results
+      - name: Upload ER-CL results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: splitmnist-5x2-results-${{ github.run_id }}
-          path: |
-            skill_memory/demos/logs/weight_reverse_engineering_*.txt
-            skill_memory/demos/logs/weight_reverse_engineering_*.csv
-            skill_memory/demos/logs/weight_reverse_engineering_*.json
-            splitmnist_5x2_oracle_*.txt
+          name: splitmnist-2x5-er-cl-results-${{ github.run_id }}
+          path: splitmnist_2x5_er_cl_*.txt
           if-no-files-found: warn
           retention-days: 14

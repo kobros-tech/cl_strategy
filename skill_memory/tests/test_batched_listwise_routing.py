@@ -21,7 +21,7 @@ experiences) contains more than one class.
 import torch
 
 from skill_memory import ClassBehaviorRecord, SkillMemory
-from skill_memory.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
+from skill_memory.evaluation.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
 
 
 def _record(class_id: int, skill_id: int, weight: float) -> ClassBehaviorRecord:

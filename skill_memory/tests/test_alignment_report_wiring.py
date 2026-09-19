@@ -12,8 +12,8 @@ import torch
 from torch import nn
 
 from skill_memory import ClassRecord, SkillMemory
-from skill_memory.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
-from skill_memory.skill_registry import ExperienceClassMap
+from skill_memory.evaluation.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
+from skill_memory.cl.skill_registry import ExperienceClassMap
 
 
 class _TinyModel(nn.Module):
