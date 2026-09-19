@@ -25,6 +25,8 @@ from avalanche.training.templates import SupervisedTemplate
 
 from skill_memory import PersistentFingerprintSkillMemoryPlugin, SkillMemory
 from skill_memory.cl import SkillMemoryPlugin
+from skill_memory.cl.skill_registry import ClassRecord
+from skill_memory.utils.probing import classes_in_experience
 
 
 class SkillMemoryMLP(nn.Module):
@@ -41,102 +43,6 @@ class SkillMemoryMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.contiguous().view(x.size(0), -1)
         return self.classifier(self.features(x))
-
-
-def evaluate_seen(strategy, test_stream, up_to_index: int) -> list[float]:
-    """Evaluate seen experiences with canonical class-to-skill routing."""
-    results = strategy.eval([test_stream[i] for i in range(up_to_index + 1)])
-    keys = sorted(key for key in results if key.startswith("Top1_Acc_Exp"))
-    return [float(results[key]) for key in keys]
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Compare Skill Memory routing with ordinary ML and ER."
-    )
-    parser.add_argument("--dataset-root", default="data")
-    parser.add_argument("--download-only", action="store_true")
-    parser.add_argument("--n-experiences", type=int, default=10)
-    parser.add_argument(
-        "--mode",
-        choices=(
-            "skill-memory-class-oracle",
-            "skill-memory-cl-probe",
-            "skill-memory-ml-probe",
-            "ml",
-            "er",
-        ),
-        default="skill-memory-class-oracle",
-    )
-    parser.add_argument("--train-epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--replay-memory-size", type=int, default=200)
-    parser.add_argument("--reverse-epochs", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
-
-
-def build_strategy(args: argparse.Namespace, device: torch.device):
-    """Build the requested training/evaluation configuration."""
-    model = SkillMemoryMLP(input_dim=784).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    criterion = nn.CrossEntropyLoss()
-
-    if args.mode == "ml":
-        return model, Naive(
-            model=model, optimizer=optimizer, criterion=criterion,
-            train_mb_size=args.batch_size, train_epochs=args.train_epochs,
-            eval_mb_size=args.batch_size, device=device,
-        ), None
-
-    if args.mode == "er":
-        return model, Naive(
-            model=model, optimizer=optimizer, criterion=criterion,
-            train_mb_size=args.batch_size, train_epochs=args.train_epochs,
-            eval_mb_size=args.batch_size, device=device,
-            plugins=[ReplayPlugin(mem_size=args.replay_memory_size)],
-        ), None
-
-    if args.mode == "skill-memory-ml-probe":
-        plugin = PersistentFingerprintSkillMemoryPlugin(
-            memory=SkillMemory(max_skills=10),
-            forgetting_margin=0.05,
-            probe_batch_size=10,
-            probe_batches=5,
-            probe_seed=args.seed,
-            class_train_epochs=1,
-            class_train_batch_size=args.batch_size,
-            reuse_is_mutable=False,
-            eval_routing="ml_probe",
-            reverse_epochs=args.reverse_epochs,
-            reverse_batch_size=256,
-            verbose=True,
-        )
-    else:
-        routing = (
-            "class_oracle"
-            if args.mode == "skill-memory-class-oracle"
-            else "cl_probe"
-        )
-        plugin = SkillMemoryPlugin(
-            memory=SkillMemory(max_skills=10),
-            forgetting_margin=0.05,
-            probe_batch_size=10,
-            probe_batches=5,
-            probe_seed=args.seed,
-            class_train_epochs=1,
-            class_train_batch_size=args.batch_size,
-            reuse_is_mutable=True,
-            eval_routing=routing,
-            verbose=True,
-        )
-
-    strategy = SupervisedTemplate(
-        model=model, optimizer=optimizer, criterion=criterion,
-        train_mb_size=args.batch_size, train_epochs=args.train_epochs,
-        eval_mb_size=args.batch_size, device=device, plugins=[plugin],
-    )
-    return model, strategy, plugin
 
 
 def evaluate_seen(
@@ -229,8 +135,7 @@ def main() -> None:
             )
 
     curve, forgetting = summarize(history)
-    print("
-=== Summary ===")
+    print("\n=== Summary ===")
     print(f"mode={args.mode}")
     print("accuracy_curve:", np.round(curve, 4))
     print("forgetting:", np.round(forgetting, 4))
@@ -243,7 +148,10 @@ def main() -> None:
     elif args.mode == "skill-memory-cl-probe":
         print("NOTE: cl_probe is label-free and uses the Skill Memory router.")
     else:
-        print("NOTE: this baseline does not use Skill Memory routing.")
+        print(
+            "NOTE: ML/ER training is unchanged; Skill Memory evaluation "
+            f"routing={args.eval_routing!r} runs over post-experience snapshots."
+        )
 
 
 if __name__ == "__main__":
