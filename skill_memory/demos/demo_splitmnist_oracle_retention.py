@@ -1,19 +1,27 @@
-"""Diagnostic SplitMNIST comparison for Skill Memory and standard baselines.\n\nModes:\n- skill-memory-class-oracle: Skill Memory + true class-to-skill routing.\n- skill-memory-cl-probe: Skill Memory + label-free CL probe routing.\n- skill-memory-ml-probe: Skill Memory + label-free standalone ML router.\n- ml: ordinary Avalanche Naive supervised learning.\n- er: Avalanche Experience Replay.\n\nThe oracle mode is diagnostic only.\n"""
+"""Diagnostic SplitMNIST comparison for Skill Memory and standard baselines.
+
+Modes:
+- skill-memory-class-oracle: Skill Memory + true class-to-skill routing.
+- skill-memory-cl-probe: Skill Memory + label-free CL probe routing.
+- skill-memory-ml-probe: Skill Memory + label-free standalone ML router.
+- ml: ordinary Avalanche Naive supervised learning.
+- er: Avalanche Experience Replay.
+
+The oracle mode is diagnostic only.
+"""
 
 from __future__ import annotations
 
 import argparse
-import json
-from datetime import datetime
 
 import numpy as np
 import torch
 import torch.nn as nn
 from avalanche.benchmarks.classic import SplitMNIST
 from avalanche.models.dynamic_modules import IncrementalClassifier
-from avalanche.training.templates import SupervisedTemplate
 from avalanche.training import Naive
 from avalanche.training.plugins import ReplayPlugin
+from avalanche.training.templates import SupervisedTemplate
 
 from skill_memory import PersistentFingerprintSkillMemoryPlugin, SkillMemory
 from skill_memory.cl import SkillMemoryPlugin
@@ -221,7 +229,8 @@ def main() -> None:
             )
 
     curve, forgetting = summarize(history)
-    print("\n=== Summary ===")
+    print("
+=== Summary ===")
     print(f"mode={args.mode}")
     print("accuracy_curve:", np.round(curve, 4))
     print("forgetting:", np.round(forgetting, 4))
