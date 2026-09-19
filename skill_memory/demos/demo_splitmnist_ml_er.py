@@ -60,7 +60,8 @@ class SnapshotEvaluationPlugin(SkillMemoryPlugin):
                 "experience_index": index,
             },
         )
-        for class_id in classes_in_experience(experience):
+        classes = classes_in_experience(experience)
+        for class_id in classes:
             self.class_map.record(
                 ClassRecord(
                     experience_index=index,
@@ -70,8 +71,8 @@ class SnapshotEvaluationPlugin(SkillMemoryPlugin):
                 )
             )
         self._log(
-            f"Evaluation snapshot {skill}: experience {index}, "
-            f"classes={classes_in_experience(experience)}"
+            f"Evaluation snapshot {skill}: "
+            f"experience {index}, classes={classes}"
         )
 
 
@@ -82,8 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", default="data")
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--n-experiences", type=int, default=10)
-    parser.add_argument("--eval-routing", choices=("class_oracle", "cl_probe", "none"),
-                        default="class_oracle")
+    parser.add_argument(
+        "--eval-routing",
+        choices=("class_oracle", "cl_probe", "none"),
+        default="class_oracle",
+        help="Routing used only during the Skill Memory evaluation phase.",
+    )
     parser.add_argument("--train-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--replay-memory-size", type=int, default=200)
@@ -97,7 +102,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def evaluate_seen(strategy, test_stream, up_to_index: int):
+def evaluate_seen(
+    strategy,
+    test_stream,
+    up_to_index: int,
+) -> tuple[list[float], list[float]]:
     """Evaluate all experiences seen so far through Skill Memory routing."""
     results = strategy.eval([test_stream[i] for i in range(up_to_index + 1)])
     loss_keys = sorted(key for key in results if key.startswith("Loss_Exp"))
@@ -109,9 +118,10 @@ def evaluate_seen(strategy, test_stream, up_to_index: int):
             f"found losses={len(loss_keys)}, accuracies={len(acc_keys)}, "
             f"expected={expected}."
         )
-    return [float(results[key]) for key in loss_keys], [
-        float(results[key]) for key in acc_keys
-    ]
+    return (
+        [float(results[key]) for key in loss_keys],
+        [float(results[key]) for key in acc_keys],
+    )
 
 
 def main() -> None:
@@ -133,7 +143,8 @@ def main() -> None:
     print(f"Experiences: {len(benchmark.train_stream)}")
     for index, experience in enumerate(benchmark.train_stream):
         print(
-            f"  Exp {index}: classes={sorted(experience.classes_in_this_experience)} "
+            f"  Exp {index}: "
+            f"classes={sorted(experience.classes_in_this_experience)} "
             f"samples={len(experience.dataset)}"
         )
 
@@ -144,6 +155,7 @@ def main() -> None:
     model = SplitMNISTMLP().to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     criterion = nn.CrossEntropyLoss()
+
     snapshot_plugin = SnapshotEvaluationPlugin(
         memory=SkillMemory(max_skills=args.n_experiences),
         eval_routing=args.eval_routing,
@@ -170,17 +182,22 @@ def main() -> None:
     for train_index, train_exp in enumerate(benchmark.train_stream):
         strategy.train(train_exp)
         losses, accuracies = evaluate_seen(
-            strategy, benchmark.test_stream, train_index
+            strategy,
+            benchmark.test_stream,
+            train_index,
         )
         loss_history.append(losses)
         accuracy_history.append(accuracies)
+
         print(
-            f"Step {train_index}: classes="
-            f"{sorted(train_exp.classes_in_this_experience)}"
+            f"Step {train_index}: "
+            f"classes={sorted(train_exp.classes_in_this_experience)}"
         )
         print(
             "  loss="
-            + ", ".join(f"Exp{i}={value:.4f}" for i, value in enumerate(losses))
+            + ", ".join(
+                f"Exp{i}={value:.4f}" for i, value in enumerate(losses)
+            )
         )
         print(
             "  accuracy="
