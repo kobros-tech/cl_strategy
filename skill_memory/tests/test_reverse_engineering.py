@@ -1,6 +1,6 @@
 import torch
 
-from skill_memory.evaluation.persistent_skill_memory_plugin import (
+from skill_memory.evaluation.fingerprint_routing import (
     PersistentFingerprintSkillMemoryPlugin,
 )
 from skill_memory.evaluation.reverse_engineering import (
