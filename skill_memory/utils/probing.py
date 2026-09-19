@@ -238,11 +238,48 @@ def expand_skill_logits(
     skill_classes: set[int],
     output_dim: int,
 ) -> Tensor:
-    """Pad global classifier logits without remapping class columns."""
-    del state_dict, skill_classes
+    """Place a skill's logits in the global class space.
+
+    Stored skills can have either a global Avalanche classifier head or a
+    compact head containing exactly their owned classes. Global heads already
+    use class ids as column indices; compact heads must map row i to the
+    i-th owned global class. A one-class skill is therefore mapped to its
+    actual class instead of incorrectly being treated as class 0.
+    """
+    del state_dict
+    owned = sorted(int(class_id) for class_id in skill_classes)
+    if not owned:
+        return logits.new_full((logits.shape[0], output_dim), -1e4)
+
+    width = logits.shape[-1]
+    max_owned = max(owned)
+
+    if width > len(owned):
+        if max_owned >= width:
+            raise RuntimeError(
+                f"skill owns class {max_owned}, but its classifier has only "
+                f"{width} output columns"
+            )
+        result = logits.new_full((logits.shape[0], output_dim), -1e4)
+        copy_width = min(width, output_dim)
+        result[:, :copy_width] = logits[:, :copy_width]
+        return result
+
+    if width != len(owned):
+        raise RuntimeError(
+            f"skill owns {len(owned)} classes but its compact classifier has "
+            f"{width} output columns"
+        )
+
+    if max_owned >= output_dim:
+        raise RuntimeError(
+            f"skill owns class {max_owned}, outside global output dimension "
+            f"{output_dim}"
+        )
+
     result = logits.new_full((logits.shape[0], output_dim), -1e4)
-    width = min(logits.shape[1], output_dim)
-    result[:, :width] = logits[:, :width]
+    for local_index, global_class in enumerate(owned):
+        result[:, global_class] = logits[:, local_index]
     return result
 
 
