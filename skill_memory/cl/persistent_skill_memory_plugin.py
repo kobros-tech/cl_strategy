@@ -14,9 +14,14 @@ from ..evaluation.behavior import (
     ClassBehaviorRecord,
     build_weight_behavior_statistics,
 )
-from ..utils.probing import apply_skill_state_exact, predict_logits, probe_class
+from ..utils.probing import (
+    apply_skill_state_exact,
+    expand_skill_logits,
+    predict_logits,
+    probe_class,
+)
 from ..evaluation.reverse_engineering import NormalMLReverseEngineer
-from .cl.skill_memory_plugin import SkillMemoryPlugin
+from .skill_memory_plugin import SkillMemoryPlugin
 
 
 class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
