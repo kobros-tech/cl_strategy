@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from skill_memory import ClassBehaviorRecord
-from skill_memory.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
+from skill_memory.evaluation.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
 
 
 def _record(class_id: int, skill_id: int) -> ClassBehaviorRecord:
