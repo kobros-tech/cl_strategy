@@ -52,7 +52,6 @@ import torch.nn as nn
 from avalanche.benchmarks.classic import SplitMNIST
 from avalanche.training import Naive
 
-import skill_memory.cl.skill_memory_plugin as skill_memory_plugin_module
 from skill_memory.cl import SkillMemoryPlugin
 from skill_memory.cl.skill_registry import SkillMemory
 from skill_memory.evaluation.routing import find_best_routing_skill
@@ -102,55 +101,6 @@ class EvaluationMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.contiguous().view(x.size(0), -1)
         return self.classifier(self.features(x))
-
-
-def train_one_vs_rest_on_class(
-    strategy,
-    experience,
-    target_class: int,
-    epochs: int,
-    batch_size: int,
-) -> None:
-    """Train one Skill Memory slot with a target-vs-rest objective."""
-    if epochs < 1:
-        return
-
-    dataset = experience.dataset
-
-    if len(dataset) == 0:
-        raise RuntimeError(f"class {target_class} has no samples to train on")
-
-    device = next(strategy.model.parameters()).device
-
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=min(batch_size, len(dataset)),
-        shuffle=True,
-    )
-
-    criterion = nn.BCEWithLogitsLoss()
-    strategy.model.train()
-
-    for _ in range(epochs):
-        for batch in loader:
-            inputs = batch[0].to(device)
-
-            target = torch.zeros(
-                inputs.shape[0],
-                strategy.model.classifier.out_features,
-                device=device,
-            )
-            target[:, target_class] = 1.0
-
-            strategy.optimizer.zero_grad(set_to_none=True)
-
-            logits = strategy.model(inputs)
-            loss = criterion(logits, target)
-
-            loss.backward()
-            strategy.optimizer.step()
-
-            strategy.clock.train_iterations += 1
 
 
 @dataclass
@@ -915,12 +865,6 @@ def main() -> None:
     )
 
     criterion = nn.CrossEntropyLoss()
-
-    # This override is deliberately local to this demo.
-    #
-    # SkillMemoryPlugin still owns allocation, routing, REUSE/SCRATCH,
-    # state storage, and all other Skill Memory behavior.
-    skill_memory_plugin_module.train_on_class = train_one_vs_rest_on_class
 
     skill_memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=args.max_skills),
