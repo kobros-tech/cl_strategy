@@ -97,6 +97,7 @@ class NormalMLReverseEngineer:
         num_heads: int = 8,
         num_layers: int = 3,
     ) -> None:
+        """Configure training hyperparameters (nothing is fit until `.fit*`)."""
         if training_mode not in {"listwise", "binary"}:
             raise ValueError("training_mode must be 'listwise' or 'binary'")
         if hidden_size <= 0 or num_heads <= 0 or num_layers <= 0:

@@ -25,8 +25,6 @@ from avalanche.training.templates import SupervisedTemplate
 
 from skill_memory import PersistentFingerprintSkillMemoryPlugin, SkillMemory
 from skill_memory.cl import SkillMemoryPlugin
-from skill_memory.cl.skill_registry import ClassRecord
-from skill_memory.utils.probing import classes_in_experience
 
 
 class SkillMemoryMLP(nn.Module):
@@ -75,6 +73,100 @@ def summarize(history: list[list[float]]) -> tuple[np.ndarray, np.ndarray]:
     return curve, forgetting
 
 
+def parse_args() -> argparse.Namespace:
+    """CLI for comparing Skill Memory routing modes against ML/ER baselines."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Diagnostic SplitMNIST comparison for Skill Memory and standard baselines."
+        )
+    )
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "skill-memory-class-oracle",
+            "skill-memory-cl-probe",
+            "skill-memory-ml-probe",
+            "ml",
+            "er",
+        ),
+        default="skill-memory-class-oracle",
+        help="See the module docstring for what each mode does.",
+    )
+    parser.add_argument("--dataset-root", default=None)
+    parser.add_argument("--download-only", action="store_true")
+    parser.add_argument("--n-experiences", type=int, default=10)
+    parser.add_argument("--train-epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--replay-memory-size", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=0)
+    return parser.parse_args()
+
+
+def build_strategy(args: argparse.Namespace, device: torch.device):
+    """Build the model, Avalanche strategy, and Skill Memory plugin (if any).
+
+    Returns ``(model, strategy, plugin)``. ``plugin`` is ``None`` for the
+    plain ``ml``/``er`` baselines, which use ordinary Avalanche training
+    with no Skill Memory routing at all.
+    """
+    model = SkillMemoryMLP(input_dim=784).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    criterion = nn.CrossEntropyLoss()
+
+    if args.mode in (
+        "skill-memory-class-oracle",
+        "skill-memory-cl-probe",
+        "skill-memory-ml-probe",
+    ):
+        memory = SkillMemory(max_skills=args.n_experiences)
+        if args.mode == "skill-memory-class-oracle":
+            plugin = SkillMemoryPlugin(
+                memory=memory, eval_routing="class_oracle", verbose=True
+            )
+        elif args.mode == "skill-memory-cl-probe":
+            plugin = SkillMemoryPlugin(
+                memory=memory, eval_routing="probe", verbose=True
+            )
+        else:
+            plugin = PersistentFingerprintSkillMemoryPlugin(
+                memory=memory,
+                eval_routing="probe",
+                diagnose=False,
+                verbose=True,
+            )
+        strategy = SupervisedTemplate(
+            model=model,
+            optimizer=optimizer,
+            criterion=criterion,
+            train_mb_size=args.batch_size,
+            train_epochs=args.train_epochs,
+            eval_mb_size=args.batch_size,
+            device=device,
+            plugins=[plugin],
+        )
+        return model, strategy, plugin
+
+    if args.mode in ("ml", "er"):
+        plugins = (
+            [ReplayPlugin(mem_size=args.replay_memory_size)]
+            if (args.mode == "er")
+            else []
+        )
+        strategy = Naive(
+            model=model,
+            optimizer=optimizer,
+            criterion=criterion,
+            train_mb_size=args.batch_size,
+            train_epochs=args.train_epochs,
+            eval_mb_size=args.batch_size,
+            device=device,
+            plugins=plugins,
+        )
+        return model, strategy, None
+
+    raise ValueError(f"unknown mode {args.mode!r}")
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -106,9 +198,7 @@ def main() -> None:
 
     for train_index, train_exp in enumerate(benchmark.train_stream):
         strategy.train(train_exp)
-        losses, accuracies = evaluate_seen(
-            strategy, benchmark.test_stream, train_index
-        )
+        losses, accuracies = evaluate_seen(strategy, benchmark.test_stream, train_index)
         history.append(accuracies)
 
         print(
@@ -117,15 +207,11 @@ def main() -> None:
         )
         print(
             "  loss="
-            + ", ".join(
-                f"Exp{i}={value:.4f}" for i, value in enumerate(losses)
-            )
+            + ", ".join(f"Exp{i}={value:.4f}" for i, value in enumerate(losses))
         )
         print(
             "  accuracy="
-            + ", ".join(
-                f"Exp{i}={value:.4f}" for i, value in enumerate(accuracies)
-            )
+            + ", ".join(f"Exp{i}={value:.4f}" for i, value in enumerate(accuracies))
         )
 
         if plugin is not None:
@@ -144,14 +230,17 @@ def main() -> None:
     if args.mode == "skill-memory-class-oracle":
         print("NOTE: class_oracle uses true labels only for skill selection.")
     elif args.mode == "skill-memory-ml-probe":
-        print("NOTE: ml_probe is label-free and uses the standalone ML router.")
-    elif args.mode == "skill-memory-cl-probe":
-        print("NOTE: cl_probe is label-free and uses the Skill Memory router.")
-    else:
         print(
-            "NOTE: ML/ER training is unchanged; Skill Memory evaluation "
-            f"routing={args.eval_routing!r} runs over post-experience snapshots."
+            "NOTE: this probe is label-free and uses the standalone ML "
+            "router (PersistentFingerprintSkillMemoryPlugin)."
         )
+    elif args.mode == "skill-memory-cl-probe":
+        print(
+            "NOTE: this probe is label-free and uses the base Skill Memory "
+            "router (SkillMemoryPlugin)."
+        )
+    else:
+        print("NOTE: this is an ordinary Avalanche baseline; no Skill Memory routing.")
 
 
 if __name__ == "__main__":

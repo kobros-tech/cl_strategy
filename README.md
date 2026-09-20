@@ -1,9 +1,7 @@
 # skill_memory
 
 Class-level, probe-based Skill Memory plugin for [Avalanche](https://avalanche.continualai.org)
-continual learning. See `skill_memory/README.md` for the full design/API
-doc and `skill_memory/README_PERSISTENT_FINGERPRINTS.md` for the optional
-persistent-fingerprint extension.
+continual learning. See `skill_memory/README.md` for the full design/API doc.
 
 ## Install
 
@@ -39,8 +37,8 @@ pre-commit install     # one-time, sets up the git hook
 pre-commit run -a      # run all hooks against the whole repo
 ```
 
-`skill_memory/tests/demo_splitmnist_eval_log.py` writes its eval-log CSV
-under a gitignored `skill_memory/tests/logs/` directory, so it won't trip
+`skill_memory/demos/demo_splitmnist_eval_log.py` writes its eval-log CSV
+under a gitignored `skill_memory/demos/logs/` directory, so it won't trip
 the large-file hook or get committed by accident.
 
 ## Run the unit tests
@@ -51,14 +49,14 @@ python -m pytest -q
 
 ## Run the SplitMNIST demo / eval-log script
 
-`skill_memory/tests/demo_splitmnist_eval_log.py` is a runnable demo
+`skill_memory/demos/demo_splitmnist_eval_log.py` is a runnable demo
 (not a pytest unit test) that trains `SkillMemoryPlugin` on Avalanche's
 SplitMNIST benchmark and prints a per-sample predicted-y-vs-real-y eval log
 after every training step, plus dumps the full log to
 `skill_memory_eval_log.csv`.
 
 ```bash
-python skill_memory/tests/demo_splitmnist_eval_log.py
+python skill_memory/demos/demo_splitmnist_eval_log.py
 ```
 
 ## Layout
@@ -67,18 +65,31 @@ python skill_memory/tests/demo_splitmnist_eval_log.py
 pyproject.toml            # pip-installable package metadata
 requirements.txt          # runtime dependencies
 requirements-dev.txt      # + pytest, for running the test suite
-skill_memory/             # the importable package (`import skill_memory`)
+skill_memory/              # the importable package (`import skill_memory`)
     __init__.py
-    behavior.py
-    decision.py
-    probing.py
-    skill_memory_plugin.py
-    persistent_skill_memory_plugin.py
-    skill_registry.py
-    training.py
+    cl/                     # continual-learning strategy: the plugin, skill
+                            #   registry, and REUSE/SCRATCH decision logic
+        skill_memory_plugin.py
+        persistent_skill_memory_plugin.py
+        decision.py
+        skill_registry.py
+        training.py
+    evaluation/             # anonymous routing and the reverse-engineering
+                            #   model used to identify a class at eval time
+        fingerprint_routing.py   # public compatibility entry point
+        routing.py
+        reverse_engineering.py
+        behavior.py
+        diagnostics.py
+        global_fingerprint_refresh.py
+    utils/                  # shared, package-independent helpers
+        probing.py
+    demos/                  # runnable scripts (not pytest tests)
+        demo_splitmnist_eval_log.py
+        demo_splitmnist_ml_er.py
+        demo_splitmnist_oracle_retention.py
+        demo_splitmnist_weight_reverse_engineering.py
     README.md
-    README_PERSISTENT_FINGERPRINTS.md
     tests/
-        test_*.py                          # existing unit tests (pytest)
-        demo_splitmnist_eval_log.py     # SplitMNIST demo / eval log script
+        test_*.py           # unit tests (pytest)
 ```

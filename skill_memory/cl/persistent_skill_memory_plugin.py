@@ -14,13 +14,8 @@ from ..evaluation.behavior import (
     ClassBehaviorRecord,
     build_weight_behavior_statistics,
 )
-from ..utils.probing import (
-    apply_skill_state_exact,
-    expand_skill_logits,
-    predict_logits,
-    probe_class,
-)
 from ..evaluation.reverse_engineering import NormalMLReverseEngineer
+from ..utils.probing import apply_skill_state_exact, predict_logits, probe_class
 from .skill_memory_plugin import SkillMemoryPlugin
 
 
@@ -46,6 +41,14 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         record_candidate_diagnostics: bool = True,
         **kwargs,
     ):
+        """Configure the persistent fingerprint cache and listwise reverse router.
+
+        Extends `SkillMemoryPlugin` with a version-aware behavior cache
+        (`self.behavior`) and a `NormalMLReverseEngineer` fit after every
+        experience (see `_fit_reverse_router`). `reuse_is_mutable` defaults
+        to `False` here, since a mutable REUSE would invalidate frozen
+        fingerprints for that skill.
+        """
         kwargs.setdefault("reuse_is_mutable", False)
         super().__init__(*args, **kwargs)
         self.behavior = BehaviorFingerprintCache()
@@ -305,6 +308,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         return changed
 
     def before_training_exp(self, strategy, **kwargs) -> None:
+        """No extra behavior beyond `SkillMemoryPlugin`'s own hook."""
         super().before_training_exp(strategy, **kwargs)
 
     def after_training_exp(self, strategy, **kwargs) -> None:
@@ -563,16 +567,15 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         )
 
     def before_eval(self, strategy, **kwargs) -> None:
+        """Reset the per-evaluation-phase route history alongside the base hook."""
         super().before_eval(strategy, **kwargs)
-        if self.record_candidate_diagnostics:
-            self.fingerprint_route_history = []
+        self.fingerprint_route_history = []
         self._fingerprint_batch_index = 0
         self._evaluation_experience_index = None
 
     def before_eval_exp(self, strategy, **kwargs) -> None:
+        """Track the current evaluation experience index for diagnostics."""
         super().before_eval_exp(strategy, **kwargs)
-        if not self.record_candidate_diagnostics:
-            return
         experience = strategy.experience
         index = getattr(experience, "current_experience", None)
         if index is None:
@@ -580,50 +583,38 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         self._evaluation_experience_index = None if index is None else int(index)
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
-        if not self._eval_active or self.eval_routing != "ml_probe":
+        """Overwrite `strategy.mb_output` with this batch's routed logits.
+
+        Falls back to the base class's own routing (or a no-op) when
+        `eval_routing != "probe"`, no skills are stored yet, or the
+        fingerprint cache hasn't been initialized.
+        """
+        if not self._eval_active or self.eval_routing != "probe":
             return super().after_eval_forward(strategy, **kwargs)
         if len(self.memory) == 0 or not self._behavior_initialized:
             return super().after_eval_forward(strategy, **kwargs)
-
         x = strategy.mbatch[0]
         y = strategy.mbatch[1]
         slot_ids = sorted(self.memory.slots())
-        chosen, _ = self._route(strategy, x, slot_ids)
+        chosen, class_matches = self._route(strategy, x, slot_ids)
+        for route, label in zip(
+            self.last_fingerprint_routes,
+            y.detach().cpu().tolist(),
+            strict=False,
+        ):
+            route["batch_index"] = self._fingerprint_batch_index
+            route["evaluation_experience"] = self._evaluation_experience_index
+            route["evaluation_y"] = int(label)
+        self.fingerprint_route_history.extend(self.last_fingerprint_routes)
+        self._fingerprint_batch_index += 1
 
-        # Routing is label-free. Keep labels completely out of the normal
-        # evaluation path; when diagnostics are enabled they are attached
-        # only after routing has already selected the skill.
-        if self.record_candidate_diagnostics:
-            for route, label in zip(
-                self.last_fingerprint_routes,
-                y.detach().cpu().tolist(),
-                strict=False,
-            ):
-                route["batch_index"] = self._fingerprint_batch_index
-                route["evaluation_experience"] = self._evaluation_experience_index
-                route["evaluation_y"] = int(label)
-            self.fingerprint_route_history.extend(self.last_fingerprint_routes)
-            self._fingerprint_batch_index += 1
-
-        # Avalanche already owns evaluation metrics. We only replace the
-        # minibatch output with the prediction produced by the selected frozen
-        # skill, then let the normal evaluator compute loss/accuracy.
+        output_model = deepcopy(strategy.model)
+        per_skill_logits = [
+            predict_logits(output_model, self.memory.state(slot), x)
+            for slot in slot_ids
+        ]
         output_dim = strategy.mb_output.shape[-1]
-        per_skill_logits = []
-        for slot in slot_ids:
-            model = self._load_frozen_model(strategy, slot)
-            device = next(model.parameters()).device
-            with torch.no_grad():
-                logits = model(x.to(device)).detach()
-            per_skill_logits.append(
-                expand_skill_logits(
-                    logits,
-                    self.memory.state(slot),
-                    self.class_map.classes_for_skill(slot),
-                    output_dim,
-                ).to(x.device)
-            )
-
+        padded = [self._pad_logits(logits, output_dim) for logits in per_skill_logits]
         valid = chosen.ge(0)
         if valid.any():
             positions = torch.nonzero(valid, as_tuple=False).squeeze(-1)
@@ -633,26 +624,26 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 device=chosen.device,
                 dtype=torch.long,
             )
-            stacked = torch.stack(per_skill_logits, dim=0)
+            stacked = torch.stack(padded, dim=0)
             strategy.mb_output[positions] = stacked[rows, positions]
 
-        if self.record_candidate_diagnostics:
-            final_predictions = strategy.mb_output.detach().argmax(dim=-1).cpu().tolist()
-            labels = y.detach().cpu().tolist()
-            for route, prediction, label in zip(
-                self.last_fingerprint_routes,
-                final_predictions,
-                labels,
-                strict=False,
-            ):
-                route["model_predicted_class"] = int(prediction)
-                route["model_correct"] = int(prediction) == int(label)
+        final_predictions = strategy.mb_output.detach().argmax(dim=-1).cpu().tolist()
+        labels = y.detach().cpu().tolist()
+        for route, prediction, label in zip(
+            self.last_fingerprint_routes,
+            final_predictions,
+            labels,
+            strict=False,
+        ):
+            route["model_predicted_class"] = int(prediction)
+            route["model_correct"] = int(prediction) == int(label)
 
-            self._log(
-                "[ML PROBE routing] "
-                f"eval_exp={self._evaluation_experience_index} "
-                f"samples={x.shape[0]} identified={len(self.last_fingerprint_routes)}"
-            )
+        self._log(
+            "[NORMAL ML routing] "
+            f"eval_exp={self._evaluation_experience_index} "
+            f"samples={x.shape[0]} identified={len(self.last_fingerprint_routes)} "
+            f"matched_classes={class_matches[:5]}"
+        )
 
     def state_dict(self) -> dict:
         """Serialize persistent references and the fitted reverse router."""
