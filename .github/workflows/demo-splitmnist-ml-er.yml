@@ -1,4 +1,4 @@
-name: SplitMNIST 5x2 benchmark and class oracle
+name: SplitMNIST ML/CL evaluator (class oracle)
 
 on:
   workflow_dispatch:
@@ -35,17 +35,29 @@ jobs:
           path: data
           key: splitmnist-dataset-v1-${{ runner.os }}
 
-      - name: Prepare SplitMNIST 5x2 dataset
+      - name: Prepare SplitMNIST dataset
         run: |
-          python skill_memory/demos/demo_splitmnist_oracle_retention.py \
+          python skill_memory/demos/demo_splitmnist_ml_er.py \
             --dataset-root data \
             --n-experiences 5 \
             --download-only
 
-  run-splitmnist-5x2:
+  run-ml-er-evaluator:
     needs: download-splitmnist
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - eval_method: ml
+            eval_epochs: 1
+          - eval_method: cl
+            eval_epochs: 1
+          - eval_method: ml
+            eval_epochs: 10
+          - eval_method: cl
+            eval_epochs: 10
 
     steps:
       - name: Checkout
@@ -66,28 +78,21 @@ jobs:
           path: data
           key: splitmnist-dataset-v1-${{ runner.os }}
 
-      - name: Run 5 experiences x 2 classes strategy
+      - name: Run 5 experiences, class oracle, ${{ matrix.eval_method }} eval, ${{ matrix.eval_epochs }} eval epoch(s)
         run: |
-          python skill_memory/demos/demo_splitmnist_weight_reverse_engineering.py \
-            --n-experiences 5 \
-            --dataset-root data
-
-      - name: Run 5 experiences x 2 classes class oracle
-        run: |
-          python skill_memory/demos/demo_splitmnist_oracle_retention.py \
+          python skill_memory/demos/demo_splitmnist_ml_er.py \
             --dataset-root data \
             --n-experiences 5 \
-            | tee splitmnist_5x2_oracle_${{ github.run_id }}.txt
+            --skill-eval-routing oracle \
+            --eval-method ${{ matrix.eval_method }} \
+            --eval-epochs ${{ matrix.eval_epochs }} \
+            | tee ml_er_${{ matrix.eval_method }}_${{ matrix.eval_epochs }}ep_${{ github.run_id }}.txt
 
-      - name: Upload 5x2 strategy and oracle results
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: splitmnist-5x2-results-${{ github.run_id }}
-          path: |
-            skill_memory/demos/logs/weight_reverse_engineering_*.txt
-            skill_memory/demos/logs/weight_reverse_engineering_*.csv
-            skill_memory/demos/logs/weight_reverse_engineering_*.json
-            splitmnist_5x2_oracle_*.txt
+          name: ml-er-${{ matrix.eval_method }}-${{ matrix.eval_epochs }}ep-${{ github.run_id }}
+          path: ml_er_${{ matrix.eval_method }}_${{ matrix.eval_epochs }}ep_*.txt
           if-no-files-found: warn
           retention-days: 14

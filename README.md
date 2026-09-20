@@ -47,17 +47,48 @@ the large-file hook or get committed by accident.
 python -m pytest -q
 ```
 
-## Run the SplitMNIST demo / eval-log script
+## Run the SplitMNIST demos
 
-`skill_memory/demos/demo_splitmnist_eval_log.py` is a runnable demo
-(not a pytest unit test) that trains `SkillMemoryPlugin` on Avalanche's
-SplitMNIST benchmark and prints a per-sample predicted-y-vs-real-y eval log
-after every training step, plus dumps the full log to
-`skill_memory_eval_log.csv`.
+`skill_memory/demos/demo_splitmnist_ml_er.py` is the demo CI actually runs
+(see `.github/workflows/demo-splitmnist-ml-er.yml`). Skill Memory trains
+the main model as usual; a completely separate ML or CL evaluator is then
+trained on frozen per-class evaluation memory and reports class-level
+accuracy, loss, and forgetting. The evaluator's lifetime (`ml`: a fresh one
+per experience, `cl`: retained across experiences) is the only difference
+between the two modes - both are trained on the full accumulated class
+memory seen so far, not just the latest experience. In practice `cl` has
+given better results than `ml`, and evaluator accuracy/forgetting depend
+heavily on giving the evaluator enough epochs (`--eval-epochs 10` or `20`,
+not `1`) to actually fit the accumulated memory:
+
+```bash
+python skill_memory/demos/demo_splitmnist_ml_er.py \
+    --n-experiences 5 \
+    --eval-method cl \
+    --eval-memory-per-class 20 \
+    --train-epochs 1 \
+    --eval-epochs 20 \
+    --max-skills 10
+```
+
+Pass `--skill-eval-routing oracle` (or `probe`/`both`) to additionally
+report Skill Memory's own direct class-oracle/anonymous-routing accuracy,
+independent of the auxiliary ML/CL evaluator - this is what the CI
+workflow uses. Run `--help` for the full flag list.
+
+`skill_memory/demos/demo_splitmnist_eval_log.py` is a separate, simpler
+demo that trains `SkillMemoryPlugin` directly and prints a per-sample
+predicted-y-vs-real-y eval log after every training step, plus dumps the
+full log to `skill_memory_eval_log.csv`.
 
 ```bash
 python skill_memory/demos/demo_splitmnist_eval_log.py
 ```
+
+`demo_splitmnist_oracle_retention.py` and
+`demo_splitmnist_weight_reverse_engineering.py` are older, more
+narrowly-scoped demos kept for manual/local use; they are not wired into
+any CI workflow.
 
 ## Layout
 
