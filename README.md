@@ -37,29 +37,26 @@ pre-commit install     # one-time, sets up the git hook
 pre-commit run -a      # run all hooks against the whole repo
 ```
 
-`skill_memory/demos/demo_splitmnist_eval_log.py` writes its eval-log CSV
-under a gitignored `skill_memory/demos/logs/` directory, so it won't trip
-the large-file hook or get committed by accident.
-
 ## Run the unit tests
 
 ```bash
 python -m pytest -q
 ```
 
-## Run the SplitMNIST demos
+## Run the SplitMNIST demo
 
-`skill_memory/demos/demo_splitmnist_ml_er.py` is the demo CI actually runs
-(see `.github/workflows/demo-splitmnist-ml-er.yml`). Skill Memory trains
-the main model as usual; a completely separate ML or CL evaluator is then
-trained on frozen per-class evaluation memory and reports class-level
-accuracy, loss, and forgetting. The evaluator's lifetime (`ml`: a fresh one
-per experience, `cl`: retained across experiences) is the only difference
-between the two modes - both are trained on the full accumulated class
-memory seen so far, not just the latest experience. In practice `cl` has
-given better results than `ml`, and evaluator accuracy/forgetting depend
-heavily on giving the evaluator enough epochs (`--eval-epochs 10` or `20`,
-not `1`) to actually fit the accumulated memory:
+`skill_memory/demos/demo_splitmnist_ml_er.py` is the repo's one demo, and
+what CI runs (see `.github/workflows/demo-splitmnist-ml-er.yml`). Skill
+Memory trains the main model as usual; a completely separate ML or CL
+evaluator is then trained on frozen per-class evaluation memory and
+reports class-level accuracy, loss, and forgetting. The evaluator's
+lifetime (`ml`: a fresh one per experience, `cl`: retained across
+experiences) is the only difference between the two modes - both are
+trained on the full accumulated class memory seen so far, not just the
+latest experience. In practice `cl` has given better results than `ml`,
+and evaluator accuracy/forgetting depend heavily on giving the evaluator
+enough epochs (`--eval-epochs 10` or `20`, not `1`) to actually fit the
+accumulated memory:
 
 ```bash
 python skill_memory/demos/demo_splitmnist_ml_er.py \
@@ -76,19 +73,12 @@ report Skill Memory's own direct class-oracle/anonymous-routing accuracy,
 independent of the auxiliary ML/CL evaluator - this is what the CI
 workflow uses. Run `--help` for the full flag list.
 
-`skill_memory/demos/demo_splitmnist_eval_log.py` is a separate, simpler
-demo that trains `SkillMemoryPlugin` directly and prints a per-sample
-predicted-y-vs-real-y eval log after every training step, plus dumps the
-full log to `skill_memory_eval_log.csv`.
-
-```bash
-python skill_memory/demos/demo_splitmnist_eval_log.py
-```
-
-`demo_splitmnist_oracle_retention.py` and
-`demo_splitmnist_weight_reverse_engineering.py` are older, more
-narrowly-scoped demos kept for manual/local use; they are not wired into
-any CI workflow.
+This demo is a thin script: all the reusable machinery it drives (frozen
+per-class evaluation memory, the independent evaluator's train/evaluate
+loop, and direct Skill Memory oracle/probe evaluation) lives in
+`skill_memory.evaluation.ml_cl_evaluator`, so it's importable and testable
+independent of SplitMNIST or this specific demo - see
+`skill_memory/tests/test_ml_cl_evaluator.py`.
 
 ## Layout
 
@@ -105,21 +95,21 @@ skill_memory/              # the importable package (`import skill_memory`)
         decision.py
         skill_registry.py
         training.py
-    evaluation/             # anonymous routing and the reverse-engineering
-                            #   model used to identify a class at eval time
+    evaluation/             # anonymous routing, the reverse-engineering
+                            #   model used to identify a class at eval time,
+                            #   and independent ML/CL evaluation
         fingerprint_routing.py   # public compatibility entry point
         routing.py
         reverse_engineering.py
         behavior.py
         diagnostics.py
         global_fingerprint_refresh.py
+        ml_cl_evaluator.py       # independent ML/CL evaluator machinery
     utils/                  # shared, package-independent helpers
         probing.py
+        models.py                # SimpleMLP, used by the demo and tests
     demos/                  # runnable scripts (not pytest tests)
-        demo_splitmnist_eval_log.py
         demo_splitmnist_ml_er.py
-        demo_splitmnist_oracle_retention.py
-        demo_splitmnist_weight_reverse_engineering.py
     README.md
     tests/
         test_*.py           # unit tests (pytest)

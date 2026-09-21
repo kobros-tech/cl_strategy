@@ -12,38 +12,7 @@ on:
       - main
 
 jobs:
-  download-splitmnist:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install package
-        run: python -m pip install -e .
-
-      - name: Restore or download SplitMNIST dataset
-        uses: actions/cache@v4
-        with:
-          path: data
-          key: splitmnist-dataset-v1-${{ runner.os }}
-
-      - name: Prepare SplitMNIST dataset
-        run: |
-          python skill_memory/demos/demo_splitmnist_ml_er.py \
-            --dataset-root data \
-            --n-experiences 5 \
-            --download-only
-
   run-ml-er-evaluator:
-    needs: download-splitmnist
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -72,7 +41,7 @@ jobs:
       - name: Install package
         run: python -m pip install -e .
 
-      - name: Restore SplitMNIST dataset cache
+      - name: Restore or download SplitMNIST dataset
         uses: actions/cache@v4
         with:
           path: data
