@@ -85,17 +85,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--n-experiences", type=int, default=5)
     parser.add_argument(
-        "--eval-method",
-        choices=("ml", "cl"),
-        default="cl",
-        help=(
-            "Evaluation learner. 'ml' creates a fresh evaluator for every "
-            "experience, but each evaluator is trained on all accumulated "
-            "class memories. 'cl' retains one evaluator across experiences "
-            "and also trains on all accumulated class memories."
-        ),
-    )
-    parser.add_argument(
         "--eval-memory-per-class",
         type=int,
         default=20,
@@ -144,7 +133,6 @@ def main() -> None:
 
     print("=== SplitMNIST Skill Memory experiment ===")
     print("Training method: Skill Memory")
-    print(f"Evaluation method: {args.eval_method.upper()}")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
     print(f"Evaluation memory per class: {args.eval_memory_per_class}")
@@ -219,8 +207,7 @@ def main() -> None:
         )
 
     evaluator = evaluator_optimizer = evaluator_criterion = None
-    if args.eval_method == "cl":
-        evaluator, evaluator_optimizer, evaluator_criterion = new_evaluator()
+    evaluator, evaluator_optimizer, evaluator_criterion = new_evaluator()
 
     accuracy_history: list[dict[int, float]] = []
     loss_history: list[dict[int, float]] = []
@@ -284,12 +271,7 @@ def main() -> None:
             "evidence about Skill Memory's own learned representation, "
             "see skill_memory.evaluation.ml_cl_evaluator's module docstring]"
         )
-
-        if args.eval_method == "ml":
-            evaluator, evaluator_optimizer, evaluator_criterion = new_evaluator()
-            print("Auxiliary evaluator: ML")
-        else:
-            print("Auxiliary evaluator: CL")
+        print("Auxiliary evaluator: ML")
         print("Evaluator training memory: all accumulated classes")
 
         assert evaluator is not None
@@ -402,7 +384,6 @@ def main() -> None:
         "oracle/probe accuracies printed after each training experience "
         "above."
     )
-    print(f"auxiliary_eval_method={args.eval_method}")
     print(f"eval_memory_per_class={args.eval_memory_per_class}")
     print("diagonal_loss:", np.round(diagonal_loss, 4))
     print("diagonal_accuracy:", np.round(diagonal_accuracy, 4))
