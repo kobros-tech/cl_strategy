@@ -1,9 +1,7 @@
 # skill_memory
 
 Class-level, probe-based Skill Memory plugin for [Avalanche](https://avalanche.continualai.org)
-continual learning. See `skill_memory/README.md` for the full design/API
-doc and `skill_memory/README_PERSISTENT_FINGERPRINTS.md` for the optional
-persistent-fingerprint extension.
+continual learning. See `skill_memory/README.md` for the full design/API doc.
 
 ## Install
 
@@ -39,27 +37,48 @@ pre-commit install     # one-time, sets up the git hook
 pre-commit run -a      # run all hooks against the whole repo
 ```
 
-`skill_memory/tests/demo_splitmnist_eval_log.py` writes its eval-log CSV
-under a gitignored `skill_memory/tests/logs/` directory, so it won't trip
-the large-file hook or get committed by accident.
-
 ## Run the unit tests
 
 ```bash
 python -m pytest -q
 ```
 
-## Run the SplitMNIST demo / eval-log script
+## Run the SplitMNIST demo
 
-`skill_memory/tests/demo_splitmnist_eval_log.py` is a runnable demo
-(not a pytest unit test) that trains `SkillMemoryPlugin` on Avalanche's
-SplitMNIST benchmark and prints a per-sample predicted-y-vs-real-y eval log
-after every training step, plus dumps the full log to
-`skill_memory_eval_log.csv`.
+`skill_memory/demos/demo_splitmnist_ml_er.py` is the repo's one demo, and
+what CI runs (see `.github/workflows/demo-splitmnist-ml-er.yml`). Skill
+Memory trains the main model as usual; a completely separate ML or CL
+evaluator is then trained on frozen per-class evaluation memory and
+reports class-level accuracy, loss, and forgetting. The evaluator's
+lifetime (`ml`: a fresh one per experience, `cl`: retained across
+experiences) is the only difference between the two modes - both are
+trained on the full accumulated class memory seen so far, not just the
+latest experience. In practice `cl` has given better results than `ml`,
+and evaluator accuracy/forgetting depend heavily on giving the evaluator
+enough epochs (`--eval-epochs 10` or `20`, not `1`) to actually fit the
+accumulated memory:
 
 ```bash
-python skill_memory/tests/demo_splitmnist_eval_log.py
+python skill_memory/demos/demo_splitmnist_ml_er.py \
+    --n-experiences 5 \
+    --eval-method cl \
+    --eval-memory-per-class 20 \
+    --train-epochs 1 \
+    --eval-epochs 20 \
+    --max-skills 10
 ```
+
+Pass `--skill-eval-routing oracle` (or `probe`/`both`) to additionally
+report Skill Memory's own direct class-oracle/anonymous-routing accuracy,
+independent of the auxiliary ML/CL evaluator - this is what the CI
+workflow uses. Run `--help` for the full flag list.
+
+This demo is a thin script: all the reusable machinery it drives (frozen
+per-class evaluation memory, the independent evaluator's train/evaluate
+loop, and direct Skill Memory oracle/probe evaluation) lives in
+`skill_memory.evaluation.ml_cl_evaluator`, so it's importable and testable
+independent of SplitMNIST or this specific demo - see
+`skill_memory/tests/test_ml_cl_evaluator.py`.
 
 ## Layout
 
@@ -67,18 +86,31 @@ python skill_memory/tests/demo_splitmnist_eval_log.py
 pyproject.toml            # pip-installable package metadata
 requirements.txt          # runtime dependencies
 requirements-dev.txt      # + pytest, for running the test suite
-skill_memory/             # the importable package (`import skill_memory`)
+skill_memory/              # the importable package (`import skill_memory`)
     __init__.py
-    behavior.py
-    decision.py
-    probing.py
-    skill_memory_plugin.py
-    persistent_skill_memory_plugin.py
-    skill_registry.py
-    training.py
+    cl/                     # continual-learning strategy: the plugin, skill
+                            #   registry, and REUSE/SCRATCH decision logic
+        skill_memory_plugin.py
+        persistent_skill_memory_plugin.py
+        decision.py
+        skill_registry.py
+        training.py
+    evaluation/             # anonymous routing, the reverse-engineering
+                            #   model used to identify a class at eval time,
+                            #   and independent ML/CL evaluation
+        fingerprint_routing.py   # public compatibility entry point
+        routing.py
+        reverse_engineering.py
+        behavior.py
+        diagnostics.py
+        global_fingerprint_refresh.py
+        ml_cl_evaluator.py       # independent ML/CL evaluator machinery
+    utils/                  # shared, package-independent helpers
+        probing.py
+        models.py                # SimpleMLP, used by the demo and tests
+    demos/                  # runnable scripts (not pytest tests)
+        demo_splitmnist_ml_er.py
     README.md
-    README_PERSISTENT_FINGERPRINTS.md
     tests/
-        test_*.py                          # existing unit tests (pytest)
-        demo_splitmnist_eval_log.py     # SplitMNIST demo / eval log script
+        test_*.py           # unit tests (pytest)
 ```

@@ -18,10 +18,15 @@ dependencies = [
 dev = ["pytest>=7.0", "ruff>=0.6", "pre-commit>=3.0"]
 
 [tool.setuptools]
-packages = ["skill_memory"]
+packages = [
+    "skill_memory",
+    "skill_memory.cl",
+    "skill_memory.evaluation",
+    "skill_memory.utils",
+]
 
 [tool.setuptools.package-data]
-skill_memory = ["README.md", "README_PERSISTENT_FINGERPRINTS.md"]
+skill_memory = ["README.md"]
 
 [tool.ruff]
 line-length = 88
