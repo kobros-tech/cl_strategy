@@ -7,18 +7,23 @@ Memory training + evaluation-memory capture, the independent evaluator's
 train/evaluate loop, and direct Skill Memory oracle/probe evaluation.
 """
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 from avalanche.benchmarks import nc_benchmark
 from avalanche.training import Naive
 from torch.utils.data import TensorDataset
 
 from skill_memory import SkillMemory
+from skill_memory.cl.skill_registry import ClassRecord
 from skill_memory.evaluation.ml_cl_evaluator import (
     EvaluationMemory,
     EvaluationMemoryPlugin,
     aggregate_experience_metrics,
     build_evaluator,
     compute_class_forgetting,
+    compute_peak_class_forgetting,
     consolidate_evaluation_memory,
     evaluate_model_by_class,
     evaluate_skill_memory,
@@ -80,6 +85,39 @@ def test_make_loader_rejects_empty_memory():
         assert "empty" in str(exc)
     else:
         raise AssertionError("expected RuntimeError for empty memory")
+
+
+def test_forgetting_definitions_diverge_on_a_dip_then_recovery_then_drop():
+    """Worked example: a class that goes 60% (acquisition) -> 90% (later)
+    -> 70% (final).
+
+    Acquisition-relative forgetting (`compute_class_forgetting`) compares
+    only against the acquisition-time accuracy (60%), so a final accuracy
+    of 70% (>= 60%) scores zero forgetting even though the class fell 20
+    points from its peak of 90%. Peak-relative forgetting
+    (`compute_peak_class_forgetting`, the standard continual-learning
+    definition) catches exactly that drop. The two metrics must therefore
+    give different answers on this example - if they ever agree here,
+    one of them has been implemented wrong.
+    """
+    accuracy_history = [
+        {0: 0.60},  # experience 0: class 0 introduced, accuracy on
+        # introduction = 60%
+        {0: 0.90},  # experience 1: class 0's accuracy rises to 90%
+        {0: 0.70},  # experience 2 (final): class 0's accuracy falls to 70%
+    ]
+    class_to_experience = {0: 0}
+
+    acquisition_relative = compute_class_forgetting(
+        accuracy_history, class_to_experience, num_experiences=3
+    )
+    peak_relative = compute_peak_class_forgetting(
+        accuracy_history, class_to_experience, num_experiences=3
+    )
+
+    assert acquisition_relative[0] == 0.0  # 60% -> 70% is not a regression
+    assert peak_relative[0] == pytest.approx(0.20)  # 90% -> 70% is
+    assert acquisition_relative[0] != peak_relative[0]
 
 
 def test_train_evaluator_reduces_loss_on_a_separable_synthetic_problem():
@@ -271,11 +309,70 @@ def test_evaluate_skill_memory_oracle_and_probe_agree_on_a_separable_problem():
         batch_size=16,
         device=torch.device("cpu"),
     )
-    assert len(oracle_accuracy) == len(probe_accuracy) == last_index + 1
+
+    assert set(oracle_accuracy) == set(probe_accuracy) == {0, 1, 2, 3}
+
     # Well-separated synthetic classes with immutable REUSE: every skill
     # keeps recognizing its own class, so oracle routing (the true mapping)
     # must be essentially perfect throughout.
-    assert all(acc > 0.95 for acc in oracle_accuracy)
+    assert all(values["accuracy"] > 0.95 for values in oracle_accuracy.values())
+
+    # Probe routing should recover the same skill choices on this deliberately
+    # easy synthetic benchmark.
+    assert all(
+        probe_accuracy[class_id]["accuracy"] > 0.95 for class_id in oracle_accuracy
+    )
+
+
+def test_skill_memory_evaluation_maps_compact_one_class_head_to_global_class():
+    model = SimpleMLP(input_dim=2, hidden_size=4, num_classes=1)
+    plugin = EvaluationMemoryPlugin(
+        memory=SkillMemory(max_skills=2),
+        eval_routing="none",
+        verbose=False,
+    )
+    plugin.memory.store(0, model.state_dict())
+    plugin.class_map.record(
+        ClassRecord(
+            experience_index=0,
+            class_id=3,
+            decision="SCRATCH",
+            skill=0,
+        )
+    )
+    x = torch.randn(8, 2)
+    y = torch.full((8,), 3, dtype=torch.long)
+    experience = SimpleNamespace(
+        dataset=TensorDataset(x, y),
+        classes_in_this_experience=[3],
+    )
+
+    class_results = evaluate_skill_memory(
+        model,
+        plugin,
+        [experience],
+        0,
+        num_classes=4,
+        routing="oracle",
+        batch_size=4,
+        device=torch.device("cpu"),
+    )
+
+    assert class_results[3]["accuracy"] == 1.0
+
+    probe_accuracy = evaluate_skill_memory(
+        model,
+        plugin,
+        [experience],
+        0,
+        num_classes=4,
+        routing="probe",
+        batch_size=4,
+        device=torch.device("cpu"),
+    )
+
+    assert set(probe_accuracy) == {3}
+    assert probe_accuracy[3]["accuracy"] == 1.0
 
 
 def test_evaluate_skill_memory_restores_model_weights_afterward():

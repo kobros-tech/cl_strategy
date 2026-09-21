@@ -2,14 +2,40 @@
 
 `SkillMemoryPlugin` is responsible only for training the main model: skill
 allocation, REUSE/SCRATCH decisions, per-class training, and skill-state
-storage. This module adds a *separate, auxiliary* way to measure what was
-learned, decoupled from Skill Memory's own routing:
+storage. This module adds two *separate* ways to measure what was learned,
+which are NOT interchangeable and answer different questions:
 
-- `EvaluationMemoryPlugin` records a small frozen sample of each class's
-  data as it's introduced, independent of experience boundaries.
-- An independent evaluator model (any `nn.Module` with a fixed global
-  output head) is trained on the accumulated per-class memory and
-  evaluated class-by-class, with no experience-level class mask.
+1. Direct Skill Memory evaluation (`evaluate_skill_memory`): loads each
+   stored skill's own frozen weights and evaluates them directly, via the
+   true class-to-skill mapping ("oracle") or via anonymous routing
+   ("probe"). This is the only measurement in this module that actually
+   depends on what Skill Memory learned - its stored skill states, and
+   (for "probe") its routing mechanism.
+
+2. The auxiliary ML/CL evaluator (`EvaluationMemoryPlugin`,
+   `train_evaluator`, `evaluate_model_by_class`): a completely separate,
+   freshly-trained model, trained directly on raw retained pixels and
+   labels - not on Skill Memory's weights, features, logits, or
+   predictions in any way. It measures how well *some* independent
+   learner can fit the retained evaluation memory, which is a property of
+   that memory (what got retained, and how much of it) more than of
+   Skill Memory's own learned representation. Any replay-based method
+   given the same retained examples (e.g. ER) could train a comparable
+   evaluator from the same memory. **Do not use this evaluator's
+   accuracy/loss/forgetting as evidence that Skill Memory outperforms a
+   replay baseline** - use `evaluate_skill_memory` for that. This
+   evaluator is still useful as a sanity check on what the retained
+   memory itself contains, and its `ml` vs `cl` lifetime axis (a fresh
+   evaluator per experience vs one retained across experiences, both
+   always trained on the complete accumulated memory - see below) is a
+   genuine, meaningful comparison of evaluator training regimes, just not
+   a Skill-Memory-specific one.
+
+`EvaluationMemoryPlugin` records a small frozen sample of each class's own
+data as it's introduced, independent of experience boundaries. The
+auxiliary evaluator (any `nn.Module` with a fixed global output head) is
+trained on the accumulated per-class memory and evaluated class-by-class,
+with no experience-level class mask.
 
 The evaluator's *lifetime* is the only degree of freedom this module
 exposes: a fresh evaluator per experience ("ML") vs one evaluator retained
@@ -19,9 +45,10 @@ callers choose which by either calling `build_evaluator` once (CL) or
 before every experience (ML); see `skill_memory/demos/demo_splitmnist_ml_er.py`
 for a complete example of both.
 
-`evaluate_skill_memory` is a third, independent measurement: Skill
-Memory's own stored skills, evaluated directly (via the true class-to-skill
-mapping, or via anonymous routing), with no auxiliary evaluator involved.
+This module offers two forgetting metrics with different definitions -
+see `compute_class_forgetting` and `compute_peak_class_forgetting`'s
+docstrings for the distinction and pick the one that matches what you
+intend to report.
 """
 
 from __future__ import annotations
@@ -35,7 +62,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
-from ..utils.probing import apply_skill_state_exact
+from ..utils.probing import apply_skill_state_exact, expand_skill_logits
 from .routing import find_best_routing_skill
 
 
@@ -59,9 +86,12 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
     This class does not implement evaluation itself - `SkillMemoryPlugin`
     remains responsible for skill allocation, REUSE/SCRATCH decisions,
     training, and skill-state storage. This subclass only additionally
-    records a bounded, deterministic sample of every class's own data as
-    each training experience introduces it, for later use by
-    `train_evaluator`/`evaluate_model_by_class`.
+    records a bounded, deterministic sample of every class's own raw data
+    (pixels and labels, not anything derived from what Skill Memory
+    learned) as each training experience introduces it, for later use by
+    `train_evaluator`/`evaluate_model_by_class` - see this module's
+    docstring for why that auxiliary evaluator is not itself a measure of
+    Skill Memory's learned representation.
     """
 
     def __init__(
@@ -197,7 +227,13 @@ def train_evaluator(
     device: torch.device,
     seed: int,
 ) -> None:
-    """Train an evaluator exclusively from accumulated class memory."""
+    """Train an auxiliary evaluator directly on raw retained pixels/labels.
+
+    `model` receives no input derived from Skill Memory (no weights,
+    features, or predictions) - see this module's docstring for why this
+    evaluator's results are not evidence about Skill Memory's own learned
+    representation.
+    """
     if not memory:
         raise RuntimeError("Cannot train evaluator with empty memory.")
     if epochs < 1:
@@ -223,9 +259,12 @@ def evaluate_model_by_class(
     batch_size: int,
     device: torch.device,
 ) -> dict[int, dict[str, float]]:
-    """Evaluate every class seen up to `up_to_index`, independently.
+    """Evaluate the auxiliary evaluator on every class seen up to `up_to_index`.
 
-    The model always uses its complete, fixed output space - no
+    `model` should be a model previously trained by `train_evaluator` (not
+    Skill Memory's own model) - see this module's docstring for why this
+    is a measurement of the auxiliary evaluator, not of Skill Memory. The
+    model always uses its complete, fixed output space - no
     experience-level prediction mask or task label is supplied.
     """
     model.eval()
@@ -310,11 +349,23 @@ def compute_class_forgetting(
     class_to_experience: dict[int, int],
     num_experiences: int,
 ) -> np.ndarray:
-    """Compute forgetting independently for every class.
+    """Compute acquisition-relative forgetting independently for every class.
 
     Each class's reference point is its own accuracy immediately after the
-    experience that introduced it; the result is then averaged over
-    classes grouped by their introducing experience.
+    experience that introduced it (not its peak accuracy at any later
+    point); the result is then averaged over classes grouped by their
+    introducing experience.
+
+    This is *not* the standard continual-learning forgetting metric, which
+    compares against a class's best-ever accuracy rather than its
+    accuracy at introduction - see `compute_peak_class_forgetting` for
+    that. Concretely, a class that goes 60% (acquisition) -> 90% (later) ->
+    70% (final) scores 0 forgetting here (final >= acquisition), even
+    though it dropped 20 points from its peak of 90%. Use this function
+    only when "did the class end up worse than when it was first learned"
+    is genuinely the question being asked; use `compute_peak_class_forgetting`
+    when reporting forgetting as commonly defined in the continual-learning
+    literature (e.g. for a Skill-Memory-vs-ER comparison).
     """
     forgetting_by_experience: list[list[float]] = [[] for _ in range(num_experiences)]
     all_classes = sorted(
@@ -338,6 +389,48 @@ def compute_class_forgetting(
     return result
 
 
+def compute_peak_class_forgetting(
+    accuracy_history: list[dict[int, float]],
+    class_to_experience: dict[int, int],
+    num_experiences: int,
+) -> np.ndarray:
+    """Compute peak-relative forgetting: the standard CL forgetting metric.
+
+    Each class's reference point is the *highest* accuracy ever recorded
+    for it at any point after its introduction (not just at introduction
+    itself, unlike `compute_class_forgetting`); the result is then
+    averaged over classes grouped by their introducing experience. This
+    matches the usual continual-learning definition of forgetting (e.g.
+    Chaudhry et al. 2018's backward transfer): a class that goes 60%
+    (acquisition) -> 90% (later) -> 70% (final) scores `90 - 70 = 20`
+    points of forgetting here, versus 0 under `compute_class_forgetting`.
+    """
+    forgetting_by_experience: list[list[float]] = [[] for _ in range(num_experiences)]
+    all_classes = sorted(
+        {class_id for history in accuracy_history for class_id in history}
+    )
+    for class_id in all_classes:
+        introduction = class_to_experience[class_id]
+        if introduction >= len(accuracy_history):
+            continue
+        final_accuracy = accuracy_history[-1].get(class_id)
+        if final_accuracy is None:
+            continue
+        peak_accuracy = max(
+            history[class_id]
+            for history in accuracy_history[introduction:]
+            if class_id in history
+        )
+        forgetting = max(0.0, peak_accuracy - final_accuracy)
+        forgetting_by_experience[introduction].append(forgetting)
+
+    result = np.zeros(num_experiences, dtype=np.float64)
+    for experience_index, values in enumerate(forgetting_by_experience):
+        if values:
+            result[experience_index] = float(np.mean(values))
+    return result
+
+
 def evaluate_skill_memory(
     model: nn.Module,
     plugin: SkillMemoryPlugin,
@@ -348,21 +441,31 @@ def evaluate_skill_memory(
     routing: str,
     batch_size: int,
     device: torch.device,
-) -> list[float]:
-    """Evaluate the actual stored Skill Memory states, per experience.
+) -> dict[int, dict[str, float]]:
+    """Evaluate stored Skill Memory states and return class-level metrics.
 
-    Deliberately independent from any auxiliary ML/CL evaluator: this
-    reuses `model`'s architecture only as scratch space to load each
-    stored skill's own frozen weights into, restoring `model`'s original
-    weights afterward. `routing="oracle"` uses the true class-to-skill
-    mapping; `routing="probe"` uses anonymous routing
-    (`find_best_routing_skill`).
+    This is the primary Skill Memory evaluation path. "oracle" uses the
+    true class-to-skill mapping; "probe" selects a skill from the input
+    alone. Both modes evaluate the selected frozen skill in the complete
+    global class space, so compact one-class or multi-class heads are mapped
+    back to their owned global class IDs before accuracy/loss is computed.
+
+    The returned dictionary contains every class present in test experiences
+    0..up_to_index. Experience IDs are retained only as reporting metadata;
+    they never restrict the prediction space.
     """
     if not plugin.memory:
         raise RuntimeError("Cannot evaluate Skill Memory before any skill exists.")
+    if routing not in ("oracle", "probe"):
+        raise ValueError(f"Unknown Skill Memory routing mode: {routing}")
+
     slot_ids = sorted(plugin.memory.slots())
     skill_states = [plugin.memory.state(slot) for slot in slot_ids]
-    accuracies: list[float] = []
+    class_correct: dict[int, int] = {}
+    class_total: dict[int, int] = {}
+    class_loss: dict[int, float] = {}
+    class_experience: dict[int, int] = {}
+
     original_state = {
         name: value.detach().clone() for name, value in model.state_dict().items()
     }
@@ -374,8 +477,9 @@ def evaluate_skill_memory(
             loader = DataLoader(
                 experience.dataset, batch_size=batch_size, shuffle=False
             )
-            correct = 0
-            total = 0
+            for class_id in experience.classes_in_this_experience:
+                class_experience[int(class_id)] = experience_index
+
             for batch in loader:
                 inputs = batch[0].to(device)
                 labels = batch[1].to(device)
@@ -385,7 +489,7 @@ def evaluate_skill_memory(
                         inputs.shape[0], num_classes, device=device
                     )
                     rows_by_skill: dict[int, list[int]] = {}
-                    for row, label in enumerate(labels.tolist()):
+                    for row, label in enumerate(labels.detach().cpu().tolist()):
                         skill = plugin.class_map.find_skill_for_class_anywhere(
                             int(label)
                         )
@@ -394,37 +498,75 @@ def evaluate_skill_memory(
                                 f"No canonical skill recorded for class {label}."
                             )
                         rows_by_skill.setdefault(int(skill), []).append(row)
+
                     for skill, rows in rows_by_skill.items():
-                        apply_skill_state_exact(model, plugin.memory.state(skill))
+                        state = plugin.memory.state(skill)
                         row_tensor = torch.tensor(rows, device=device)
-                        chosen_logits[row_tensor] = model(inputs[row_tensor])
-                elif routing == "probe":
+                        apply_skill_state_exact(model, state)
+                        raw_logits = model(inputs[row_tensor])
+                        chosen_logits[row_tensor] = expand_skill_logits(
+                            raw_logits,
+                            state,
+                            plugin.class_map.classes_for_skill(skill),
+                            num_classes,
+                        )
+                else:
                     raw_logits = []
                     for state in skill_states:
                         apply_skill_state_exact(model, state)
                         raw_logits.append(model(inputs))
+
                     routing_result = find_best_routing_skill(
                         raw_logits,
                         skill_states,
                         [plugin.class_map.classes_for_skill(slot) for slot in slot_ids],
                     )
                     chosen = routing_result.skill_indices
-                    stacked = torch.stack(raw_logits, dim=0)
+                    expanded_by_skill = [
+                        expand_skill_logits(
+                            logits,
+                            state,
+                            plugin.class_map.classes_for_skill(slot),
+                            num_classes,
+                        )
+                        for slot, state, logits in zip(
+                            slot_ids, skill_states, raw_logits, strict=False
+                        )
+                    ]
+                    stacked = torch.stack(expanded_by_skill, dim=0)
                     rows = torch.arange(inputs.shape[0], device=device)
                     chosen_logits = stacked[chosen, rows]
-                else:
-                    raise ValueError(f"Unknown Skill Memory routing mode: {routing}")
 
-                correct += int((chosen_logits.argmax(dim=1) == labels).sum().item())
-                total += int(labels.numel())
-
-            if total == 0:
-                raise RuntimeError(f"Test experience {experience_index} is empty.")
-            accuracies.append(correct / total)
+                per_sample_loss = nn.functional.cross_entropy(
+                    chosen_logits, labels, reduction="none"
+                )
+                predictions = chosen_logits.argmax(dim=1)
+                for class_id in torch.unique(labels).tolist():
+                    class_id = int(class_id)
+                    mask = labels == class_id
+                    class_loss[class_id] = class_loss.get(class_id, 0.0) + float(
+                        per_sample_loss[mask].sum().item()
+                    )
+                    class_correct[class_id] = class_correct.get(class_id, 0) + int(
+                        (predictions[mask] == labels[mask]).sum().item()
+                    )
+                    class_total[class_id] = class_total.get(class_id, 0) + int(
+                        mask.sum().item()
+                    )
     finally:
         apply_skill_state_exact(model, original_state)
 
-    return accuracies
+    results: dict[int, dict[str, float]] = {}
+    for class_id in sorted(class_total):
+        total = class_total[class_id]
+        if total == 0:
+            raise RuntimeError(f"Class {class_id} has no test samples.")
+        results[class_id] = {
+            "loss": class_loss[class_id] / total,
+            "accuracy": class_correct[class_id] / total,
+            "experience": float(class_experience[class_id]),
+        }
+    return results
 
 
 def build_evaluator(

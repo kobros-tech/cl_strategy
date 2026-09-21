@@ -63,6 +63,7 @@ from skill_memory.evaluation.ml_cl_evaluator import (
     aggregate_experience_metrics,
     build_evaluator,
     compute_class_forgetting,
+    compute_peak_class_forgetting,
     consolidate_evaluation_memory,
     evaluate_model_by_class,
     evaluate_skill_memory,
@@ -201,10 +202,14 @@ def main() -> None:
     # ================================================================
     # Independent evaluation learner
     #
-    # ML:  replaced with a fresh evaluator every step.
+    # ML: a fresh evaluator is created every step.
     # CL:  same evaluator persists across steps.
     # Both receive the accumulated class memory.
     # ================================================================
+    skill_accuracy_history: dict[str, list[dict[int, float]]] = {
+        "oracle": [],
+        "probe": [],
+    }
 
     def new_evaluator():
         return build_evaluator(
@@ -229,44 +234,30 @@ def main() -> None:
         # Actual Skill Memory training.
         strategy.train(train_exp)
 
-        # Direct Skill Memory diagnostic - NOT the auxiliary ML/CL evaluator.
         if args.skill_eval_routing != "none":
-            print()
-            print("Direct Skill Memory evaluation (actual stored skills):")
-            if args.skill_eval_routing in ("oracle", "both"):
-                oracle_accuracy = evaluate_skill_memory(
+            routings = (
+                ("oracle", "probe")
+                if args.skill_eval_routing == "both"
+                else (args.skill_eval_routing,)
+            )
+
+            for routing in routings:
+                class_results = evaluate_skill_memory(
                     model,
                     skill_memory_plugin,
                     benchmark.test_stream,
                     train_index,
                     num_classes=NUM_CLASSES,
-                    routing="oracle",
+                    routing=routing,
                     batch_size=args.eval_batch_size,
                     device=device,
                 )
-                print(
-                    "  class_oracle_accuracy="
-                    + ", ".join(
-                        f"Exp{i}={value:.4f}" for i, value in enumerate(oracle_accuracy)
-                    )
-                )
-            if args.skill_eval_routing in ("probe", "both"):
-                probe_accuracy = evaluate_skill_memory(
-                    model,
-                    skill_memory_plugin,
-                    benchmark.test_stream,
-                    train_index,
-                    num_classes=NUM_CLASSES,
-                    routing="probe",
-                    batch_size=args.eval_batch_size,
-                    device=device,
-                )
-                print(
-                    "  probe_accuracy="
-                    + ", ".join(
-                        f"Exp{i}={value:.4f}" for i, value in enumerate(probe_accuracy)
-                    )
-                )
+
+                current_accuracy = {
+                    class_id: values["accuracy"]
+                    for class_id, values in class_results.items()
+                }
+                skill_accuracy_history[routing].append(current_accuracy)
 
         # Evaluation memory must exist for every trained experience.
         if len(skill_memory_plugin.eval_memory) == 0:
@@ -287,6 +278,12 @@ def main() -> None:
         # Auxiliary evaluation.
         print()
         print(f"========== Evaluation after experience {train_index} ==========")
+        print(
+            "  [auxiliary evaluator only - trained on raw retained pixels, "
+            "NOT on Skill Memory's weights/features/predictions; not "
+            "evidence about Skill Memory's own learned representation, "
+            "see skill_memory.evaluation.ml_cl_evaluator's module docstring]"
+        )
 
         if args.eval_method == "ml":
             evaluator, evaluator_optimizer, evaluator_criterion = new_evaluator()
@@ -378,6 +375,9 @@ def main() -> None:
     forgetting = compute_class_forgetting(
         accuracy_history, class_to_experience, len(benchmark.train_stream)
     )
+    peak_forgetting = compute_peak_class_forgetting(
+        accuracy_history, class_to_experience, len(benchmark.train_stream)
+    )
     diagonal_accuracy = np.asarray(diagonal_accuracy_history, dtype=np.float64)
     diagonal_loss = np.asarray(diagonal_loss_history, dtype=np.float64)
     final_accuracy = np.asarray(
@@ -392,17 +392,62 @@ def main() -> None:
     print()
     print("=== Summary ===")
     print("training_method=SkillMemory")
+    print(
+        "NOTE: the auxiliary_* / diagonal_* / final_class_* / "
+        "*_forgetting figures below all come from the AUXILIARY ML/CL "
+        "evaluator (trained on raw retained pixels, not on Skill Memory's "
+        "learned representation) - they are not evidence for or against "
+        "Skill Memory itself. For that, use the "
+        "'Direct Skill Memory evaluation (actual stored skills)' "
+        "oracle/probe accuracies printed after each training experience "
+        "above."
+    )
     print(f"auxiliary_eval_method={args.eval_method}")
     print(f"eval_memory_per_class={args.eval_memory_per_class}")
     print("diagonal_loss:", np.round(diagonal_loss, 4))
     print("diagonal_accuracy:", np.round(diagonal_accuracy, 4))
     print("final_class_loss:", np.round(final_loss, 4))
     print("final_class_accuracy:", np.round(final_accuracy, 4))
-    print("class_forgetting_by_introducing_experience:", np.round(forgetting, 4))
+    print(
+        "class_forgetting_by_introducing_experience (acquisition-relative):",
+        np.round(forgetting, 4),
+    )
+    print(
+        "class_forgetting_by_introducing_experience (peak-relative, standard CL "
+        "definition):",
+        np.round(peak_forgetting, 4),
+    )
     print(f"mean_diagonal_loss={diagonal_loss.mean():.4f}")
     print(f"mean_auxiliary_diagonal_accuracy={diagonal_accuracy.mean():.4f}")
     print(f"mean_auxiliary_final_accuracy={final_accuracy.mean():.4f}")
-    print(f"mean_class_forgetting={forgetting.mean():.4f}")
+    print(f"mean_class_forgetting_acquisition_relative={forgetting.mean():.4f}")
+    print(f"mean_class_forgetting_peak_relative={peak_forgetting.mean():.4f}")
+
+    skill_peak_forgetting = {
+        routing: compute_peak_class_forgetting(
+            history,
+            class_to_experience,
+            len(benchmark.train_stream),
+        )
+        for routing, history in skill_accuracy_history.items()
+        if history
+    }
+
+    print("Primary Skill Memory metrics (actual stored skills):")
+    for routing, history in skill_accuracy_history.items():
+        if not history:
+            continue
+
+        final = history[-1]
+        values = np.asarray(list(final.values()), dtype=np.float64)
+        forgetting = skill_peak_forgetting[routing]
+
+        print(f"skill_memory_{routing}_final_class_accuracy={values.mean():.4f}")
+        print(
+            f"skill_memory_{routing}_peak_forgetting_by_introducing_experience=",
+            np.round(forgetting, 4),
+        )
+        print(f"mean_skill_memory_{routing}_peak_forgetting={forgetting.mean():.4f}")
 
 
 if __name__ == "__main__":
