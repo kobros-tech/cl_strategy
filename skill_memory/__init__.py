@@ -29,6 +29,7 @@ from .evaluation.ml_cl_evaluator import (
 )
 from .evaluation.reverse_engineering import CandidateParameters, NormalMLReverseEngineer
 from .evaluation.routing import RoutingResult, find_best_routing_skill
+from .strategy import SkillMemoryStrategy
 from .utils.models import SimpleMLP
 
 __all__ = [
@@ -62,4 +63,5 @@ __all__ = [
     "find_best_routing_skill",
     "find_best_skill",
     "train_evaluator",
+    "SkillMemoryStrategy",
 ]

@@ -1,50 +1,15 @@
-"""SplitMNIST Skill Memory training with independent ML/CL evaluation.
+"""SplitMNIST Skill Memory experiment with ML evaluation.
 
-Skill Memory is responsible only for training the main model.
+The public SkillMemoryStrategy owns the complete experiment lifecycle:
 
-After every Skill Memory training experience, this demo stores a small frozen
-evaluation memory for each class introduced by that experience.
+* Skill Memory training
+* frozen per-class evaluation memory
+* independent ML evaluator training
+* class-level evaluation
+* accuracy/loss tracking
+* forgetting metrics
 
-A completely separate evaluator is then used to measure evaluation-time
-ML/CL behavior.
-
-The evaluator is deliberately class-dependent rather than experience-
-dependent:
-
-    ML:
-        a fresh evaluator is created after every experience, but it is trained
-        on the complete accumulated class memory seen so far.
-
-    CL:
-        one evaluator is retained across experiences and is trained on the
-        complete accumulated class memory seen so far.
-
-The important distinction between ML and CL is therefore the lifetime of the
-evaluator, not whether it receives only the latest experience.
-
-Evaluation never receives an experience-level class oracle. The evaluator
-always uses the fixed global 10-class output head, and each class is evaluated
-independently.
-
-Experience boundaries are used only for reporting which classes were
-introduced at each step.
-
-The demo also optionally reports direct Skill Memory evaluation:
-
-    oracle:
-        the true class -> skill mapping is supplied.
-
-    probe:
-        the anonymous routing mechanism must select the skill.
-
-These direct Skill Memory measurements are kept separate from the auxiliary
-ML/CL evaluator measurements.
-
-All of the reusable machinery this demo drives (the frozen per-class
-evaluation memory, the independent evaluator's train/evaluate loop, and
-direct Skill Memory oracle/probe evaluation) lives in
-`skill_memory.evaluation.ml_cl_evaluator`; this script only wires it up
-against SplitMNIST, parses CLI flags, and prints results.
+The demo only configures SplitMNIST and the strategy, then reports results.
 """
 
 from __future__ import annotations
@@ -53,33 +18,16 @@ import argparse
 
 import numpy as np
 import torch
-import torch.nn as nn
 from avalanche.benchmarks.classic import SplitMNIST
-from avalanche.training import Naive
+from torch import nn
 
-from skill_memory.cl.skill_registry import SkillMemory
-from skill_memory.evaluation.ml_cl_evaluator import (
-    EvaluationMemoryPlugin,
-    aggregate_experience_metrics,
-    build_evaluator,
-    compute_class_forgetting,
-    compute_peak_class_forgetting,
-    consolidate_evaluation_memory,
-    evaluate_model_by_class,
-    evaluate_skill_memory,
-    train_evaluator,
-)
+from skill_memory import SkillMemoryStrategy
 from skill_memory.utils.models import SimpleMLP
-
-NUM_CLASSES = 10  # SplitMNIST's fixed global class count.
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Train Skill Memory on SplitMNIST and evaluate its learned "
-            "knowledge using independent ML/CL evaluation learners."
-        )
+        description="Train and evaluate Skill Memory on SplitMNIST."
     )
     parser.add_argument("--dataset-root", default="data")
     parser.add_argument("--download-only", action="store_true")
@@ -94,7 +42,7 @@ def parse_args() -> argparse.Namespace:
         "--eval-epochs",
         type=int,
         default=1,
-        help="Number of epochs used by the independent evaluator.",
+        help="Number of epochs used by the independent ML evaluator.",
     )
     parser.add_argument("--train-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -108,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         choices=("oracle", "probe", "both", "none"),
         default="both",
         help=(
-            "Direct Skill Memory diagnostic. 'oracle' uses the true "
+            "Direct Skill Memory evaluation. 'oracle' uses the true "
             "class-to-skill mapping; 'probe' uses anonymous routing; "
             "'both' runs both; 'none' disables direct Skill Memory "
             "evaluation."
@@ -148,287 +96,143 @@ def main() -> None:
         print(f"SplitMNIST dataset prepared at {args.dataset_root}")
         return
 
-    # ================================================================
-    # Class -> introducing experience mapping.
+    # ------------------------------------------------------------------
+    # Main Skill Memory model.
+    # ------------------------------------------------------------------
+
+    model = SimpleMLP(num_classes=10).to(device)
+
+    # ------------------------------------------------------------------
+    # One high-level object owns both:
     #
-    # This mapping is used ONLY for reporting. It is never used to
-    # restrict predictions or choose evaluator training data.
-    # ================================================================
+    #   1. Skill Memory training
+    #   2. independent ML evaluation
+    #
+    # The demo does not need to know about SkillMemoryPlugin,
+    # EvaluationMemoryPlugin, Naive, evaluator optimizers, etc.
+    # ------------------------------------------------------------------
 
-    class_to_experience: dict[int, int] = {}
-    for experience_index, experience in enumerate(benchmark.train_stream):
-        for class_id in experience.classes_in_this_experience:
-            class_to_experience[int(class_id)] = experience_index
-
-    # ================================================================
-    # Skill Memory training model
-    # ================================================================
-
-    model = SimpleMLP(num_classes=NUM_CLASSES).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
-    criterion = nn.CrossEntropyLoss()
-
-    skill_memory_plugin = EvaluationMemoryPlugin(
-        memory=SkillMemory(max_skills=args.max_skills),
-        eval_routing="none",
-        eval_memory_per_class=args.eval_memory_per_class,
-        eval_memory_seed=args.seed,
-        verbose=True,
-    )
-
-    strategy = Naive(
+    strategy = SkillMemoryStrategy(
         model=model,
-        optimizer=optimizer,
-        criterion=criterion,
+        optimizer=torch.optim.SGD(
+            model.parameters(),
+            lr=args.learning_rate,
+        ),
+        criterion=nn.CrossEntropyLoss(),
+        train_stream=benchmark.train_stream,
+        test_stream=benchmark.test_stream,
+        max_skills=args.max_skills,
         train_mb_size=args.batch_size,
         train_epochs=args.train_epochs,
         eval_mb_size=args.eval_batch_size,
+        evaluator_model_factory=lambda: SimpleMLP(num_classes=10),
+        eval_memory_per_class=args.eval_memory_per_class,
+        eval_epochs=args.eval_epochs,
+        eval_learning_rate=args.eval_learning_rate,
+        skill_eval_routing=args.skill_eval_routing,
+        probe_seed=args.seed,
         device=device,
-        plugins=[skill_memory_plugin],
+        verbose=True,
     )
 
-    # ================================================================
-    # Independent evaluation learner
-    #
-    # ML: a fresh evaluator is created every step.
-    # CL:  same evaluator persists across steps.
-    # Both receive the accumulated class memory.
-    # ================================================================
-    skill_accuracy_history: dict[str, list[dict[int, float]]] = {
-        "oracle": [],
-        "probe": [],
-    }
+    # ------------------------------------------------------------------
+    # Complete experiment.
+    # ------------------------------------------------------------------
 
-    def new_evaluator():
-        return build_evaluator(
-            lambda: SimpleMLP(num_classes=NUM_CLASSES),
-            device=device,
-            learning_rate=args.eval_learning_rate,
-        )
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
 
-    evaluator = evaluator_optimizer = evaluator_criterion = None
-    evaluator, evaluator_optimizer, evaluator_criterion = new_evaluator()
+    # ------------------------------------------------------------------
+    # Final results.
+    # ------------------------------------------------------------------
 
-    accuracy_history: list[dict[int, float]] = []
-    loss_history: list[dict[int, float]] = []
-    diagonal_accuracy_history: list[float] = []
-    diagonal_loss_history: list[float] = []
-
-    for train_index, train_exp in enumerate(benchmark.train_stream):
-        print()
-        print(f"========== Training experience {train_index} ==========")
-
-        # Actual Skill Memory training.
-        strategy.train(train_exp)
-
-        if args.skill_eval_routing != "none":
-            routings = (
-                ("oracle", "probe")
-                if args.skill_eval_routing == "both"
-                else (args.skill_eval_routing,)
-            )
-
-            for routing in routings:
-                class_results = evaluate_skill_memory(
-                    model,
-                    skill_memory_plugin,
-                    benchmark.test_stream,
-                    train_index,
-                    num_classes=NUM_CLASSES,
-                    routing=routing,
-                    batch_size=args.eval_batch_size,
-                    device=device,
-                )
-
-                current_accuracy = {
-                    class_id: values["accuracy"]
-                    for class_id, values in class_results.items()
-                }
-                skill_accuracy_history[routing].append(current_accuracy)
-
-        # Evaluation memory must exist for every trained experience.
-        if len(skill_memory_plugin.eval_memory) == 0:
-            raise RuntimeError("Evaluation memory is empty.")
-
-        # Consolidate all evaluation memories into one class-level memory.
-        # Experience boundaries are intentionally removed from the
-        # evaluator's training unit.
-        accumulated_memory = consolidate_evaluation_memory(
-            skill_memory_plugin.eval_memory
-        )
-        accumulated_classes = [memory.class_id for memory in accumulated_memory]
-        print()
-        print("Accumulated evaluation memory:")
-        print(f"  classes={accumulated_classes}")
-        print(f"  samples={sum(memory.size for memory in accumulated_memory)}")
-
-        # Auxiliary evaluation.
-        print()
-        print(f"========== Evaluation after experience {train_index} ==========")
-        print(
-            "  [auxiliary evaluator only - trained on raw retained pixels, "
-            "NOT on Skill Memory's weights/features/predictions; not "
-            "evidence about Skill Memory's own learned representation, "
-            "see skill_memory.evaluation.ml_cl_evaluator's module docstring]"
-        )
-        print("Auxiliary evaluator: ML")
-        print("Evaluator training memory: all accumulated classes")
-
-        assert evaluator is not None
-        assert evaluator_optimizer is not None
-        assert evaluator_criterion is not None
-
-        train_evaluator(
-            evaluator,
-            evaluator_optimizer,
-            evaluator_criterion,
-            accumulated_memory,
-            batch_size=args.eval_batch_size,
-            epochs=args.eval_epochs,
-            device=device,
-            seed=args.seed + train_index,
-        )
-
-        # Evaluate globally, class by class - deliberately NO
-        # experience-based class mask.
-        class_results = evaluate_model_by_class(
-            evaluator,
-            benchmark.test_stream,
-            train_index,
-            batch_size=args.eval_batch_size,
-            device=device,
-        )
-        losses, accuracies = aggregate_experience_metrics(
-            class_results, benchmark.test_stream, train_index
-        )
-
-        current_accuracy = {
-            class_id: values["accuracy"] for class_id, values in class_results.items()
-        }
-        current_loss = {
-            class_id: values["loss"] for class_id, values in class_results.items()
-        }
-        accuracy_history.append(current_accuracy)
-        loss_history.append(current_loss)
-
-        current_classes = sorted(
-            int(class_id) for class_id in train_exp.classes_in_this_experience
-        )
-        diagonal_accuracy = float(
-            np.mean([current_accuracy[class_id] for class_id in current_classes])
-        )
-        diagonal_loss = float(
-            np.mean([current_loss[class_id] for class_id in current_classes])
-        )
-        diagonal_accuracy_history.append(diagonal_accuracy)
-        diagonal_loss_history.append(diagonal_loss)
-
-        print(f"Step {train_index}: classes={current_classes}")
-        print(
-            "  class_accuracy="
-            + ", ".join(
-                f"class{class_id}={current_accuracy[class_id]:.4f}"
-                for class_id in sorted(current_accuracy)
-            )
-        )
-        print(
-            "  class_loss="
-            + ", ".join(
-                f"class{class_id}={current_loss[class_id]:.4f}"
-                for class_id in sorted(current_loss)
-            )
-        )
-        print(
-            "  experience_accuracy="
-            + ", ".join(f"Exp{i}={value:.4f}" for i, value in enumerate(accuracies))
-        )
-        print(
-            "  experience_loss="
-            + ", ".join(f"Exp{i}={value:.4f}" for i, value in enumerate(losses))
-        )
-        print(f"  diagonal_accuracy={diagonal_accuracy:.4f}")
-
-    # ================================================================
-    # Final class-level summary
-    # ================================================================
-
-    final_class_accuracy = accuracy_history[-1]
-    final_class_loss = loss_history[-1]
-    forgetting = compute_class_forgetting(
-        accuracy_history, class_to_experience, len(benchmark.train_stream)
-    )
-    peak_forgetting = compute_peak_class_forgetting(
-        accuracy_history, class_to_experience, len(benchmark.train_stream)
-    )
-    diagonal_accuracy = np.asarray(diagonal_accuracy_history, dtype=np.float64)
-    diagonal_loss = np.asarray(diagonal_loss_history, dtype=np.float64)
-    final_accuracy = np.asarray(
-        [final_class_accuracy[class_id] for class_id in sorted(final_class_accuracy)],
-        dtype=np.float64,
-    )
-    final_loss = np.asarray(
-        [final_class_loss[class_id] for class_id in sorted(final_class_loss)],
-        dtype=np.float64,
-    )
+    results = strategy.results()
 
     print()
     print("=== Summary ===")
-    print("training_method=SkillMemory")
     print(
-        "NOTE: the auxiliary_* / diagonal_* / final_class_* / "
-        "*_forgetting figures below all come from the AUXILIARY ML/CL "
-        "evaluator (trained on raw retained pixels, not on Skill Memory's "
-        "learned representation) - they are not evidence for or against "
-        "Skill Memory itself. For that, use the "
-        "'Direct Skill Memory evaluation (actual stored skills)' "
-        "oracle/probe accuracies printed after each training experience "
-        "above."
-    )
-    print(f"eval_memory_per_class={args.eval_memory_per_class}")
-    print("diagonal_loss:", np.round(diagonal_loss, 4))
-    print("diagonal_accuracy:", np.round(diagonal_accuracy, 4))
-    print("final_class_loss:", np.round(final_loss, 4))
-    print("final_class_accuracy:", np.round(final_accuracy, 4))
-    print(
-        "class_forgetting_by_introducing_experience (acquisition-relative):",
-        np.round(forgetting, 4),
+        "diagonal_loss:",
+        np.round(results["diagonal_loss"], 4),
     )
     print(
-        "class_forgetting_by_introducing_experience (peak-relative, standard CL "
-        "definition):",
-        np.round(peak_forgetting, 4),
+        "diagonal_accuracy:",
+        np.round(results["diagonal_accuracy"], 4),
     )
-    print(f"mean_diagonal_loss={diagonal_loss.mean():.4f}")
-    print(f"mean_auxiliary_diagonal_accuracy={diagonal_accuracy.mean():.4f}")
-    print(f"mean_auxiliary_final_accuracy={final_accuracy.mean():.4f}")
-    print(f"mean_class_forgetting_acquisition_relative={forgetting.mean():.4f}")
-    print(f"mean_class_forgetting_peak_relative={peak_forgetting.mean():.4f}")
+    print("final_class_loss:")
 
-    skill_peak_forgetting = {
-        routing: compute_peak_class_forgetting(
-            history,
-            class_to_experience,
-            len(benchmark.train_stream),
-        )
-        for routing, history in skill_accuracy_history.items()
-        if history
-    }
+    for class_id, loss in sorted(results["final_class_loss"].items()):
+        print(f"  class {class_id}: {loss:.4f}")
 
-    print("Primary Skill Memory metrics (actual stored skills):")
-    for routing, history in skill_accuracy_history.items():
-        if not history:
+    print("final_class_accuracy:")
+
+    for class_id, accuracy in sorted(results["final_class_accuracy"].items()):
+        print(f"  class {class_id}: {accuracy:.4f}")
+
+    print(
+        "class_forgetting_by_introducing_experience:",
+        np.round(
+            results["class_forgetting_acquisition_relative"],
+            4,
+        ),
+    )
+    print(
+        "class_forgetting_peak_relative:",
+        np.round(
+            results["class_forgetting_peak_relative"],
+            4,
+        ),
+    )
+    print(f"mean_diagonal_loss={results['mean_diagonal_loss']:.4f}")
+    print(f"mean_auxiliary_diagonal_accuracy={results['mean_diagonal_accuracy']:.4f}")
+    print(f"mean_auxiliary_final_accuracy={results['mean_final_accuracy']:.4f}")
+    print(
+        "mean_class_forgetting_acquisition_relative="
+        f"{results['mean_class_forgetting_acquisition_relative']:.4f}"
+    )
+    print(
+        "mean_class_forgetting_peak_relative="
+        f"{results['mean_class_forgetting_peak_relative']:.4f}"
+    )
+
+    # Direct Skill Memory metrics.
+    skill_results = results.get("skill_memory", {})
+
+    for routing in ("oracle", "probe"):
+        if routing not in skill_results:
             continue
 
-        final = history[-1]
-        values = np.asarray(list(final.values()), dtype=np.float64)
-        forgetting = skill_peak_forgetting[routing]
+        skill_result = skill_results[routing]
 
-        print(f"skill_memory_{routing}_final_class_accuracy={values.mean():.4f}")
+        print()
+        print(f"Primary Skill Memory metrics ({routing}):")
         print(
-            f"skill_memory_{routing}_peak_forgetting_by_introducing_experience=",
-            np.round(forgetting, 4),
+            f"skill_memory_{routing}_final_class_accuracy="
+            f"{skill_result['mean_final_accuracy']:.4f}"
         )
-        print(f"mean_skill_memory_{routing}_peak_forgetting={forgetting.mean():.4f}")
+        print(
+            f"mean_skill_memory_{routing}_peak_forgetting="
+            f"{skill_result['mean_peak_forgetting']:.4f}"
+        )
+
+    # Direct Skill Memory metrics.
+    for routing in ("oracle", "probe"):
+        key = f"skill_memory_{routing}"
+
+        if key not in results:
+            continue
+
+        skill_result = results[key]
+
+        print()
+        print(f"Primary Skill Memory metrics ({routing}):")
+        print(
+            f"skill_memory_{routing}_final_class_accuracy="
+            f"{skill_result['final_class_accuracy']:.4f}"
+        )
+        print(
+            f"mean_skill_memory_{routing}_peak_forgetting="
+            f"{skill_result['mean_peak_forgetting']:.4f}"
+        )
 
 
 if __name__ == "__main__":
