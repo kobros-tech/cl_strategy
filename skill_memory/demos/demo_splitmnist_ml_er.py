@@ -54,12 +54,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skill-eval-routing",
         choices=("oracle", "probe", "both", "none"),
-        default="both",
+        default="none",
         help=(
             "Direct Skill Memory evaluation. 'oracle' uses the true "
             "class-to-skill mapping; 'probe' uses anonymous routing; "
             "'both' runs both; 'none' disables direct Skill Memory "
             "evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--eval-frequency",
+        choices=("every_experience", "final", "none"),
+        default="final",
+        help=(
+            "Evaluation schedule. 'final' evaluates once after all training; "
+            "'every_experience' evaluates after each experience; "
+            "'none' disables evaluation."
         ),
     )
     return parser.parse_args()
@@ -130,6 +140,7 @@ def main() -> None:
         eval_epochs=args.eval_epochs,
         eval_learning_rate=args.eval_learning_rate,
         skill_eval_routing=args.skill_eval_routing,
+        eval_frequency=args.eval_frequency,
         probe_seed=args.seed,
         device=device,
         verbose=True,
@@ -143,96 +154,31 @@ def main() -> None:
         strategy.train(experience)
 
     # ------------------------------------------------------------------
-    # Final results.
+    # Final evaluation and results.
     # ------------------------------------------------------------------
 
+    strategy.evaluate()
     results = strategy.results()
 
     print()
-    print("=== Summary ===")
-    print(
-        "diagonal_loss:",
-        np.round(results["diagonal_loss"], 4),
-    )
-    print(
-        "diagonal_accuracy:",
-        np.round(results["diagonal_accuracy"], 4),
-    )
-    print("final_class_loss:")
+    print("\n=== Summary ===")
 
-    for class_id, loss in sorted(results["final_class_loss"].items()):
-        print(f"  class {class_id}: {loss:.4f}")
+    print(
+        "mean_final_accuracy=",
+        f"{results['mean_final_accuracy']:.4f}",
+    )
+    print(
+        "mean_final_loss=",
+        f"{results['mean_final_loss']:.4f}",
+    )
 
     print("final_class_accuracy:")
-
-    for class_id, accuracy in sorted(results["final_class_accuracy"].items()):
+    for class_id, accuracy in results["final_class_accuracy"].items():
         print(f"  class {class_id}: {accuracy:.4f}")
 
-    print(
-        "class_forgetting_by_introducing_experience:",
-        np.round(
-            results["class_forgetting_acquisition_relative"],
-            4,
-        ),
-    )
-    print(
-        "class_forgetting_peak_relative:",
-        np.round(
-            results["class_forgetting_peak_relative"],
-            4,
-        ),
-    )
-    print(f"mean_diagonal_loss={results['mean_diagonal_loss']:.4f}")
-    print(f"mean_auxiliary_diagonal_accuracy={results['mean_diagonal_accuracy']:.4f}")
-    print(f"mean_auxiliary_final_accuracy={results['mean_final_accuracy']:.4f}")
-    print(
-        "mean_class_forgetting_acquisition_relative="
-        f"{results['mean_class_forgetting_acquisition_relative']:.4f}"
-    )
-    print(
-        "mean_class_forgetting_peak_relative="
-        f"{results['mean_class_forgetting_peak_relative']:.4f}"
-    )
-
-    # Direct Skill Memory metrics.
-    skill_results = results.get("skill_memory", {})
-
-    for routing in ("oracle", "probe"):
-        if routing not in skill_results:
-            continue
-
-        skill_result = skill_results[routing]
-
-        print()
-        print(f"Primary Skill Memory metrics ({routing}):")
-        print(
-            f"skill_memory_{routing}_final_class_accuracy="
-            f"{skill_result['mean_final_accuracy']:.4f}"
-        )
-        print(
-            f"mean_skill_memory_{routing}_peak_forgetting="
-            f"{skill_result['mean_peak_forgetting']:.4f}"
-        )
-
-    # Direct Skill Memory metrics.
-    for routing in ("oracle", "probe"):
-        key = f"skill_memory_{routing}"
-
-        if key not in results:
-            continue
-
-        skill_result = results[key]
-
-        print()
-        print(f"Primary Skill Memory metrics ({routing}):")
-        print(
-            f"skill_memory_{routing}_final_class_accuracy="
-            f"{skill_result['final_class_accuracy']:.4f}"
-        )
-        print(
-            f"mean_skill_memory_{routing}_peak_forgetting="
-            f"{skill_result['mean_peak_forgetting']:.4f}"
-        )
+    print("final_class_loss:")
+    for class_id, loss in results["final_class_loss"].items():
+        print(f"  class {class_id}: {loss:.4f}")
 
 
 if __name__ == "__main__":
