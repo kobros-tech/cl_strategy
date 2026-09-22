@@ -62,16 +62,6 @@ def parse_args() -> argparse.Namespace:
             "evaluation."
         ),
     )
-    parser.add_argument(
-        "--eval-frequency",
-        choices=("every_experience", "final", "none"),
-        default="final",
-        help=(
-            "Evaluation schedule. 'final' evaluates once after all training; "
-            "'every_experience' evaluates after each experience; "
-            "'none' disables evaluation."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -129,8 +119,6 @@ def main() -> None:
             lr=args.learning_rate,
         ),
         criterion=nn.CrossEntropyLoss(),
-        train_stream=benchmark.train_stream,
-        test_stream=benchmark.test_stream,
         max_skills=args.max_skills,
         train_mb_size=args.batch_size,
         train_epochs=args.train_epochs,
@@ -140,7 +128,6 @@ def main() -> None:
         eval_epochs=args.eval_epochs,
         eval_learning_rate=args.eval_learning_rate,
         skill_eval_routing=args.skill_eval_routing,
-        eval_frequency=args.eval_frequency,
         probe_seed=args.seed,
         device=device,
         verbose=True,
@@ -157,7 +144,7 @@ def main() -> None:
     # Final evaluation and results.
     # ------------------------------------------------------------------
 
-    strategy.evaluate()
+    strategy.evaluate(benchmark.test_stream)
     results = strategy.results()
 
     print()
