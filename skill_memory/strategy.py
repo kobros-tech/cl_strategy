@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from avalanche.training import Naive
+from avalanche.training.templates import SupervisedTemplate
 
 from .cl.skill_memory_plugin import SkillMemoryPlugin
 from .cl.skill_registry import SkillMemory
@@ -42,7 +42,7 @@ from .evaluation.ml_cl_evaluator import (
 )
 
 
-class SkillMemoryStrategy(Naive):
+class SkillMemoryStrategy(SupervisedTemplate):
     """Avalanche strategy with integrated Skill Memory and ML evaluation."""
 
     def __init__(
@@ -182,43 +182,13 @@ class SkillMemoryStrategy(Naive):
             "probe": [],
         }
 
-        self._experience_count = 0
-
         self._last_evaluation: dict[str, Any] | None = None
 
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
-
-    def train(self, experience, **kwargs):
-        """Train Skill Memory through the Avalanche plugin lifecycle."""
-        experience_index = self._experience_count
-
-        classes = sorted(
-            int(class_id) for class_id in experience.classes_in_this_experience
-        )
-
-        for class_id in classes:
-            if class_id not in self._class_to_experience:
-                self._class_to_experience[class_id] = experience_index
-
-        if self.verbose:
-            print()
-            print(f"========== Training experience {experience_index} ==========")
-            print(f"Classes: {classes}")
-
-        # Naive.train() is the actual Avalanche training path.
-        # EvaluationMemoryPlugin -> SkillMemoryPlugin hooks perform
-        # the Skill Memory REUSE/SCRATCH training.
-        result = super().train(experience, **kwargs)
-
-        self._experience_count += 1
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Evaluation stream
-    # ------------------------------------------------------------------
+    def record_experience(self, experience, experience_index: int) -> None:
+        """Record the first experience in which each class was introduced."""
+        for class_id in experience.classes_in_this_experience:
+            class_id = int(class_id)
+            self._class_to_experience.setdefault(class_id, experience_index)
 
     # ------------------------------------------------------------------
     # Skill Memory evaluation
@@ -258,23 +228,17 @@ class SkillMemoryStrategy(Naive):
             self._skill_accuracy_history[routing].append(accuracy)
 
     def _num_classes(self) -> int:
-        """Return the global evaluator/output class count."""
-        if hasattr(self.ml_evaluator, "classifier"):
-            classifier = self.ml_evaluator.classifier
-            if hasattr(classifier, "out_features"):
-                return int(classifier.out_features)
+        """Return the number of globally known classes."""
+        if not self._class_to_experience:
+            raise RuntimeError("Cannot determine the number of classes.")
 
-        # Fall back to the largest class observed so far.
-        if self._class_to_experience:
-            return max(self._class_to_experience) + 1
-
-        raise RuntimeError("Cannot determine the number of classes.")
+        return max(self._class_to_experience) + 1
 
     # ------------------------------------------------------------------
     # Results
     # ------------------------------------------------------------------
 
-    def _evaluate_after_experience(
+    def evaluate_ml(
         self,
         test_stream,
         experience_index: int,
@@ -366,19 +330,12 @@ class SkillMemoryStrategy(Naive):
             print(f"  diagonal_accuracy={diagonal_accuracy:.4f}")
             print(f"  diagonal_loss={diagonal_loss:.4f}")
 
-    def evaluate(self, test_stream) -> None:
-        """Train the ML evaluator and evaluate it on the test stream."""
-        self._evaluate_after_experience(
-            test_stream,
-            self._experience_count - 1,
-        )
-
     def results(self) -> dict[str, Any]:
         """Return the complete experiment metrics."""
         if not self._accuracy_history:
             raise RuntimeError(
                 "No results are available. Train at least one experience "
-                "and call evaluate()."
+                "and call evaluate_ml()."
             )
 
         final_accuracy = self._accuracy_history[-1]
@@ -424,7 +381,7 @@ class SkillMemoryStrategy(Naive):
             forgetting = compute_peak_class_forgetting(
                 history,
                 self._class_to_experience,
-                self._experience_count,
+                len(history),
             )
 
             results[routing] = {

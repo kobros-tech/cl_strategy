@@ -137,14 +137,30 @@ def main() -> None:
     # Complete experiment.
     # ------------------------------------------------------------------
 
-    for experience in benchmark.train_stream:
+    for experience_index, experience in enumerate(benchmark.train_stream):
+        print()
+        print(f"========== Training experience {experience_index} ==========")
+        print(
+            "Classes:",
+            sorted(int(class_id) for class_id in experience.classes_in_this_experience),
+        )
+
+        strategy.record_experience(experience, experience_index)
         strategy.train(experience)
 
+        print(
+            f"========== ML evaluation after experience {experience_index} =========="
+        )
+
+        strategy.evaluate_ml(
+            benchmark.test_stream,
+            experience_index,
+        )
+
     # ------------------------------------------------------------------
-    # Final evaluation and results.
+    # Final results.
     # ------------------------------------------------------------------
 
-    strategy.evaluate(benchmark.test_stream)
     results = strategy.results()
 
     print()
