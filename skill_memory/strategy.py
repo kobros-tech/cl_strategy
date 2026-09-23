@@ -1,23 +1,24 @@
-"""High-level Skill Memory strategy with integrated ML evaluation.
+"""High-level Avalanche strategy with Skill Memory and ML evaluation.
 
-This module provides the public orchestration layer for Skill Memory.
+The strategy integrates two distinct learning/evaluation processes:
 
-The strategy manages two learners:
-
-1. Skill Memory:
+1. Skill Memory
    - class-level REUSE/SCRATCH decisions
    - skill allocation and storage
    - class-to-skill bookkeeping
-   - optional oracle/probe diagnostics
+   - optional direct Skill Memory diagnostics
 
-2. Auxiliary ML evaluator:
-   - receives frozen raw examples retained by Skill Memory
-   - trains on all accumulated class memory
-   - evaluates every seen class
-   - tracks accuracy, loss, and forgetting
+2. Anonymous ML evaluator
+   - receives only x at prediction time
+   - learns x -> y from frozen examples retained by Skill Memory
+   - is trained on all accumulated evaluation memory
+   - evaluates all classes seen so far
+   - provides the methodology used to measure non-forgetting
 
-The low-level Skill Memory and evaluation components remain modular. This
-class simply provides one entry point for applications such as ocl_survey.
+The ML evaluator is intentionally independent from the Skill Memory model.
+Its purpose is to measure whether an independently trained classifier can
+recover the class identity of anonymous samples from the accumulated
+retained data after continual training.
 """
 
 from __future__ import annotations
@@ -25,25 +26,31 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
+from avalanche.training.plugins import SupervisedPlugin
+from avalanche.training.plugins.evaluation import EvaluationPlugin
 from avalanche.training.templates import SupervisedTemplate
 
 from .cl.skill_memory_plugin import SkillMemoryPlugin
 from .cl.skill_registry import SkillMemory
 from .evaluation.ml_cl_evaluator import (
     EvaluationMemoryPlugin,
-    compute_peak_class_forgetting,
-    consolidate_evaluation_memory,
-    evaluate_model_by_class,
-    evaluate_skill_memory,
-    train_evaluator,
+    MLEvaluationPlugin,
 )
 
 
 class SkillMemoryStrategy(SupervisedTemplate):
-    """Avalanche strategy with integrated Skill Memory and ML evaluation."""
+    """Avalanche strategy integrating Skill Memory and anonymous ML evaluation.
+
+    The Avalanche strategy is responsible for lifecycle integration and for
+    exposing the complete experiment through one public object.
+
+    Skill Memory training itself remains in ``EvaluationMemoryPlugin`` /
+    ``SkillMemoryPlugin``. The independent ML evaluator remains owned by this
+    strategy because it is part of the experiment's evaluation methodology,
+    not part of Skill Memory's internal training algorithm.
+    """
 
     def __init__(
         self,
@@ -51,6 +58,10 @@ class SkillMemoryStrategy(SupervisedTemplate):
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         criterion: nn.Module,
+        evaluator: EvaluationPlugin | None = None,
+        plugins: list[SupervisedPlugin] | None = None,
+        eval_every: int = -1,
+        peval_mode: str = "epoch",
         max_skills: int = 200,
         forgetting_margin: float = 0.05,
         score_floor: float | None = 0.9,
@@ -58,7 +69,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         probe_batches: int = 5,
         probe_seed: int | None = None,
         max_safety_candidates: int = 5,
-        class_train_epochs: int = 1,
+        class_train_epochs: int = 10,
         class_train_batch_size: int = 64,
         reuse_is_mutable: bool = True,
         force_decision: str | None = None,
@@ -76,15 +87,6 @@ class SkillMemoryStrategy(SupervisedTemplate):
         device: torch.device | str | None = None,
         verbose: bool = True,
     ) -> None:
-        """Initialize the complete Skill Memory + ML evaluation pipeline.
-
-        Parameters controlling Skill Memory are passed to
-        :class:`SkillMemoryPlugin`.
-
-        The auxiliary evaluator is intentionally independent from the main
-        Skill Memory model. By default it uses a fresh `SimpleMLP`, but a
-        caller can provide `evaluator_model_factory` for another architecture.
-        """
         if skill_eval_routing not in {
             "none",
             "oracle",
@@ -112,8 +114,6 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_epochs = eval_epochs
         self.eval_batch_size = eval_batch_size
         self.eval_learning_rate = eval_learning_rate
-        self.skill_eval_routing = skill_eval_routing
-        self.skill_eval_batch_size = skill_eval_batch_size
         self.verbose = verbose
 
         # ------------------------------------------------------------------
@@ -122,6 +122,8 @@ class SkillMemoryStrategy(SupervisedTemplate):
 
         self.memory = SkillMemory(max_skills=max_skills)
 
+        # EvaluationMemoryPlugin extends SkillMemoryPlugin. Therefore there
+        # is exactly one Skill Memory plugin in the Avalanche plugin list.
         self.plugin = EvaluationMemoryPlugin(
             memory=self.memory,
             max_skills=max_skills,
@@ -135,271 +137,64 @@ class SkillMemoryStrategy(SupervisedTemplate):
             class_train_batch_size=class_train_batch_size,
             reuse_is_mutable=reuse_is_mutable,
             force_decision=force_decision,
+            # Keep the normal Avalanche evaluation path untouched.
+            #
+            # The anonymous ML evaluator below is the primary evaluation
+            # methodology. The plugin's probe routing is currently kept
+            # disabled because it is an independent, known-problematic path.
             eval_routing="none",
             eval_memory_per_class=eval_memory_per_class,
             eval_memory_seed=eval_memory_seed,
             verbose=verbose,
         )
 
+        self.ml_evaluation_plugin = MLEvaluationPlugin(
+            memory_plugin=self.plugin,
+            model_factory=evaluator_model_factory,
+            epochs=eval_epochs,
+            batch_size=eval_batch_size,
+            learning_rate=eval_learning_rate,
+            seed=eval_memory_seed,
+            verbose=verbose,
+        )
+
+        strategy_plugins: list[SupervisedPlugin] = [
+            self.plugin,
+            self.ml_evaluation_plugin,
+        ]
+
+        if plugins:
+            strategy_plugins.extend(plugins)
+
         super().__init__(
             model=model,
             optimizer=optimizer,
             criterion=criterion,
+            evaluator=evaluator,
             train_mb_size=train_mb_size,
             train_epochs=train_epochs,
             eval_mb_size=eval_mb_size,
+            eval_every=eval_every,
+            peval_mode=peval_mode,
             device=device,
-            plugins=[self.plugin],
+            plugins=strategy_plugins,
         )
-
-        # ------------------------------------------------------------------
-        # Auxiliary ML evaluator
-        # ------------------------------------------------------------------
-
-        self.evaluator_model_factory = evaluator_model_factory
-
-        self.ml_evaluator = evaluator_model_factory().to(self.device)
-        self.evaluator_optimizer = torch.optim.SGD(
-            self.ml_evaluator.parameters(),
-            lr=eval_learning_rate,
-        )
-        self.evaluator_criterion = nn.CrossEntropyLoss()
-
-        # ------------------------------------------------------------------
-        # Experiment bookkeeping
-        # ------------------------------------------------------------------
-
-        self._class_to_experience: dict[int, int] = {}
-
-        self._accuracy_history: list[dict[int, float]] = []
-        self._loss_history: list[dict[int, float]] = []
-
-        self._diagonal_accuracy_history: list[float] = []
-        self._diagonal_loss_history: list[float] = []
-
-        self._skill_accuracy_history: dict[str, list[dict[int, float]]] = {
-            "oracle": [],
-            "probe": [],
-        }
-
-        self._last_evaluation: dict[str, Any] | None = None
-
-    def record_experience(self, experience, experience_index: int) -> None:
-        """Record the first experience in which each class was introduced."""
-        for class_id in experience.classes_in_this_experience:
-            class_id = int(class_id)
-            self._class_to_experience.setdefault(class_id, experience_index)
-
-    # ------------------------------------------------------------------
-    # Skill Memory evaluation
-    # ------------------------------------------------------------------
-
-    def _evaluate_skill_memory(
-        self,
-        test_stream,
-        experience_index: int,
-    ) -> None:
-        """Evaluate the actual stored Skill Memory when requested."""
-        if self.skill_eval_routing == "none":
-            return
-
-        if self.skill_eval_routing == "both":
-            routings = ("oracle", "probe")
-        else:
-            routings = (self.skill_eval_routing,)
-
-        for routing in routings:
-            class_results = evaluate_skill_memory(
-                self.model,
-                self.plugin,
-                test_stream,
-                experience_index,
-                num_classes=self._num_classes(),
-                routing=routing,
-                batch_size=self.skill_eval_batch_size,
-                device=self.device,
-            )
-
-            accuracy = {
-                class_id: values["accuracy"]
-                for class_id, values in class_results.items()
-            }
-
-            self._skill_accuracy_history[routing].append(accuracy)
-
-    def _num_classes(self) -> int:
-        """Return the number of globally known classes."""
-        if not self._class_to_experience:
-            raise RuntimeError("Cannot determine the number of classes.")
-
-        return max(self._class_to_experience) + 1
 
     # ------------------------------------------------------------------
     # Results
     # ------------------------------------------------------------------
 
-    def evaluate_ml(
-        self,
-        test_stream,
-        experience_index: int,
-    ) -> None:
-        """Run auxiliary and optional Skill Memory evaluation."""
-        self._evaluate_skill_memory(
-            test_stream,
-            experience_index,
-        )
-
-        accumulated_memory = consolidate_evaluation_memory(self.plugin.eval_memory)
-
-        if not accumulated_memory:
-            raise RuntimeError("Evaluation memory is empty.")
-
-        train_evaluator(
-            self.ml_evaluator,
-            self.evaluator_optimizer,
-            self.evaluator_criterion,
-            accumulated_memory,
-            batch_size=self.eval_batch_size,
-            epochs=self.eval_epochs,
-            device=self.device,
-            seed=experience_index,
-        )
-
-        class_results = evaluate_model_by_class(
-            self.ml_evaluator,
-            test_stream,
-            experience_index,
-            batch_size=self.eval_batch_size,
-            device=self.device,
-        )
-
-        current_accuracy = {
-            class_id: values["accuracy"] for class_id, values in class_results.items()
-        }
-        current_loss = {
-            class_id: values["loss"] for class_id, values in class_results.items()
-        }
-
-        self._accuracy_history.append(current_accuracy)
-        self._loss_history.append(current_loss)
-
-        classes = [
-            class_id
-            for class_id, first_experience in self._class_to_experience.items()
-            if first_experience <= experience_index
-        ]
-
-        diagonal_classes = [
-            class_id
-            for class_id in classes
-            if self._class_to_experience[class_id] == experience_index
-        ]
-
-        if not diagonal_classes:
-            raise RuntimeError(f"No classes found for experience {experience_index}.")
-
-        missing_classes = [
-            class_id
-            for class_id in diagonal_classes
-            if class_id not in current_accuracy
-        ]
-
-        if missing_classes:
-            raise RuntimeError(
-                f"Evaluation is missing classes {missing_classes} "
-                f"for experience {experience_index}."
-            )
-
-        diagonal_accuracy = float(
-            np.mean([current_accuracy[class_id] for class_id in diagonal_classes])
-        )
-        diagonal_loss = float(
-            np.mean([current_loss[class_id] for class_id in diagonal_classes])
-        )
-
-        self._diagonal_accuracy_history.append(diagonal_accuracy)
-        self._diagonal_loss_history.append(diagonal_loss)
-
-        self._last_evaluation = {
-            "class_results": class_results,
-            "diagonal_accuracy": diagonal_accuracy,
-            "diagonal_loss": diagonal_loss,
-        }
-
-        if self.verbose:
-            print(f"  diagonal_accuracy={diagonal_accuracy:.4f}")
-            print(f"  diagonal_loss={diagonal_loss:.4f}")
-
     def results(self) -> dict[str, Any]:
-        """Return the complete experiment metrics."""
-        if not self._accuracy_history:
-            raise RuntimeError(
-                "No results are available. Train at least one experience "
-                "and call evaluate_ml()."
-            )
-
-        final_accuracy = self._accuracy_history[-1]
-        final_loss = self._loss_history[-1]
-
-        result: dict[str, Any] = {
-            "final_class_accuracy": dict(final_accuracy),
-            "final_class_loss": dict(final_loss),
-            "mean_final_accuracy": float(np.mean(list(final_accuracy.values()))),
-            "mean_final_loss": float(np.mean(list(final_loss.values()))),
-        }
-
-        result.update(
-            {
-                "diagonal_accuracy": np.asarray(
-                    self._diagonal_accuracy_history,
-                    dtype=np.float64,
-                ),
-                "diagonal_loss": np.asarray(
-                    self._diagonal_loss_history,
-                    dtype=np.float64,
-                ),
-            }
-        )
-
-        skill_results = self._skill_results()
-
-        if skill_results:
-            result["skill_memory"] = skill_results
-
-        return result
-
-    def _skill_results(self) -> dict[str, Any]:
-        """Build metrics for direct Skill Memory evaluation."""
-        results: dict[str, Any] = {}
-
-        for routing, history in self._skill_accuracy_history.items():
-            if not history:
-                continue
-
-            final = history[-1]
-
-            forgetting = compute_peak_class_forgetting(
-                history,
-                self._class_to_experience,
-                len(history),
-            )
-
-            results[routing] = {
-                "final_class_accuracy": dict(final),
-                "mean_final_accuracy": float(np.mean(list(final.values()))),
-                "peak_forgetting": forgetting,
-                "mean_peak_forgetting": float(forgetting.mean()),
-            }
-
-        return results
+        """Return the independent ML evaluation results."""
+        return self.ml_evaluation_plugin.results()
 
     # ------------------------------------------------------------------
-    # Convenient properties
+    # Public accessors
     # ------------------------------------------------------------------
 
     @property
     def skill_memory(self) -> SkillMemory:
-        """Return the underlying Skill Memory storage."""
+        """Return the underlying Skill Memory."""
         return self.memory
 
     @property
@@ -408,20 +203,5 @@ class SkillMemoryStrategy(SupervisedTemplate):
         return self.plugin
 
     @property
-    def evaluator_model(self) -> nn.Module:
-        """Return the auxiliary ML evaluator."""
-        return self.ml_evaluator
-
-    @property
-    def current_accuracy(self) -> dict[int, float]:
-        """Return the most recent per-class accuracy."""
-        if not self._accuracy_history:
-            return {}
-        return dict(self._accuracy_history[-1])
-
-    @property
-    def current_loss(self) -> dict[int, float]:
-        """Return the most recent per-class loss."""
-        if not self._loss_history:
-            return {}
-        return dict(self._loss_history[-1])
+    def evaluator_model(self) -> nn.Module | None:
+        return self.ml_evaluation_plugin.model

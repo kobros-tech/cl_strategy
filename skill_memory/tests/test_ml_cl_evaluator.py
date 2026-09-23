@@ -4,36 +4,37 @@ Uses a small synthetic (non-MNIST, no download needed) benchmark built
 with Avalanche's own `nc_benchmark` generator, exercising the same code
 path as `skill_memory/demos/demo_splitmnist_ml_er.py` end to end: Skill
 Memory training + evaluation-memory capture, the independent evaluator's
-train/evaluate loop, and direct Skill Memory oracle/probe evaluation.
+train/evaluate loop, and ML evaluation through the Avalanche plugin.
 """
-
-from types import SimpleNamespace
 
 import pytest
 import torch
 from avalanche.benchmarks import nc_benchmark
+from avalanche.models import SimpleMLP
 from avalanche.training import Naive
 from torch.utils.data import TensorDataset
 
 from skill_memory import SkillMemory
-from skill_memory.cl.skill_registry import ClassRecord
 from skill_memory.evaluation.ml_cl_evaluator import (
     EvaluationMemory,
     EvaluationMemoryPlugin,
+    MLEvaluationPlugin,
     aggregate_experience_metrics,
     build_evaluator,
     compute_class_forgetting,
     compute_peak_class_forgetting,
     consolidate_evaluation_memory,
     evaluate_model_by_class,
-    evaluate_skill_memory,
     make_loader,
     train_evaluator,
 )
-from skill_memory.utils.models import SimpleMLP
 
 
-def _synthetic_benchmark(n_classes: int, n_experiences: int, n_per_class: int = 40):
+def _synthetic_benchmark(
+    n_classes: int,
+    n_experiences: int,
+    n_per_class: int = 40,
+):
     """A synthetic, well-separated benchmark with no ordering degeneracy.
 
     Each class perturbs its own feature dimension (`class_id % n_features`),
@@ -50,7 +51,13 @@ def _synthetic_benchmark(n_classes: int, n_experiences: int, n_per_class: int = 
         offsets = torch.zeros(n_features)
         offsets[class_id % n_features] = 6.0 * (1 + class_id // n_features)
         xs.append(torch.randn(n_per_class, n_features) * 0.5 + offsets)
-        ys.append(torch.full((n_per_class,), class_id, dtype=torch.long))
+        ys.append(
+            torch.full(
+                (n_per_class,),
+                class_id,
+                dtype=torch.long,
+            )
+        )
     x = torch.cat(xs)
     y = torch.cat(ys)
     train_ds = TensorDataset(x, y)
@@ -67,9 +74,21 @@ def _synthetic_benchmark(n_classes: int, n_experiences: int, n_per_class: int = 
 
 def test_consolidate_evaluation_memory_merges_by_class_across_experiences():
     memory = [
-        EvaluationMemory(torch.zeros(2, 3), torch.tensor([1, 1]), class_id=1),
-        EvaluationMemory(torch.ones(3, 3), torch.tensor([2, 2, 2]), class_id=2),
-        EvaluationMemory(torch.full((1, 3), 5.0), torch.tensor([1]), class_id=1),
+        EvaluationMemory(
+            torch.zeros(2, 3),
+            torch.tensor([1, 1]),
+            class_id=1,
+        ),
+        EvaluationMemory(
+            torch.ones(3, 3),
+            torch.tensor([2, 2, 2]),
+            class_id=2,
+        ),
+        EvaluationMemory(
+            torch.full((1, 3), 5.0),
+            torch.tensor([1]),
+            class_id=1,
+        ),
     ]
     consolidated = consolidate_evaluation_memory(memory)
     by_class = {item.class_id: item for item in consolidated}
@@ -80,7 +99,11 @@ def test_consolidate_evaluation_memory_merges_by_class_across_experiences():
 
 def test_make_loader_rejects_empty_memory():
     try:
-        make_loader([], batch_size=4, shuffle=False)
+        make_loader(
+            [],
+            batch_size=4,
+            shuffle=False,
+        )
     except RuntimeError as exc:
         assert "empty" in str(exc)
     else:
@@ -88,8 +111,7 @@ def test_make_loader_rejects_empty_memory():
 
 
 def test_forgetting_definitions_diverge_on_a_dip_then_recovery_then_drop():
-    """Worked example: a class that goes 60% (acquisition) -> 90% (later)
-    -> 70% (final).
+    """Worked example: a class that goes 60% -> 90% -> 70%.
 
     Acquisition-relative forgetting (`compute_class_forgetting`) compares
     only against the acquisition-time accuracy (60%), so a final accuracy
@@ -101,22 +123,25 @@ def test_forgetting_definitions_diverge_on_a_dip_then_recovery_then_drop():
     one of them has been implemented wrong.
     """
     accuracy_history = [
-        {0: 0.60},  # experience 0: class 0 introduced, accuracy on
-        # introduction = 60%
+        {0: 0.60},  # experience 0: class 0 introduced, accuracy on introduction = 60%
         {0: 0.90},  # experience 1: class 0's accuracy rises to 90%
-        {0: 0.70},  # experience 2 (final): class 0's accuracy falls to 70%
+        {0: 0.70},  # experience 2: class 0's accuracy falls to 70%
     ]
     class_to_experience = {0: 0}
 
     acquisition_relative = compute_class_forgetting(
-        accuracy_history, class_to_experience, num_experiences=3
+        accuracy_history,
+        class_to_experience,
+        num_experiences=3,
     )
     peak_relative = compute_peak_class_forgetting(
-        accuracy_history, class_to_experience, num_experiences=3
+        accuracy_history,
+        class_to_experience,
+        num_experiences=3,
     )
 
-    assert acquisition_relative[0] == 0.0  # 60% -> 70% is not a regression
-    assert peak_relative[0] == pytest.approx(0.20)  # 90% -> 70% is
+    assert acquisition_relative[0] == 0.0
+    assert peak_relative[0] == pytest.approx(0.20)
     assert acquisition_relative[0] != peak_relative[0]
 
 
@@ -125,18 +150,31 @@ def test_train_evaluator_reduces_loss_on_a_separable_synthetic_problem():
     memory = [
         EvaluationMemory(
             torch.randn(20, 6) + class_id * 4.0,
-            torch.full((20,), class_id, dtype=torch.long),
+            torch.full(
+                (20,),
+                class_id,
+                dtype=torch.long,
+            ),
             class_id=class_id,
         )
         for class_id in range(3)
     ]
     model, optimizer, criterion = build_evaluator(
-        lambda: SimpleMLP(input_dim=6, hidden_size=16, num_classes=3),
+        lambda: SimpleMLP(
+            input_size=6,
+            hidden_size=16,
+            num_classes=3,
+        ),
         device=torch.device("cpu"),
         learning_rate=0.1,
     )
 
-    loader = make_loader(memory, batch_size=8, shuffle=False)
+    loader = make_loader(
+        memory,
+        batch_size=8,
+        shuffle=False,
+    )
+
     model.eval()
     with torch.no_grad():
         initial_loss = sum(float(criterion(model(x), y)) for x, y in loader) / len(
@@ -155,7 +193,11 @@ def test_train_evaluator_reduces_loss_on_a_separable_synthetic_problem():
     )
 
     model.eval()
-    loader = make_loader(memory, batch_size=8, shuffle=False)
+    loader = make_loader(
+        memory,
+        batch_size=8,
+        shuffle=False,
+    )
     with torch.no_grad():
         final_loss = sum(float(criterion(model(x), y)) for x, y in loader) / len(loader)
 
@@ -163,8 +205,16 @@ def test_train_evaluator_reduces_loss_on_a_separable_synthetic_problem():
 
 
 def test_evaluation_memory_plugin_captures_bounded_per_class_samples():
-    benchmark = _synthetic_benchmark(n_classes=4, n_experiences=2, n_per_class=40)
-    model = SimpleMLP(input_dim=6, hidden_size=8, num_classes=4)
+    benchmark = _synthetic_benchmark(
+        n_classes=4,
+        n_experiences=2,
+        n_per_class=40,
+    )
+    model = SimpleMLP(
+        input_size=6,
+        hidden_size=8,
+        num_classes=4,
+    )
     plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
         eval_routing="none",
@@ -174,7 +224,10 @@ def test_evaluation_memory_plugin_captures_bounded_per_class_samples():
     )
     strategy = Naive(
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        optimizer=torch.optim.SGD(
+            model.parameters(),
+            lr=0.05,
+        ),
         criterion=torch.nn.CrossEntropyLoss(),
         train_mb_size=16,
         train_epochs=1,
@@ -184,14 +237,27 @@ def test_evaluation_memory_plugin_captures_bounded_per_class_samples():
     for exp in benchmark.train_stream:
         strategy.train(exp)
 
-    assert {m.class_id for m in plugin.eval_memory} == {0, 1, 2, 3}
+    assert {m.class_id for m in plugin.eval_memory} == {
+        0,
+        1,
+        2,
+        3,
+    }
     # eval_memory_per_class=5 must bound each class's retained sample count.
     assert all(m.size == 5 for m in plugin.eval_memory)
 
 
 def test_evaluate_model_by_class_and_aggregate_and_forgetting_end_to_end():
-    benchmark = _synthetic_benchmark(n_classes=4, n_experiences=2, n_per_class=40)
-    model = SimpleMLP(input_dim=6, hidden_size=8, num_classes=4)
+    benchmark = _synthetic_benchmark(
+        n_classes=4,
+        n_experiences=2,
+        n_per_class=40,
+    )
+    model = SimpleMLP(
+        input_size=6,
+        hidden_size=8,
+        num_classes=4,
+    )
     plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
         eval_routing="none",
@@ -201,7 +267,10 @@ def test_evaluate_model_by_class_and_aggregate_and_forgetting_end_to_end():
     )
     strategy = Naive(
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        optimizer=torch.optim.SGD(
+            model.parameters(),
+            lr=0.05,
+        ),
         criterion=torch.nn.CrossEntropyLoss(),
         train_mb_size=16,
         train_epochs=1,
@@ -217,7 +286,11 @@ def test_evaluate_model_by_class_and_aggregate_and_forgetting_end_to_end():
 
         memory = consolidate_evaluation_memory(plugin.eval_memory)
         evaluator, optimizer, criterion = build_evaluator(
-            lambda: SimpleMLP(input_dim=6, hidden_size=8, num_classes=4),
+            lambda: SimpleMLP(
+                input_size=6,
+                hidden_size=8,
+                num_classes=4,
+            ),
             device=torch.device("cpu"),
             learning_rate=0.1,
         )
@@ -243,7 +316,9 @@ def test_evaluate_model_by_class_and_aggregate_and_forgetting_end_to_end():
         assert set(class_results) == set(class_to_experience)
 
         losses, accuracies = aggregate_experience_metrics(
-            class_results, benchmark.test_stream, train_index
+            class_results,
+            benchmark.test_stream,
+            train_index,
         )
         assert len(losses) == len(accuracies) == train_index + 1
 
@@ -252,162 +327,203 @@ def test_evaluate_model_by_class_and_aggregate_and_forgetting_end_to_end():
         )
 
     forgetting = compute_class_forgetting(
-        accuracy_history, class_to_experience, len(benchmark.train_stream)
+        accuracy_history,
+        class_to_experience,
+        len(benchmark.train_stream),
     )
     assert forgetting.shape == (len(benchmark.train_stream),)
     assert (forgetting >= 0).all()
 
 
-def test_evaluate_skill_memory_oracle_and_probe_agree_on_a_separable_problem():
-    benchmark = _synthetic_benchmark(n_classes=4, n_experiences=2, n_per_class=40)
-    model = SimpleMLP(input_dim=6, hidden_size=8, num_classes=4)
-    plugin = EvaluationMemoryPlugin(
+def test_ml_evaluation_plugin_trains_and_reports_class_metrics():
+    benchmark = _synthetic_benchmark(
+        n_classes=4,
+        n_experiences=2,
+        n_per_class=40,
+    )
+    model = SimpleMLP(
+        input_size=6,
+        hidden_size=8,
+        num_classes=4,
+    )
+    memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
         eval_routing="none",
         eval_memory_per_class=10,
         eval_memory_seed=0,
-        # A mutable REUSE would overwrite an earlier skill's weights for a
-        # later class, which is expected to forget the earlier class - a
-        # real property of SkillMemoryPlugin, not something this test is
-        # about. Disable it here so both classes stay recognizable.
-        reuse_is_mutable=False,
-        # class_train_epochs defaults to 1; this tiny synthetic dataset
-        # needs more than one pass to actually converge.
-        class_train_epochs=10,
+        verbose=False,
+    )
+    ml_plugin = MLEvaluationPlugin(
+        memory_plugin=memory_plugin,
+        model_factory=lambda: SimpleMLP(
+            input_size=6,
+            hidden_size=8,
+            num_classes=4,
+        ),
+        epochs=10,
+        batch_size=8,
+        learning_rate=0.1,
+        seed=0,
         verbose=False,
     )
     strategy = Naive(
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        optimizer=torch.optim.SGD(
+            model.parameters(),
+            lr=0.05,
+        ),
         criterion=torch.nn.CrossEntropyLoss(),
         train_mb_size=16,
         train_epochs=1,
         eval_mb_size=16,
-        plugins=[plugin],
+        plugins=[
+            memory_plugin,
+            ml_plugin,
+        ],
     )
-    for exp in benchmark.train_stream:
-        strategy.train(exp)
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
+        strategy.eval(benchmark.test_stream)
+    results = ml_plugin.results()
+    assert set(results["final_class_accuracy"]) == {
+        0,
+        1,
+        2,
+        3,
+    }
+    assert set(results["final_class_loss"]) == {
+        0,
+        1,
+        2,
+        3,
+    }
+    assert results["mean_final_accuracy"] > 0.95
+    assert results["mean_final_loss"] >= 0.0
+    assert ml_plugin.current_accuracy == results["final_class_accuracy"]
+    assert ml_plugin.current_loss == results["final_class_loss"]
+    assert len(results["diagonal_accuracy"]) == 2
+    assert len(results["diagonal_loss"]) == 2
+    assert results["peak_forgetting"].shape == (2,)
 
-    last_index = len(benchmark.train_stream) - 1
-    oracle_accuracy = evaluate_skill_memory(
-        model,
-        plugin,
-        benchmark.test_stream,
-        last_index,
+
+def test_ml_evaluator_uses_global_class_output_space():
+    benchmark = _synthetic_benchmark(
+        n_classes=4,
+        n_experiences=1,
+        n_per_class=40,
+    )
+    model = SimpleMLP(
+        input_size=6,
+        hidden_size=8,
         num_classes=4,
-        routing="oracle",
-        batch_size=16,
-        device=torch.device("cpu"),
     )
-    probe_accuracy = evaluate_skill_memory(
-        model,
-        plugin,
-        benchmark.test_stream,
-        last_index,
-        num_classes=4,
-        routing="probe",
-        batch_size=16,
-        device=torch.device("cpu"),
-    )
-
-    assert set(oracle_accuracy) == set(probe_accuracy) == {0, 1, 2, 3}
-
-    # Well-separated synthetic classes with immutable REUSE: every skill
-    # keeps recognizing its own class, so oracle routing (the true mapping)
-    # must be essentially perfect throughout.
-    assert all(values["accuracy"] > 0.95 for values in oracle_accuracy.values())
-
-    # Probe routing should recover the same skill choices on this deliberately
-    # easy synthetic benchmark.
-    assert all(
-        probe_accuracy[class_id]["accuracy"] > 0.95 for class_id in oracle_accuracy
-    )
-
-
-def test_skill_memory_evaluation_maps_compact_one_class_head_to_global_class():
-    model = SimpleMLP(input_dim=2, hidden_size=4, num_classes=1)
-    plugin = EvaluationMemoryPlugin(
-        memory=SkillMemory(max_skills=2),
+    memory_plugin = EvaluationMemoryPlugin(
+        memory=SkillMemory(max_skills=10),
         eval_routing="none",
+        eval_memory_per_class=10,
+        eval_memory_seed=0,
         verbose=False,
     )
-    plugin.memory.store(0, model.state_dict())
-    plugin.class_map.record(
-        ClassRecord(
-            experience_index=0,
-            class_id=3,
-            decision="SCRATCH",
-            skill=0,
-        )
-    )
-    x = torch.randn(8, 2)
-    y = torch.full((8,), 3, dtype=torch.long)
-    experience = SimpleNamespace(
-        dataset=TensorDataset(x, y),
-        classes_in_this_experience=[3],
+    ml_plugin = MLEvaluationPlugin(
+        memory_plugin=memory_plugin,
+        model_factory=lambda: SimpleMLP(
+            input_size=6,
+            hidden_size=8,
+            num_classes=4,
+        ),
+        epochs=10,
+        batch_size=8,
+        learning_rate=0.1,
+        seed=0,
+        verbose=False,
     )
 
-    class_results = evaluate_skill_memory(
-        model,
-        plugin,
-        [experience],
-        0,
-        num_classes=4,
-        routing="oracle",
-        batch_size=4,
-        device=torch.device("cpu"),
+    strategy = Naive(
+        model=model,
+        optimizer=torch.optim.SGD(
+            model.parameters(),
+            lr=0.05,
+        ),
+        criterion=torch.nn.CrossEntropyLoss(),
+        train_mb_size=16,
+        train_epochs=1,
+        eval_mb_size=16,
+        plugins=[
+            memory_plugin,
+            ml_plugin,
+        ],
     )
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
 
-    assert class_results[3]["accuracy"] == 1.0
+    strategy.eval(benchmark.test_stream)
+    evaluator = ml_plugin.evaluator_model
+    assert evaluator is not None
+    x = benchmark.test_stream[0].dataset[0][0]
+    x = x.unsqueeze(0)
+    with torch.no_grad():
+        logits = evaluator(x)
 
-    probe_accuracy = evaluate_skill_memory(
-        model,
-        plugin,
-        [experience],
-        0,
-        num_classes=4,
-        routing="probe",
-        batch_size=4,
-        device=torch.device("cpu"),
+    assert logits.shape == (1, 4)
+
+
+def test_ml_evaluation_does_not_modify_main_model():
+    benchmark = _synthetic_benchmark(
+        n_classes=2,
+        n_experiences=1,
+        n_per_class=20,
     )
-
-    assert set(probe_accuracy) == {3}
-    assert probe_accuracy[3]["accuracy"] == 1.0
-
-
-def test_evaluate_skill_memory_restores_model_weights_afterward():
-    benchmark = _synthetic_benchmark(n_classes=2, n_experiences=1, n_per_class=20)
-    model = SimpleMLP(input_dim=6, hidden_size=8, num_classes=2)
-    plugin = EvaluationMemoryPlugin(
+    model = SimpleMLP(
+        input_size=6,
+        hidden_size=8,
+        num_classes=2,
+    )
+    memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=5),
         eval_routing="none",
         eval_memory_per_class=5,
         eval_memory_seed=0,
         verbose=False,
     )
+    ml_plugin = MLEvaluationPlugin(
+        memory_plugin=memory_plugin,
+        model_factory=lambda: SimpleMLP(
+            input_size=6,
+            hidden_size=8,
+            num_classes=2,
+        ),
+        epochs=10,
+        batch_size=8,
+        learning_rate=0.1,
+        seed=0,
+        verbose=False,
+    )
     strategy = Naive(
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        optimizer=torch.optim.SGD(
+            model.parameters(),
+            lr=0.05,
+        ),
         criterion=torch.nn.CrossEntropyLoss(),
         train_mb_size=16,
         train_epochs=1,
         eval_mb_size=16,
-        plugins=[plugin],
+        plugins=[
+            memory_plugin,
+            ml_plugin,
+        ],
     )
-    for exp in benchmark.train_stream:
-        strategy.train(exp)
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
 
-    before = {k: v.clone() for k, v in model.state_dict().items()}
-    evaluate_skill_memory(
-        model,
-        plugin,
-        benchmark.test_stream,
-        0,
-        num_classes=2,
-        routing="oracle",
-        batch_size=16,
-        device=torch.device("cpu"),
-    )
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    strategy.eval(benchmark.test_stream)
     after = model.state_dict()
     for key in before:
-        assert torch.equal(before[key], after[key])
+        assert torch.equal(
+            before[key],
+            after[key],
+        )
+
+    assert ml_plugin.evaluator_model is not None
+    assert ml_plugin.evaluator_model is not model

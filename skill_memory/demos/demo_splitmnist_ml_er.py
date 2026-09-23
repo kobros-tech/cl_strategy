@@ -1,11 +1,11 @@
-"""SplitMNIST Skill Memory experiment with ML evaluation.
+"""SplitMNIST Skill Memory experiment with anonymous ML evaluation.
 
 The public SkillMemoryStrategy owns the complete experiment lifecycle:
 
 * Skill Memory training
 * frozen per-class evaluation memory
 * independent ML evaluator training
-* class-level evaluation
+* anonymous x -> y evaluation through Avalanche's normal eval() lifecycle
 * accuracy/loss tracking
 * forgetting metrics
 
@@ -19,10 +19,10 @@ import argparse
 import numpy as np
 import torch
 from avalanche.benchmarks.classic import SplitMNIST
+from avalanche.models import SimpleMLP
 from torch import nn
 
 from skill_memory import SkillMemoryStrategy
-from skill_memory.utils.models import SimpleMLP
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
         choices=("oracle", "probe", "both", "none"),
         default="none",
         help=(
-            "Direct Skill Memory evaluation. 'oracle' uses the true "
-            "class-to-skill mapping; 'probe' uses anonymous routing; "
+            "Optional direct Skill Memory diagnostic. 'oracle' uses the "
+            "true class-to-skill mapping; 'probe' uses anonymous routing; "
             "'both' runs both; 'none' disables direct Skill Memory "
             "evaluation."
         ),
@@ -81,9 +81,13 @@ def main() -> None:
 
     print("=== SplitMNIST Skill Memory experiment ===")
     print("Training method: Skill Memory")
+    print("Evaluation method: independent anonymous ML evaluator")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
-    print(f"Evaluation memory per class: {args.eval_memory_per_class}")
+    print(
+        "Evaluation memory per class:",
+        args.eval_memory_per_class,
+    )
 
     for index, experience in enumerate(benchmark.train_stream):
         print(
@@ -100,16 +104,20 @@ def main() -> None:
     # Main Skill Memory model.
     # ------------------------------------------------------------------
 
-    model = SimpleMLP(num_classes=10).to(device)
+    model = SimpleMLP(
+        num_classes=10,
+    ).to(device)
 
     # ------------------------------------------------------------------
-    # One high-level object owns both:
+    # SkillMemoryStrategy owns:
     #
     #   1. Skill Memory training
-    #   2. independent ML evaluation
+    #   2. evaluation-memory retention
+    #   3. independent ML evaluator
+    #   4. normal Avalanche evaluation lifecycle
     #
-    # The demo does not need to know about SkillMemoryPlugin,
-    # EvaluationMemoryPlugin, Naive, evaluator optimizers, etc.
+    # The evaluator receives only x at evaluation time and predicts y.
+    # No experience ID, task label, or skill ID is supplied.
     # ------------------------------------------------------------------
 
     strategy = SkillMemoryStrategy(
@@ -123,7 +131,13 @@ def main() -> None:
         train_mb_size=args.batch_size,
         train_epochs=args.train_epochs,
         eval_mb_size=args.eval_batch_size,
-        evaluator_model_factory=lambda: SimpleMLP(num_classes=10),
+        evaluator_model_factory=lambda: SimpleMLP(
+            num_classes=10,
+            input_size=28 * 28,
+            hidden_size=2048,
+            hidden_layers=1,
+            drop_rate=0.1,
+        ),
         eval_memory_per_class=args.eval_memory_per_class,
         eval_epochs=args.eval_epochs,
         eval_learning_rate=args.eval_learning_rate,
@@ -134,7 +148,16 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Complete experiment.
+    # Complete Avalanche lifecycle.
+    #
+    # Training:
+    #     strategy.train(experience)
+    #
+    # Evaluation:
+    #     strategy.eval(benchmark.test_stream)
+    #
+    # The ML evaluator is invoked automatically by its Avalanche plugin
+    # during strategy.eval().
     # ------------------------------------------------------------------
 
     for experience_index, experience in enumerate(benchmark.train_stream):
@@ -145,17 +168,16 @@ def main() -> None:
             sorted(int(class_id) for class_id in experience.classes_in_this_experience),
         )
 
-        strategy.record_experience(experience, experience_index)
+        # Normal Avalanche training lifecycle.
         strategy.train(experience)
 
-        print(
-            f"========== ML evaluation after experience {experience_index} =========="
-        )
+        print(f"========== Evaluation after experience {experience_index} ==========")
 
-        strategy.evaluate_ml(
-            benchmark.test_stream,
-            experience_index,
-        )
+        # Normal Avalanche evaluation lifecycle.
+        #
+        # The standalone ML evaluator is trained automatically on all
+        # accumulated frozen x,y evaluation memory before this evaluation.
+        strategy.eval(benchmark.test_stream)
 
     # ------------------------------------------------------------------
     # Final results.
@@ -164,7 +186,7 @@ def main() -> None:
     results = strategy.results()
 
     print()
-    print("\n=== Summary ===")
+    print("=== Summary ===")
 
     print(
         "mean_final_accuracy=",
