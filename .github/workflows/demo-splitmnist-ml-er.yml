@@ -1,4 +1,4 @@
-name: SplitMNIST ML/CL evaluator (class oracle)
+name: SplitMNIST ML/CL evaluator
 
 on:
   workflow_dispatch:
@@ -42,12 +42,11 @@ jobs:
           path: data
           key: splitmnist-dataset-v1-${{ runner.os }}
 
-      - name: Run 5 experiences, class oracle, ${{ matrix.eval_epochs }} eval epoch(s)
+      - name: Run 5 experiences, independent ML evaluator, ${{ matrix.eval_epochs }} eval epoch(s)
         run: |
           python skill_memory/demos/demo_splitmnist_ml_er.py \
             --dataset-root data \
             --n-experiences 5 \
-            --skill-eval-routing oracle \
             --eval-epochs ${{ matrix.eval_epochs }} \
             | tee ml_er_${{ matrix.eval_epochs }}ep_${{ github.run_id }}.txt
 

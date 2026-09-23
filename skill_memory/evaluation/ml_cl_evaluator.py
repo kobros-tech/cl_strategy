@@ -42,6 +42,8 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
+from ..utils.probing import apply_skill_state_exact, expand_skill_logits
+from .routing import find_best_routing_skill
 
 
 @dataclass
@@ -456,7 +458,6 @@ def evaluate_model_by_class(
             results[class_id] = {
                 "loss": (class_loss[class_id] / total),
                 "accuracy": (class_correct[class_id] / total),
-                "experience": float(experience_index),
             }
 
     return results
@@ -608,6 +609,128 @@ def compute_peak_class_forgetting(
             result[experience_index] = float(np.mean(values))
 
     return result
+
+
+def evaluate_skill_memory(
+    model: nn.Module,
+    plugin: SkillMemoryPlugin,
+    test_stream,
+    up_to_index: int,
+    *,
+    num_classes: int,
+    routing: str,
+    batch_size: int,
+    device: torch.device,
+) -> dict[int, dict[str, float]]:
+    """Evaluate stored Skill Memory states with oracle or probe routing."""
+    if not plugin.memory:
+        raise RuntimeError("Cannot evaluate Skill Memory before any skill exists.")
+    if routing not in ("oracle", "probe"):
+        raise ValueError(f"Unknown Skill Memory routing mode: {routing}")
+    if num_classes < 1:
+        raise ValueError("num_classes must be positive")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+
+    slot_ids = sorted(plugin.memory.slots())
+    skill_states = [plugin.memory.state(slot) for slot in slot_ids]
+    class_correct: dict[int, int] = {}
+    class_total: dict[int, int] = {}
+    class_loss: dict[int, float] = {}
+    original_state = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+
+    try:
+        model.eval()
+        for experience_index in range(up_to_index + 1):
+            experience = test_stream[experience_index]
+            loader = DataLoader(
+                experience.dataset, batch_size=batch_size, shuffle=False
+            )
+            for batch in loader:
+                inputs = batch[0].to(device)
+                labels = batch[1].to(device)
+                if routing == "oracle":
+                    chosen_logits = torch.empty(
+                        inputs.shape[0], num_classes, device=device
+                    )
+                    rows_by_skill: dict[int, list[int]] = {}
+                    for row, label in enumerate(labels.detach().cpu().tolist()):
+                        skill = plugin.class_map.find_skill_for_class_anywhere(
+                            int(label)
+                        )
+                        if skill is None:
+                            raise RuntimeError(
+                                f"No canonical skill recorded for class {label}."
+                            )
+                        rows_by_skill.setdefault(int(skill), []).append(row)
+                    for skill, rows in rows_by_skill.items():
+                        state = plugin.memory.state(skill)
+                        row_tensor = torch.tensor(rows, device=device)
+                        apply_skill_state_exact(model, state)
+                        raw_logits = model(inputs[row_tensor])
+                        chosen_logits[row_tensor] = expand_skill_logits(
+                            raw_logits,
+                            state,
+                            plugin.class_map.classes_for_skill(skill),
+                            num_classes,
+                        )
+                else:
+                    raw_logits = []
+                    for state in skill_states:
+                        apply_skill_state_exact(model, state)
+                        raw_logits.append(model(inputs))
+                    routing_result = find_best_routing_skill(
+                        raw_logits,
+                        skill_states,
+                        [plugin.class_map.classes_for_skill(slot) for slot in slot_ids],
+                    )
+                    chosen = routing_result.skill_indices
+                    expanded_by_skill = [
+                        expand_skill_logits(
+                            logits,
+                            state,
+                            plugin.class_map.classes_for_skill(slot),
+                            num_classes,
+                        )
+                        for slot, state, logits in zip(
+                            slot_ids, skill_states, raw_logits, strict=False
+                        )
+                    ]
+                    stacked = torch.stack(expanded_by_skill, dim=0)
+                    rows = torch.arange(inputs.shape[0], device=device)
+                    chosen_logits = stacked[chosen, rows]
+
+                per_sample_loss = nn.functional.cross_entropy(
+                    chosen_logits, labels, reduction="none"
+                )
+                predictions = chosen_logits.argmax(dim=1)
+                for class_id in torch.unique(labels).tolist():
+                    class_id = int(class_id)
+                    mask = labels == class_id
+                    class_loss[class_id] = class_loss.get(class_id, 0.0) + float(
+                        per_sample_loss[mask].sum().item()
+                    )
+                    class_correct[class_id] = class_correct.get(class_id, 0) + int(
+                        (predictions[mask] == labels[mask]).sum().item()
+                    )
+                    class_total[class_id] = class_total.get(class_id, 0) + int(
+                        mask.sum().item()
+                    )
+    finally:
+        apply_skill_state_exact(model, original_state)
+
+    results: dict[int, dict[str, float]] = {}
+    for class_id in sorted(class_total):
+        total = class_total[class_id]
+        if total == 0:
+            raise RuntimeError(f"Class {class_id} has no test samples.")
+        results[class_id] = {
+            "loss": class_loss[class_id] / total,
+            "accuracy": class_correct[class_id] / total,
+        }
+    return results
 
 
 def build_evaluator(
