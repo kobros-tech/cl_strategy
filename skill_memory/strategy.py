@@ -96,6 +96,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         weight_state_eval_batch_size: int = 64,
         weight_state_eval_learning_rate: float = 0.01,
         weight_state_eval_hidden_size: int = 128,
+        weight_state_representation_size: int = 128,
         train_mb_size: int = 64,
         train_epochs: int = 1,
         eval_mb_size: int = 64,
@@ -132,6 +133,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.weight_state_eval_epochs = weight_state_eval_epochs
         self.weight_state_eval_batch_size = weight_state_eval_batch_size
         self.weight_state_eval_learning_rate = weight_state_eval_learning_rate
+        self.weight_state_representation_size = weight_state_representation_size
         self.skill_eval_routing = skill_eval_routing
         self.verbose = verbose
 
@@ -221,6 +223,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             ml1_batch_size=weight_state_ml1_batch_size,
             seed=eval_memory_seed,
             hidden_size=weight_state_eval_hidden_size,
+            state_representation_size=weight_state_representation_size,
             verbose=verbose,
         )
 
