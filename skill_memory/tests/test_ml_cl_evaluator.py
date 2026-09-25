@@ -32,12 +32,12 @@ from skill_memory.evaluation.weight_state_ml_evaluator import (
     WeightEvaluationMemory,
     WeightStateMLEvaluationPlugin,
     build_weight_state_evaluator,
-    sketch_weight_state,
     build_weight_state_regressor,
     consolidate_weight_evaluation_memory,
     consolidate_weight_state_memory,
     evaluate_weight_state_memory,
     flatten_weight_state,
+    sketch_weight_state,
     train_weight_state_evaluator,
     train_weight_state_regressor,
 )
@@ -951,8 +951,9 @@ def test_anonymous_two_stage_plugin_replaces_evaluation_output():
     result = anonymous.current_result
 
     assert anonymous.ml1_model is not None
-    assert anonymous.model is not None
-    assert anonymous.model[-1].out_features == 3
+    assert anonymous.ml1_model is not None
+    assert anonymous.ml2_model is not None
+    assert anonymous.ml2_model[-1].out_features == 3
     assert "true_omega_accuracy" in result
     assert "end_to_end_accuracy" in result
     assert "final_class_accuracy" in result

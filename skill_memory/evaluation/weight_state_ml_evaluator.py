@@ -179,7 +179,7 @@ def consolidate_weight_evaluation_memory(
     representation_size: int = 128,
     seed: int = 0,
 ) -> tuple[Tensor, Tensor]:
-    """Backward-compatible ML-2 consolidation: omega -> class."""
+    """Build ML-2 training pairs from true stored omega states."""
     _, _, inputs, targets = consolidate_weight_state_memory(
         memory,
         representation_size=representation_size,
@@ -268,7 +268,7 @@ def train_weight_state_evaluator(
     seed: int = 0,
     representation_size: int = 128,
 ) -> None:
-    """Train the ML-2 omega -> class evaluator.""
+    """Train the ML-2 omega -> class evaluator."""
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     if epochs < 1:
@@ -327,7 +327,7 @@ class WeightStateMLEvaluation:
         *,
         memory: WeightEvaluationMemory,
         num_classes: int,
-        model_factory: Callable[[int, int], nn.Module] | None = None,
+        ml2_model_factory: Callable[[int, int], nn.Module] | None = None,
         ml1_model_factory: Callable[[int, int], nn.Module] | None = None,
         epochs: int = 10,
         batch_size: int = 64,
@@ -348,7 +348,7 @@ class WeightStateMLEvaluation:
             raise ValueError("num_classes must be positive")
         self.memory = memory
         self.num_classes = int(num_classes)
-        self.model_factory = model_factory
+        self.ml2_model_factory = ml2_model_factory
         self.ml1_model_factory = ml1_model_factory
         self.epochs = int(epochs)
         self.batch_size = int(batch_size)
@@ -362,15 +362,15 @@ class WeightStateMLEvaluation:
             raise ValueError("state_representation_size must be positive")
         self.state_representation_size = int(state_representation_size)
         self.verbose = verbose
-        self.model: nn.Module | None = None
         self.ml1_model: nn.Module | None = None
-        self.optimizer: torch.optim.Optimizer | None = None
+        self.ml2_model: nn.Module | None = None
         self.ml1_optimizer: torch.optim.Optimizer | None = None
+        self.ml2_optimizer: torch.optim.Optimizer | None = None
         self.criterion = nn.CrossEntropyLoss()
         self._last_result: dict[str, object] = {}
 
     def train(self, *, device: torch.device, num_classes: int) -> dict[str, object]:
-        ml1_x, ml1_y, omega, y = consolidate_weight_state_memory(
+        ml1_x, ml1_y, _, _ = consolidate_weight_state_memory(
             self.memory,
             representation_size=self.state_representation_size,
             seed=self.seed,
@@ -397,16 +397,22 @@ class WeightStateMLEvaluation:
             representation_size=self.state_representation_size,
         )
 
-        if self.model_factory is None:
-            self.model = build_weight_state_evaluator(
-                omega_size, num_classes, hidden_size=self.hidden_size
+        if self.ml2_model_factory is None:
+            self.ml2_model = build_weight_state_evaluator(
+                omega_size,
+                num_classes,
+                hidden_size=self.hidden_size,
             )
         else:
-            self.model = self.model_factory(omega_size, num_classes)
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
+            self.ml2_model = self.ml2_model_factory(omega_size, num_classes)
+
+        self.ml2_optimizer = torch.optim.SGD(
+            self.ml2_model.parameters(),
+            lr=self.learning_rate,
+        )
         train_weight_state_evaluator(
-            self.model,
-            self.optimizer,
+            self.ml2_model,
+            self.ml2_optimizer,
             self.criterion,
             self.memory,
             batch_size=self.batch_size,
@@ -420,7 +426,7 @@ class WeightStateMLEvaluation:
 
     @torch.no_grad()
     def evaluate(self, *, device: torch.device) -> dict[str, object]:
-        if self.ml1_model is None or self.model is None:
+        if self.ml1_model is None or self.ml2_model is None:
             return {}
 
         ml1_x, ml1_targets, omega, targets = consolidate_weight_state_memory(
@@ -429,10 +435,11 @@ class WeightStateMLEvaluation:
             seed=self.seed,
         )
         self.ml1_model.to(device).eval()
-        self.model.to(device).eval()
+        self.ml2_model.to(device).eval()
 
         predicted_omega = self.ml1_model(ml1_x.to(device))
-        true_logits = self.model(omega.to(device))
+
+        true_logits = self.ml2_model(omega.to(device))
         true_targets = targets.to(device)
         true_accuracy = (true_logits.argmax(1) == true_targets).float().mean()
 
@@ -446,14 +453,18 @@ class WeightStateMLEvaluation:
                 for snapshot in self.memory.snapshots()
             ]
         ).to(device)
-        predicted_logits = self.model(predicted_omega)
+
+        predicted_logits = self.ml2_model(predicted_omega)
         end_accuracy = (predicted_logits.argmax(1) == sample_targets).float().mean()
 
         return {
             "true_omega_accuracy": float(true_accuracy.item()),
             "end_to_end_accuracy": float(end_accuracy.item()),
             "omega_mse": float(
-                nn.functional.mse_loss(predicted_omega, ml1_targets.to(device)).item()
+                nn.functional.mse_loss(
+                    predicted_omega,
+                    ml1_targets.to(device),
+                ).item()
             ),
         }
 
@@ -485,13 +496,16 @@ class WeightStateMLEvaluationPlugin(WeightStateMLEvaluation, SupervisedPlugin):
 
     @torch.no_grad()
     def after_eval_forward(self, strategy, **kwargs) -> None:
-        if not self._active or self.ml1_model is None or self.model is None:
+        if not self._active or self.ml1_model is None or self.ml2_model is None:
             return
+
         inputs = _flatten_inputs(strategy.mbatch[0]).to(strategy.device)
+
         self.ml1_model.eval()
-        self.model.eval()
+        self.ml2_model.eval()
+
         predicted_omega = self.ml1_model(inputs)
-        strategy.mb_output = self.model(predicted_omega)
+        strategy.mb_output = self.ml2_model(predicted_omega)
 
     def after_eval_iteration(self, strategy, **kwargs) -> None:
         if not self._active:

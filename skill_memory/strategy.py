@@ -85,8 +85,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         eval_learning_rate: float = 0.01,
         evaluator_model_factory: Callable[[], nn.Module],
         weight_state_num_classes: int | None = None,
-        weight_state_evaluator_model_factory: Callable[[int, int], nn.Module]
-        | None = None,
+        weight_state_ml2_model_factory: Callable[[int, int], nn.Module] | None = None,
         weight_state_ml1_model_factory: Callable[[int, int], nn.Module] | None = None,
         weight_state_ml1_learning_rate: float = 0.001,
         weight_state_ml1_epochs: int | None = None,
@@ -213,7 +212,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.weight_state_ml_evaluation_plugin = WeightStateMLEvaluationPlugin(
             memory=self.weight_evaluation_memory,
             num_classes=self.weight_state_num_classes,
-            model_factory=weight_state_evaluator_model_factory,
+            ml2_model_factory=weight_state_ml2_model_factory,
             ml1_model_factory=weight_state_ml1_model_factory,
             epochs=weight_state_eval_epochs,
             batch_size=weight_state_eval_batch_size,
@@ -285,7 +284,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
 
     @property
     def weight_state_evaluator_model(self) -> nn.Module | None:
-        return self.weight_state_ml_evaluation_plugin.model
+        return self.weight_state_ml_evaluation_plugin.ml2_model
 
     @property
     def weight_state_memory(self) -> WeightEvaluationMemory:
