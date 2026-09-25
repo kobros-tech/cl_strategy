@@ -70,6 +70,13 @@ class SkillMemoryPlugin(SupervisedPlugin):
         force_decision: str | None = None,
         eval_routing: EvalRouting = "probe",
         verbose: bool = True,
+        weight_state_callback: (
+            Callable[
+                [torch.nn.Module, torch.Tensor, torch.Tensor, int, int, int],
+                None,
+            ]
+            | None
+        ) = None,
     ):
         """Configure per-class REUSE/SCRATCH decisions and evaluation routing.
 
@@ -102,6 +109,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.force_decision = force_decision
         self.eval_routing = eval_routing
         self.verbose = verbose
+        self.weight_state_callback = weight_state_callback
 
         self.last_class_decisions: dict[int, dict[int, dict[str, Any]]] = {}
         self._initial_state: dict | None = None
@@ -267,12 +275,33 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 self._reset_optimizer(strategy)
 
                 if self.reuse_is_mutable:
+                    capture_callback = None
+                    if self.weight_state_callback is not None:
+
+                        def capture_callback(
+                            model,
+                            inputs,
+                            targets,
+                            step,
+                            class_id=target_class,
+                            skill_id=skill,
+                        ):
+                            self.weight_state_callback(
+                                model,
+                                inputs,
+                                targets,
+                                class_id,
+                                skill_id,
+                                step,
+                            )
+
                     train_on_class(
                         strategy,
                         experience,
                         target_class,
                         self.class_train_epochs,
                         self.class_train_batch_size,
+                        on_step=capture_callback,
                     )
                     self.memory.store(
                         skill,
@@ -290,12 +319,33 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 skill = self.memory.allocate()
                 self._log(f"Class {target_class}: SCRATCH -> new skill {skill}")
                 self._scratch_reset(strategy, experience)
+                capture_callback = None
+                if self.weight_state_callback is not None:
+
+                    def capture_callback(
+                        model,
+                        inputs,
+                        targets,
+                        step,
+                        class_id=target_class,
+                        skill_id=skill,
+                    ):
+                        self.weight_state_callback(
+                            model,
+                            inputs,
+                            targets,
+                            class_id,
+                            skill_id,
+                            step,
+                        )
+
                 train_on_class(
                     strategy,
                     experience,
                     target_class,
                     self.class_train_epochs,
                     self.class_train_batch_size,
+                    on_step=capture_callback,
                 )
                 self.memory.store(
                     skill,
