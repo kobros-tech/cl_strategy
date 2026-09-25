@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-learning-rate", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-skills", type=int, default=20)
+    parser.add_argument(
+        "--eval-routing",
+        choices=("none", "probe"),
+        default="none",
+        help=(
+            "Evaluation routing: independent evaluator only or anonymous "
+            "Skill Memory probe."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -71,6 +80,7 @@ def main() -> None:
     print("=== SplitMNIST Skill Memory experiment ===")
     print("Training method: Skill Memory")
     print("Evaluation method: independent anonymous ML evaluator")
+    print(f"Evaluation routing: {args.eval_routing}")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
     print(
@@ -131,6 +141,7 @@ def main() -> None:
         probe_seed=args.seed,
         device=device,
         verbose=True,
+        eval_routing=args.eval_routing,
     )
 
     # ------------------------------------------------------------------
@@ -187,6 +198,11 @@ def main() -> None:
     print("final_class_loss:")
     for class_id, loss in results["final_class_loss"].items():
         print(f"  class {class_id}: {loss:.4f}")
+
+    if args.eval_routing == "probe":
+        print("probe_routing_accuracy=", f"{results['probe_routing_accuracy']:.4f}")
+        print("probe_mean_confidence=", f"{results['probe_mean_confidence']:.4f}")
+        print("probe_mean_margin=", f"{results['probe_mean_margin']:.4f}")
 
 
 if __name__ == "__main__":

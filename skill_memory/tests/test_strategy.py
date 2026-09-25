@@ -14,6 +14,10 @@ from avalanche.models import SimpleMLP
 from torch.utils.data import TensorDataset
 
 from skill_memory.evaluation.ml_cl_evaluator import evaluate_skill_memory
+from skill_memory.evaluation.routing import (
+    score_skill_compatibility,
+    select_skill_from_scores,
+)
 from skill_memory.strategy import SkillMemoryStrategy
 
 
@@ -110,3 +114,86 @@ def test_public_properties_expose_underlying_components():
     strategy = _make_strategy(n_classes=2)
     assert strategy.memory is strategy.skill_memory_plugin.memory
     assert strategy.evaluator_model is strategy.ml_evaluation_plugin.evaluator_model
+
+
+def test_probe_uses_the_same_evaluator_and_reports_routing_metrics():
+    """Probe adds skill selection without changing the public lifecycle."""
+    benchmark = _synthetic_benchmark(n_classes=4, n_experiences=2, n_per_class=30)
+    model = SimpleMLP(input_size=6, hidden_size=8, num_classes=4)
+    strategy = SkillMemoryStrategy(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        criterion=torch.nn.CrossEntropyLoss(),
+        evaluator_model_factory=lambda: SimpleMLP(
+            input_size=6, hidden_size=8, num_classes=4
+        ),
+        eval_routing="probe",
+        max_skills=10,
+        eval_memory_per_class=10,
+        eval_epochs=5,
+        train_mb_size=16,
+        train_epochs=1,
+        eval_mb_size=16,
+        verbose=False,
+    )
+
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
+
+    before_eval = {
+        name: value.detach().clone()
+        for name, value in strategy.model.state_dict().items()
+    }
+    results = strategy.eval(benchmark.test_stream)
+
+    for name, value in before_eval.items():
+        assert torch.equal(strategy.model.state_dict()[name], value)
+
+    assert strategy.evaluator_model is strategy.ml_evaluation_plugin.evaluator_model
+    assert "probe_routing_accuracy" in results
+    assert "probe_mean_confidence" in results
+    assert "probe_mean_margin" in results
+    assert "probe_diagnostics" in results
+    assert results["probe_diagnostics"]
+    diagnostic = results["probe_diagnostics"][0]
+    required_keys = {
+        "true_class",
+        "canonical_skill",
+        "selected_skill",
+        "candidate_skills",
+        "candidate_scores",
+        "top_candidates",
+        "evaluation_experience",
+        "confidence",
+        "margin",
+        "correct",
+    }
+    assert required_keys <= diagnostic.keys()
+    assert 0.0 <= results["probe_routing_accuracy"] <= 1.0
+    assert 0.0 <= results["probe_mean_confidence"] <= 1.0
+    assert 0.0 <= results["probe_mean_margin"] <= 1.0
+
+
+def test_none_has_no_probe_metrics():
+    """The reference evaluator path remains independent of probe routing."""
+    benchmark = _synthetic_benchmark(n_classes=4, n_experiences=2, n_per_class=20)
+    strategy = _make_strategy(n_classes=4)
+
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
+
+    results = strategy.eval(benchmark.test_stream)
+
+    assert "probe_routing_accuracy" not in results
+    assert "probe_mean_confidence" not in results
+
+
+def test_probe_scores_group_evaluator_probabilities_by_canonical_skill():
+    """Probe selection uses evaluator class probabilities, not labels."""
+    evaluator_logits = torch.tensor([[4.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 4.0]])
+    scores = score_skill_compatibility(evaluator_logits, [{0, 1}, {2, 3}])
+    routing = select_skill_from_scores(scores)
+
+    assert scores.shape == (2, 2)
+    assert routing.skill_indices.tolist() == [0, 1]
+    assert torch.all(routing.confidence_gap >= 0)

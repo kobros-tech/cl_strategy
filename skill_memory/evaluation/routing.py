@@ -135,3 +135,52 @@ def route_probe_logits(
     return find_best_routing_skill(
         raw_skill_logits, states, skill_classes
     ).skill_indices
+
+
+def score_skill_compatibility(
+    evaluator_logits: Tensor,
+    skill_classes: Sequence[Sequence[int]],
+) -> Tensor:
+    """Score each skill from one shared independent evaluator."""
+    if evaluator_logits.ndim != 2:
+        raise ValueError("evaluator_logits must have shape [batch, classes]")
+    probabilities = torch.softmax(evaluator_logits, dim=1)
+    scores = []
+    for classes in skill_classes:
+        owned = sorted(int(class_id) for class_id in classes)
+        if not owned:
+            scores.append(
+                torch.zeros(probabilities.shape[0], device=probabilities.device)
+            )
+            continue
+        if max(owned) >= probabilities.shape[1]:
+            raise RuntimeError(
+                f"skill owns class {max(owned)}, but evaluator has only "
+                f"{probabilities.shape[1]} output columns"
+            )
+        scores.append(probabilities[:, owned].sum(dim=1))
+    if not scores:
+        raise RuntimeError("No skills available for probe routing.")
+    return torch.stack(scores, dim=0)
+
+
+def select_skill_from_scores(scores: Tensor) -> RoutingResult:
+    """Select one skill per sample from compatibility scores."""
+    if scores.ndim != 2 or scores.shape[0] < 1:
+        raise ValueError("scores must have shape [skills, batch]")
+    probabilities = _normalize_routing_scores(scores, temperature=1.0)
+    skill_indices = probabilities.argmax(dim=0)
+    if probabilities.shape[0] == 1:
+        best_probability = probabilities[0]
+        second_probability = torch.zeros_like(best_probability)
+    else:
+        top2 = torch.topk(probabilities, k=2, dim=0).values
+        best_probability = top2[0]
+        second_probability = top2[1]
+    return RoutingResult(
+        skill_indices=skill_indices,
+        probabilities=probabilities,
+        best_probability=best_probability,
+        second_probability=second_probability,
+        confidence_gap=best_probability - second_probability,
+    )

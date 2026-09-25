@@ -42,8 +42,16 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
-from ..utils.probing import apply_skill_state_exact, expand_skill_logits
-from .routing import find_best_routing_skill
+from ..utils.probing import (
+    apply_skill_state_exact,
+    expand_skill_logits,
+    resize_incremental_classifiers_for_state,
+)
+from .routing import (
+    find_best_routing_skill,
+    score_skill_compatibility,
+    select_skill_from_scores,
+)
 
 
 @dataclass
@@ -520,6 +528,9 @@ def compute_class_forgetting(
     )
 
     for class_id in all_classes:
+        if class_id not in class_to_experience:
+            continue
+
         introduction = class_to_experience[class_id]
 
         if introduction >= len(accuracy_history):
@@ -571,6 +582,9 @@ def compute_peak_class_forgetting(
     )
 
     for class_id in all_classes:
+        if class_id not in class_to_experience:
+            continue
+
         introduction = class_to_experience[class_id]
 
         if introduction >= len(accuracy_history):
@@ -788,6 +802,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         learning_rate: float = 0.01,
         seed: int = 0,
         verbose: bool = True,
+        eval_routing: str = "none",
     ) -> None:
         super().__init__()
 
@@ -804,6 +819,9 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self.learning_rate = float(learning_rate)
         self.seed = int(seed)
         self.verbose = verbose
+        if eval_routing not in ("none", "probe"):
+            raise ValueError("eval_routing must be one of 'none' or 'probe'")
+        self.eval_routing = eval_routing
 
         self.model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -821,6 +839,12 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct: dict[int, int] = {}
         self._current_class_total: dict[int, int] = {}
         self._current_experience_classes: set[int] = set()
+        self._main_model_state: dict[str, torch.Tensor] | None = None
+        self._probe_total = 0
+        self._probe_correct = 0
+        self._probe_confidences: list[float] = []
+        self._probe_margins: list[float] = []
+        self._probe_diagnostics: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Training-memory bookkeeping
@@ -881,6 +905,19 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct = {}
         self._current_class_total = {}
         self._current_experience_classes = set()
+        self._main_model_state = (
+            {
+                name: value.detach().clone()
+                for name, value in strategy.model.state_dict().items()
+            }
+            if self.eval_routing != "none"
+            else None
+        )
+        self._probe_total = 0
+        self._probe_correct = 0
+        self._probe_confidences = []
+        self._probe_margins = []
+        self._probe_diagnostics = []
 
         if self.verbose:
             print(
@@ -901,16 +938,126 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
     @torch.no_grad()
     def after_eval_forward(self, strategy, **kwargs) -> None:
-        """Replace the main model output with standalone ML predictions."""
+        """Produce normal or skill-routed predictions."""
         if not self._active or self.model is None:
             return
 
         inputs = strategy.mbatch[0]
-
         self.model.eval()
+        evaluator_logits = self.model(inputs)
 
-        # The evaluator sees only x.
-        strategy.mb_output = self.model(inputs)
+        # "none" is the reference implementation.
+        if self.eval_routing == "none":
+            strategy.mb_output = evaluator_logits
+            return
+
+        slot_ids = sorted(self.memory_plugin.memory.slots())
+        if not slot_ids:
+            strategy.mb_output = evaluator_logits
+            return
+
+        skill_classes = [
+            self.memory_plugin.class_map.classes_for_skill(slot) for slot in slot_ids
+        ]
+
+        scores = score_skill_compatibility(evaluator_logits, skill_classes)
+        routing = select_skill_from_scores(scores)
+        chosen_tensor = routing.skill_indices
+
+        if self._main_model_state is None:
+            raise RuntimeError("Missing main-model snapshot for routed evaluation.")
+
+        routed_logits = torch.empty(
+            inputs.shape[0],
+            evaluator_logits.shape[1],
+            device=inputs.device,
+            dtype=evaluator_logits.dtype,
+        )
+
+        try:
+            for skill_index, slot in enumerate(slot_ids):
+                rows = torch.where(chosen_tensor == skill_index)[0]
+                if rows.numel() == 0:
+                    continue
+                state = self.memory_plugin.memory.state(slot)
+                apply_skill_state_exact(strategy.model, state)
+                strategy.model.eval()
+                raw_logits = strategy.model(inputs[rows])
+                routed_logits[rows] = expand_skill_logits(
+                    raw_logits,
+                    state,
+                    self.memory_plugin.class_map.classes_for_skill(slot),
+                    evaluator_logits.shape[1],
+                )
+        finally:
+            resize_incremental_classifiers_for_state(
+                strategy.model,
+                self._main_model_state,
+            )
+            strategy.model.load_state_dict(self._main_model_state)
+
+        strategy.mb_output = routed_logits
+
+        if routing is not None:
+            labels = strategy.mbatch[1]
+            self._probe_total += int(labels.numel())
+            for label, chosen_idx in zip(
+                labels.detach().cpu().tolist(),
+                chosen_tensor.detach().cpu().tolist(),
+                strict=False,
+            ):
+                canonical = self.memory_plugin.class_map.find_skill_for_class_anywhere(
+                    int(label)
+                )
+                if canonical is not None and slot_ids[chosen_idx] == canonical:
+                    self._probe_correct += 1
+            candidate_scores = routing.probabilities.detach().cpu().tolist()
+            confidences = routing.best_probability.detach().cpu().tolist()
+            margins = routing.confidence_gap.detach().cpu().tolist()
+            self._probe_confidences.extend(confidences)
+            self._probe_margins.extend(margins)
+
+            labels_cpu = labels.detach().cpu().tolist()
+            chosen_cpu = chosen_tensor.detach().cpu().tolist()
+            for row, (label, chosen_idx) in enumerate(
+                zip(labels_cpu, chosen_cpu, strict=False)
+            ):
+                canonical = self.memory_plugin.class_map.find_skill_for_class_anywhere(
+                    int(label)
+                )
+                self._probe_diagnostics.append(
+                    {
+                        "true_class": int(label),
+                        "canonical_skill": (
+                            int(canonical) if canonical is not None else None
+                        ),
+                        "evaluation_experience": int(
+                            getattr(strategy.experience, "current_experience", -1)
+                        ),
+                        "selected_skill": int(slot_ids[chosen_idx]),
+                        "candidate_skills": [int(slot) for slot in slot_ids],
+                        "candidate_scores": [
+                            float(candidate_scores[skill_index][row])
+                            for skill_index in range(len(candidate_scores))
+                        ],
+                        "top_candidates": [
+                            {
+                                "skill": int(slot_ids[index]),
+                                "score": float(candidate_scores[index][row]),
+                            }
+                            for index in sorted(
+                                range(len(slot_ids)),
+                                key=lambda index: candidate_scores[index][row],
+                                reverse=True,
+                            )[:2]
+                        ],
+                        "confidence": float(confidences[row]),
+                        "margin": float(margins[row]),
+                        "correct": (
+                            canonical is not None and slot_ids[chosen_idx] == canonical
+                        ),
+                    }
+                )
 
     def after_eval_iteration(self, strategy, **kwargs) -> None:
         """Collect class-level metrics from the standalone evaluator."""
@@ -1007,6 +1154,13 @@ class MLEvaluationPlugin(SupervisedPlugin):
                 f"{np.mean(list(current_accuracy.values())):.4f}"
             )
 
+        if self._main_model_state is not None:
+            resize_incremental_classifiers_for_state(
+                strategy.model,
+                self._main_model_state,
+            )
+            strategy.model.load_state_dict(self._main_model_state)
+        self._main_model_state = None
         self._active = False
 
     # ------------------------------------------------------------------
@@ -1061,6 +1215,28 @@ class MLEvaluationPlugin(SupervisedPlugin):
                 self._accuracy_history,
                 self._class_to_experience,
                 len(self._accuracy_history),
+            )
+
+        if self.eval_routing == "probe":
+            result.update(
+                {
+                    "probe_routing_accuracy": (
+                        self._probe_correct / self._probe_total
+                        if self._probe_total
+                        else float("nan")
+                    ),
+                    "probe_mean_confidence": (
+                        float(np.mean(self._probe_confidences))
+                        if self._probe_confidences
+                        else float("nan")
+                    ),
+                    "probe_mean_margin": (
+                        float(np.mean(self._probe_margins))
+                        if self._probe_margins
+                        else float("nan")
+                    ),
+                    "probe_diagnostics": list(self._probe_diagnostics),
+                }
             )
 
         return result

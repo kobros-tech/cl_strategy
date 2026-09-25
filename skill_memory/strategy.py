@@ -85,6 +85,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         eval_mb_size: int = 64,
         device: torch.device | str | None = None,
         verbose: bool = True,
+        eval_routing: str = "none",
     ) -> None:
         if eval_memory_per_class <= 0:
             raise ValueError("eval_memory_per_class must be positive")
@@ -95,6 +96,9 @@ class SkillMemoryStrategy(SupervisedTemplate):
         if eval_batch_size < 1:
             raise ValueError("eval_batch_size must be positive")
 
+        if eval_routing not in ("none", "probe"):
+            raise ValueError("eval_routing must be one of 'none' or 'probe'")
+
         if device is None:
             device = next(model.parameters()).device
         else:
@@ -104,6 +108,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_batch_size = eval_batch_size
         self.eval_learning_rate = eval_learning_rate
         self.verbose = verbose
+        self.eval_routing = eval_routing
 
         # ------------------------------------------------------------------
         # Skill Memory
@@ -142,6 +147,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             learning_rate=eval_learning_rate,
             seed=eval_memory_seed,
             verbose=verbose,
+            eval_routing=eval_routing,
         )
 
         strategy_plugins: list[SupervisedPlugin] = [
@@ -171,6 +177,16 @@ class SkillMemoryStrategy(SupervisedTemplate):
             device=device,
             plugins=strategy_plugins,
         )
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def eval(self, exp_list, **kwargs):
+        """Run normal Avalanche evaluation and include ML evaluator results."""
+        avalanche_results = super().eval(exp_list, **kwargs)
+        avalanche_results.update(self.ml_evaluation_plugin.results())
+        return avalanche_results
 
     # ------------------------------------------------------------------
     # Results

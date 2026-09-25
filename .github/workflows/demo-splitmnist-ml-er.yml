@@ -20,8 +20,13 @@ jobs:
       matrix:
         include:
           - eval_epochs: 1
+            eval_routing: none
           - eval_epochs: 10
+            eval_routing: none
           - eval_epochs: 100
+            eval_routing: none
+          - eval_epochs: 10
+            eval_routing: probe
 
     steps:
       - name: Checkout
@@ -42,19 +47,20 @@ jobs:
           path: data
           key: splitmnist-dataset-v1-${{ runner.os }}
 
-      - name: Run 5 experiences, independent ML evaluator, ${{ matrix.eval_epochs }} eval epoch(s)
+      - name: Run 5 experiences, ${{ matrix.eval_routing }} evaluation, ${{ matrix.eval_epochs }} eval epoch(s)
         run: |
           python skill_memory/demos/demo_splitmnist_ml_er.py \
             --dataset-root data \
             --n-experiences 5 \
             --eval-epochs ${{ matrix.eval_epochs }} \
-            | tee ml_er_${{ matrix.eval_epochs }}ep_${{ github.run_id }}.txt
+            --eval-routing ${{ matrix.eval_routing }} \
+            | tee ml_er_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_${{ github.run_id }}.txt
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ml-er-${{ matrix.eval_epochs }}ep-${{ github.run_id }}
-          path: ml_er_${{ matrix.eval_epochs }}ep_*.txt
+          name: ml-er-${{ matrix.eval_routing }}-${{ matrix.eval_epochs }}ep-${{ github.run_id }}
+          path: ml_er_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_*.txt
           if-no-files-found: warn
           retention-days: 14
