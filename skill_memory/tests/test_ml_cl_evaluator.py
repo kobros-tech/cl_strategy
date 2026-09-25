@@ -32,6 +32,7 @@ from skill_memory.evaluation.weight_state_ml_evaluator import (
     WeightEvaluationMemory,
     WeightStateMLEvaluationPlugin,
     build_weight_state_evaluator,
+    sketch_weight_state,
     build_weight_state_regressor,
     consolidate_weight_evaluation_memory,
     consolidate_weight_state_memory,
@@ -648,7 +649,10 @@ def test_consolidate_weight_state_memory_builds_both_training_stages():
         skill_id=2,
     )
 
-    ml1_x, ml1_targets, ml2_x, ml2_y = consolidate_weight_state_memory(memory)
+    ml1_x, ml1_targets, ml2_x, ml2_y = consolidate_weight_state_memory(
+        memory,
+        representation_size=3,
+    )
 
     assert ml1_x.shape == (2, 2)
     assert ml1_targets.shape == (2, 3)
@@ -683,14 +687,30 @@ def test_ml1_regressor_learns_x_to_omega_on_synthetic_trajectory():
         epochs=100,
         device=torch.device("cpu"),
         seed=0,
+        representation_size=3,
     )
 
-    ml1_x, ml1_targets, _, _ = consolidate_weight_state_memory(memory)
+    ml1_x, ml1_targets, _, _ = consolidate_weight_state_memory(
+        memory,
+        representation_size=3,
+    )
     with torch.no_grad():
         prediction = model(ml1_x)
 
     assert prediction.shape == ml1_targets.shape
     assert torch.mean((prediction - ml1_targets) ** 2).item() < 1.0
+
+
+def test_weight_state_sketch_has_bounded_representation():
+    state = {
+        "large": torch.arange(10_000, dtype=torch.float32),
+    }
+
+    sketch = sketch_weight_state(state, representation_size=32, seed=0)
+
+    assert sketch.shape == (32,)
+    assert sketch.dtype == torch.float32
+    assert torch.isfinite(sketch).all()
 
 
 def test_weight_state_evaluator_learns_class_from_anonymous_weight_states():
@@ -708,7 +728,10 @@ def test_weight_state_evaluator_learns_class_from_anonymous_weight_states():
                 skill_id=class_id,
             )
 
-    inputs, targets = consolidate_weight_evaluation_memory(memory)
+    inputs, targets = consolidate_weight_evaluation_memory(
+        memory,
+        representation_size=3,
+    )
 
     assert inputs.shape[0] == 20
     assert inputs.shape[1] == 3
@@ -731,12 +754,14 @@ def test_weight_state_evaluator_learns_class_from_anonymous_weight_states():
         epochs=50,
         device=torch.device("cpu"),
         seed=0,
+        representation_size=3,
     )
 
     result = evaluate_weight_state_memory(
         model,
         memory,
         device=torch.device("cpu"),
+        representation_size=3,
     )
 
     assert result["accuracy"] >= 0.9
