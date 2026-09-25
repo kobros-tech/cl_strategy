@@ -1,6 +1,6 @@
 """High-level Avalanche strategy with Skill Memory and ML evaluation.
 
-The strategy integrates two distinct learning/evaluation processes:
+The strategy integrates Skill Memory training with independent evaluation plugins:
 
 1. Skill Memory
    - class-level REUSE/SCRATCH decisions
@@ -8,12 +8,10 @@ The strategy integrates two distinct learning/evaluation processes:
    - class-to-skill bookkeeping
    - optional direct Skill Memory diagnostics
 
-2. Anonymous ML evaluator
-   - receives only x at prediction time
-   - learns x -> y from frozen examples retained by Skill Memory
-   - is trained on all accumulated evaluation memory
-   - evaluates all classes seen so far
-   - provides the methodology used to measure non-forgetting
+2. Anonymous two-stage ML evaluator
+   - for eval_routing="none", receives only x at prediction time
+   - learns x -> omega and omega -> y using retained CL trajectory states
+   - predicts x -> ML-1 -> omega -> ML-2 -> y during evaluation
 
 The ML evaluator is intentionally independent from the Skill Memory model.
 Its purpose is to measure whether an independently trained classifier can
@@ -38,6 +36,10 @@ from .evaluation.ml_cl_evaluator import (
     EvaluationMemoryPlugin,
     MLEvaluationPlugin,
 )
+from .evaluation.weight_state_ml_evaluator import (
+    WeightEvaluationMemory,
+    WeightStateMLEvaluationPlugin,
+)
 
 
 class SkillMemoryStrategy(SupervisedTemplate):
@@ -47,9 +49,10 @@ class SkillMemoryStrategy(SupervisedTemplate):
     exposing the complete experiment through one public object.
 
     Skill Memory training itself remains in ``EvaluationMemoryPlugin`` /
-    ``SkillMemoryPlugin``. The independent ML evaluator remains owned by this
-    strategy because it is part of the experiment's evaluation methodology,
-    not part of Skill Memory's internal training algorithm.
+    ``SkillMemoryPlugin``. The independent ML evaluator is implemented as an
+    Avalanche plugin. The strategy constructs and registers that plugin as
+    part of the experiment's evaluation methodology; it is not part of Skill
+    Memory's internal training algorithm.
     """
 
     def __init__(
@@ -81,6 +84,18 @@ class SkillMemoryStrategy(SupervisedTemplate):
         eval_batch_size: int = 64,
         eval_learning_rate: float = 0.01,
         evaluator_model_factory: Callable[[], nn.Module],
+        weight_state_num_classes: int | None = None,
+        weight_state_evaluator_model_factory: Callable[[int, int], nn.Module]
+        | None = None,
+        weight_state_ml1_model_factory: Callable[[int, int], nn.Module] | None = None,
+        weight_state_ml1_learning_rate: float = 0.001,
+        weight_state_ml1_epochs: int | None = None,
+        weight_state_ml1_batch_size: int | None = None,
+        weight_state_snapshots_per_class: int = 10,
+        weight_state_eval_epochs: int = 10,
+        weight_state_eval_batch_size: int = 64,
+        weight_state_eval_learning_rate: float = 0.01,
+        weight_state_eval_hidden_size: int = 128,
         train_mb_size: int = 64,
         train_epochs: int = 1,
         eval_mb_size: int = 64,
@@ -114,7 +129,29 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_epochs = eval_epochs
         self.eval_batch_size = eval_batch_size
         self.eval_learning_rate = eval_learning_rate
+        self.weight_state_eval_epochs = weight_state_eval_epochs
+        self.weight_state_eval_batch_size = weight_state_eval_batch_size
+        self.weight_state_eval_learning_rate = weight_state_eval_learning_rate
+        self.skill_eval_routing = skill_eval_routing
         self.verbose = verbose
+
+        if weight_state_num_classes is None:
+            linear_layers = [
+                module for module in model.modules() if isinstance(module, nn.Linear)
+            ]
+            if not linear_layers:
+                raise ValueError(
+                    "weight_state_num_classes must be provided when the model "
+                    "has no final Linear classification layer"
+                )
+            weight_state_num_classes = linear_layers[-1].out_features
+        if weight_state_num_classes < 1:
+            raise ValueError("weight_state_num_classes must be positive")
+        self.weight_state_num_classes = int(weight_state_num_classes)
+
+        self.weight_evaluation_memory = WeightEvaluationMemory(
+            max_snapshots_per_class=weight_state_snapshots_per_class,
+        )
 
         # ------------------------------------------------------------------
         # Skill Memory
@@ -124,8 +161,26 @@ class SkillMemoryStrategy(SupervisedTemplate):
 
         # EvaluationMemoryPlugin extends SkillMemoryPlugin. Therefore there
         # is exactly one Skill Memory plugin in the Avalanche plugin list.
+        def capture_weight_state(
+            model: nn.Module,
+            inputs: torch.Tensor,
+            targets: torch.Tensor,
+            class_id: int,
+            skill_id: int,
+            step: int,
+        ) -> None:
+            self.weight_evaluation_memory.add(
+                model.state_dict(),
+                inputs=inputs,
+                targets=targets,
+                class_id=class_id,
+                skill_id=skill_id,
+                step=step,
+            )
+
         self.plugin = EvaluationMemoryPlugin(
             memory=self.memory,
+            weight_state_callback=capture_weight_state,
             max_skills=max_skills,
             forgetting_margin=forgetting_margin,
             score_floor=score_floor,
@@ -137,11 +192,6 @@ class SkillMemoryStrategy(SupervisedTemplate):
             class_train_batch_size=class_train_batch_size,
             reuse_is_mutable=reuse_is_mutable,
             force_decision=force_decision,
-            # Keep the normal Avalanche evaluation path untouched.
-            #
-            # The anonymous ML evaluator below is the primary evaluation
-            # methodology. The plugin's probe routing is currently kept
-            # disabled because it is an independent, known-problematic path.
             eval_routing="none",
             eval_memory_per_class=eval_memory_per_class,
             eval_memory_seed=eval_memory_seed,
@@ -158,10 +208,27 @@ class SkillMemoryStrategy(SupervisedTemplate):
             verbose=verbose,
         )
 
-        strategy_plugins: list[SupervisedPlugin] = [
-            self.plugin,
-            self.ml_evaluation_plugin,
-        ]
+        self.weight_state_ml_evaluation_plugin = WeightStateMLEvaluationPlugin(
+            memory=self.weight_evaluation_memory,
+            num_classes=self.weight_state_num_classes,
+            model_factory=weight_state_evaluator_model_factory,
+            ml1_model_factory=weight_state_ml1_model_factory,
+            epochs=weight_state_eval_epochs,
+            batch_size=weight_state_eval_batch_size,
+            learning_rate=weight_state_eval_learning_rate,
+            ml1_learning_rate=weight_state_ml1_learning_rate,
+            ml1_epochs=weight_state_ml1_epochs,
+            ml1_batch_size=weight_state_ml1_batch_size,
+            seed=eval_memory_seed,
+            hidden_size=weight_state_eval_hidden_size,
+            verbose=verbose,
+        )
+
+        strategy_plugins: list[SupervisedPlugin] = [self.plugin]
+        if skill_eval_routing == "none":
+            strategy_plugins.append(self.weight_state_ml_evaluation_plugin)
+        else:
+            strategy_plugins.append(self.ml_evaluation_plugin)
 
         if plugins:
             strategy_plugins.extend(plugins)
@@ -185,7 +252,14 @@ class SkillMemoryStrategy(SupervisedTemplate):
     # ------------------------------------------------------------------
 
     def results(self) -> dict[str, Any]:
-        """Return the independent ML evaluation results."""
+        """Return results for the active independent evaluation path."""
+        if self.skill_eval_routing == "none":
+            return {
+                "weight_state_evaluation": (
+                    self.weight_state_ml_evaluation_plugin.current_result
+                )
+            }
+
         return self.ml_evaluation_plugin.results()
 
     # ------------------------------------------------------------------
@@ -205,3 +279,11 @@ class SkillMemoryStrategy(SupervisedTemplate):
     @property
     def evaluator_model(self) -> nn.Module | None:
         return self.ml_evaluation_plugin.model
+
+    @property
+    def weight_state_evaluator_model(self) -> nn.Module | None:
+        return self.weight_state_ml_evaluation_plugin.model
+
+    @property
+    def weight_state_memory(self) -> WeightEvaluationMemory:
+        return self.weight_evaluation_memory

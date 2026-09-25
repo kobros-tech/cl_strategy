@@ -29,6 +29,12 @@ from .evaluation.ml_cl_evaluator import (
 )
 from .evaluation.reverse_engineering import CandidateParameters, NormalMLReverseEngineer
 from .evaluation.routing import RoutingResult, find_best_routing_skill
+from .evaluation.weight_state_ml_evaluator import (
+    WeightEvaluationMemory,
+    WeightStateMLEvaluation,
+    WeightStateMLEvaluationPlugin,
+    build_weight_state_evaluator,
+)
 from .strategy import SkillMemoryStrategy
 
 __all__ = [
@@ -61,5 +67,9 @@ __all__ = [
     "find_best_routing_skill",
     "find_best_skill",
     "train_evaluator",
+    "WeightEvaluationMemory",
+    "WeightStateMLEvaluation",
+    "WeightStateMLEvaluationPlugin",
+    "build_weight_state_evaluator",
     "SkillMemoryStrategy",
 ]

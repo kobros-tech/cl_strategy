@@ -28,6 +28,18 @@ from skill_memory.evaluation.ml_cl_evaluator import (
     make_loader,
     train_evaluator,
 )
+from skill_memory.evaluation.weight_state_ml_evaluator import (
+    WeightEvaluationMemory,
+    WeightStateMLEvaluationPlugin,
+    build_weight_state_evaluator,
+    build_weight_state_regressor,
+    consolidate_weight_evaluation_memory,
+    consolidate_weight_state_memory,
+    evaluate_weight_state_memory,
+    flatten_weight_state,
+    train_weight_state_evaluator,
+    train_weight_state_regressor,
+)
 
 
 def _synthetic_benchmark(
@@ -527,3 +539,396 @@ def test_ml_evaluation_does_not_modify_main_model():
 
     assert ml_plugin.evaluator_model is not None
     assert ml_plugin.evaluator_model is not model
+
+
+def _tiny_state(value: float) -> dict[str, torch.Tensor]:
+    return {
+        "weight": torch.tensor([[value, value + 1.0]]),
+        "bias": torch.tensor([value]),
+    }
+
+
+def _tiny_batch(
+    value: float,
+    class_id: int,
+    n: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inputs = torch.full((n, 2), value)
+    targets = torch.full((n,), class_id, dtype=torch.long)
+    return inputs, targets
+
+
+def test_weight_evaluation_memory_keeps_last_ten_snapshots_per_class():
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+
+    for step in range(12):
+        inputs, targets = _tiny_batch(float(step), class_id=7)
+        memory.add(
+            _tiny_state(float(step)),
+            inputs=inputs,
+            targets=targets,
+            class_id=7,
+            skill_id=3,
+        )
+
+    snapshots = memory.snapshots_for_class(7)
+
+    assert len(snapshots) == 10
+    assert [snapshot.step for snapshot in snapshots] == list(range(2, 12))
+    assert all(snapshot.class_id == 7 for snapshot in snapshots)
+    assert all(snapshot.skill_id == 3 for snapshot in snapshots)
+
+
+def test_weight_evaluation_memory_snapshots_are_immutable():
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+    state = _tiny_state(1.0)
+    inputs, targets = _tiny_batch(1.0, class_id=2)
+
+    memory.add(
+        state,
+        inputs=inputs,
+        targets=targets,
+        class_id=2,
+        skill_id=4,
+    )
+    state["weight"].fill_(99.0)
+    inputs.fill_(99.0)
+    targets.fill_(9)
+
+    stored = memory.snapshots_for_class(2)[0]
+    assert torch.equal(stored.state["weight"], torch.tensor([[1.0, 2.0]]))
+    assert torch.equal(stored.inputs, torch.ones(2, 2))
+    assert torch.equal(stored.targets, torch.tensor([2, 2]))
+
+
+def test_weight_state_memory_preserves_x_omega_y_pairing():
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+
+    first_x, first_y = _tiny_batch(1.0, class_id=0)
+    second_x, second_y = _tiny_batch(2.0, class_id=1)
+
+    memory.add(
+        _tiny_state(10.0),
+        inputs=first_x,
+        targets=first_y,
+        class_id=0,
+        skill_id=4,
+    )
+    memory.add(
+        _tiny_state(20.0),
+        inputs=second_x,
+        targets=second_y,
+        class_id=1,
+        skill_id=7,
+    )
+
+    snapshots = memory.snapshots()
+    assert torch.equal(snapshots[0].inputs, first_x)
+    assert torch.equal(snapshots[0].targets, first_y)
+    assert torch.equal(
+        flatten_weight_state(snapshots[0].state),
+        torch.tensor([10.0, 10.0, 11.0]),
+    )
+    assert snapshots[0].skill_id == 4
+
+    assert torch.equal(snapshots[1].inputs, second_x)
+    assert torch.equal(snapshots[1].targets, second_y)
+    assert snapshots[1].skill_id == 7
+
+
+def test_consolidate_weight_state_memory_builds_both_training_stages():
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+    inputs, targets = _tiny_batch(3.0, class_id=1)
+
+    memory.add(
+        _tiny_state(5.0),
+        inputs=inputs,
+        targets=targets,
+        class_id=1,
+        skill_id=2,
+    )
+
+    ml1_x, ml1_targets, ml2_x, ml2_y = consolidate_weight_state_memory(memory)
+
+    assert ml1_x.shape == (2, 2)
+    assert ml1_targets.shape == (2, 3)
+    assert ml2_x.shape == (1, 3)
+    assert ml2_y.tolist() == [1]
+    assert torch.equal(ml1_targets[0], ml1_targets[1])
+
+
+def test_ml1_regressor_learns_x_to_omega_on_synthetic_trajectory():
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+
+    for class_id in range(2):
+        for step in range(5):
+            value = float(class_id * 5 + step)
+            inputs, targets = _tiny_batch(value, class_id=class_id)
+            memory.add(
+                _tiny_state(value),
+                inputs=inputs,
+                targets=targets,
+                class_id=class_id,
+                skill_id=class_id,
+            )
+
+    model = build_weight_state_regressor(2, 3, hidden_size=8)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    train_weight_state_regressor(
+        model,
+        optimizer,
+        memory,
+        batch_size=4,
+        epochs=100,
+        device=torch.device("cpu"),
+        seed=0,
+    )
+
+    ml1_x, ml1_targets, _, _ = consolidate_weight_state_memory(memory)
+    with torch.no_grad():
+        prediction = model(ml1_x)
+
+    assert prediction.shape == ml1_targets.shape
+    assert torch.mean((prediction - ml1_targets) ** 2).item() < 1.0
+
+
+def test_weight_state_evaluator_learns_class_from_anonymous_weight_states():
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+
+    for class_id in range(2):
+        for step in range(10):
+            value = float(class_id * 5 + step * 0.01)
+            inputs, targets = _tiny_batch(value, class_id=class_id)
+            memory.add(
+                _tiny_state(value),
+                inputs=inputs,
+                targets=targets,
+                class_id=class_id,
+                skill_id=class_id,
+            )
+
+    inputs, targets = consolidate_weight_evaluation_memory(memory)
+
+    assert inputs.shape[0] == 20
+    assert inputs.shape[1] == 3
+    assert set(targets.tolist()) == {0, 1}
+
+    model = build_weight_state_evaluator(
+        input_size=3,
+        num_classes=2,
+        hidden_size=8,
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    train_weight_state_evaluator(
+        model,
+        optimizer,
+        criterion,
+        memory,
+        batch_size=8,
+        epochs=50,
+        device=torch.device("cpu"),
+        seed=0,
+    )
+
+    result = evaluate_weight_state_memory(
+        model,
+        memory,
+        device=torch.device("cpu"),
+    )
+
+    assert result["accuracy"] >= 0.9
+
+
+def test_skill_memory_plugin_captures_post_step_states_with_inputs():
+    benchmark = _synthetic_benchmark(
+        n_classes=2,
+        n_experiences=1,
+        n_per_class=12,
+    )
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+    captured: list[tuple[int, int, int]] = []
+
+    def callback(model, inputs, targets, class_id, skill_id, step):
+        memory.add(
+            model.state_dict(),
+            inputs=inputs,
+            targets=targets,
+            class_id=class_id,
+            skill_id=skill_id,
+            step=step,
+        )
+        captured.append((class_id, skill_id))
+
+    plugin = EvaluationMemoryPlugin(
+        memory=SkillMemory(max_skills=10),
+        eval_routing="none",
+        class_train_epochs=2,
+        class_train_batch_size=3,
+        weight_state_callback=callback,
+        verbose=False,
+    )
+    model = SimpleMLP(
+        input_size=6,
+        hidden_size=8,
+        num_classes=2,
+    )
+    strategy = Naive(
+        model=model,
+        optimizer=torch.optim.SGD(
+            model.parameters(),
+            lr=0.05,
+        ),
+        criterion=torch.nn.CrossEntropyLoss(),
+        train_mb_size=16,
+        train_epochs=1,
+        plugins=[plugin],
+    )
+
+    post_step_states = []
+    original_step = strategy.optimizer.step
+
+    def wrapped_step(*args, **kwargs):
+        result = original_step(*args, **kwargs)
+        post_step_states.append(
+            {
+                key: value.detach().cpu().clone()
+                for key, value in strategy.model.state_dict().items()
+            }
+        )
+        return result
+
+    strategy.optimizer.step = wrapped_step
+
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
+
+    assert len(captured) > 0
+    assert len(post_step_states) == len(memory.snapshots())
+    for snapshot, post_step_state in zip(
+        memory.snapshots(), post_step_states, strict=True
+    ):
+        assert all(
+            torch.equal(snapshot.state[key], value)
+            for key, value in post_step_state.items()
+        )
+    assert [step for _, _, step in captured] == [
+        snapshot.step for snapshot in memory.snapshots()
+    ]
+    assert set(memory.classes()) == {0, 1}
+    assert all(
+        len(memory.snapshots_for_class(class_id)) <= 10 for class_id in memory.classes()
+    )
+    assert all(
+        snapshot.inputs.shape[0] == snapshot.targets.shape[0]
+        for snapshot in memory.snapshots()
+    )
+
+
+def test_mutable_reuse_captures_weight_states():
+    benchmark = _synthetic_benchmark(n_classes=1, n_experiences=2, n_per_class=12)
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+
+    def callback(model, inputs, targets, class_id, skill_id, step):
+        memory.add(
+            model.state_dict(),
+            inputs=inputs,
+            targets=targets,
+            class_id=class_id,
+            skill_id=skill_id,
+            step=step,
+        )
+
+    plugin = EvaluationMemoryPlugin(
+        memory=SkillMemory(max_skills=10),
+        eval_routing="none",
+        class_train_epochs=1,
+        class_train_batch_size=4,
+        reuse_is_mutable=True,
+        force_decision="scratch",
+        weight_state_callback=callback,
+        verbose=False,
+    )
+    model = SimpleMLP(input_size=6, hidden_size=8, num_classes=1)
+    strategy = Naive(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        criterion=torch.nn.CrossEntropyLoss(),
+        train_mb_size=8,
+        train_epochs=1,
+        plugins=[plugin],
+    )
+
+    experiences = list(benchmark.train_stream)
+    strategy.train(experiences[0])
+    first_count = len(memory.snapshots_for_class(0))
+    plugin.force_decision = plugin.REUSE
+    strategy.train(experiences[1])
+
+    snapshots = memory.snapshots_for_class(0)
+    assert first_count > 0
+    assert len(snapshots) > first_count
+    assert all(snapshot.skill_id == snapshots[0].skill_id for snapshot in snapshots)
+
+
+def test_anonymous_two_stage_plugin_replaces_evaluation_output():
+    benchmark = _synthetic_benchmark(
+        n_classes=2,
+        n_experiences=1,
+        n_per_class=12,
+    )
+    memory = WeightEvaluationMemory(max_snapshots_per_class=10)
+
+    def callback(model, inputs, targets, class_id, skill_id, step):
+        memory.add(
+            model.state_dict(),
+            inputs=inputs,
+            targets=targets,
+            class_id=class_id,
+            skill_id=skill_id,
+            step=step,
+        )
+
+    plugin = EvaluationMemoryPlugin(
+        memory=SkillMemory(max_skills=10),
+        eval_routing="none",
+        class_train_epochs=1,
+        class_train_batch_size=4,
+        weight_state_callback=callback,
+        verbose=False,
+    )
+    anonymous = WeightStateMLEvaluationPlugin(
+        memory=memory,
+        num_classes=3,
+        epochs=2,
+        batch_size=4,
+        ml1_epochs=2,
+        ml1_batch_size=4,
+        verbose=False,
+    )
+    model = SimpleMLP(input_size=6, hidden_size=8, num_classes=2)
+    strategy = Naive(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        criterion=torch.nn.CrossEntropyLoss(),
+        train_mb_size=8,
+        train_epochs=1,
+        eval_mb_size=8,
+        plugins=[plugin, anonymous],
+    )
+
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
+
+    strategy.eval(benchmark.test_stream)
+    result = anonymous.current_result
+
+    assert anonymous.ml1_model is not None
+    assert anonymous.model is not None
+    assert anonymous.model[-1].out_features == 3
+    assert "true_omega_accuracy" in result
+    assert "end_to_end_accuracy" in result
+    assert "final_class_accuracy" in result
+    assert set(result["final_class_accuracy"]) == {0, 1}

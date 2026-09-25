@@ -9,14 +9,17 @@ from ..utils.probing import class_subset
 
 
 def train_on_class(
-    strategy, experience, target_class: int, epochs: int, batch_size: int
+    strategy,
+    experience,
+    target_class: int,
+    epochs: int,
+    batch_size: int,
+    on_step=None,
 ) -> None:
     """Train only on samples whose label equals ``target_class``.
 
-    This loop bypasses Avalanche's normal training-iteration machinery because
-    Skill Memory trains one class at a time. The training clock therefore has
-    to be advanced explicitly so evaluation checkpoints receive distinct
-    ``mb_index`` values in the JSON logger.
+    ``on_step`` is called immediately after each optimizer update and receives
+    the model, exact input/target batch, and zero-based optimization-step index.
     """
     dataset = class_subset(experience, target_class)
     if len(dataset) == 0:
@@ -45,9 +48,6 @@ def train_on_class(
             loss.backward()
             strategy.optimizer.step()
 
-            # This custom loop bypasses Avalanche's normal training
-            # iteration events, so BaseStrategy cannot advance the clock.
-            # JSONLogger uses this clock to distinguish evaluation
-            # checkpoints. Without it, later evaluations overwrite earlier
-            # records because they receive the same mb_index.
+            if on_step is not None:
+                on_step(strategy.model, x, y, strategy.clock.train_iterations)
             strategy.clock.train_iterations += 1
