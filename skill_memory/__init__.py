@@ -17,19 +17,19 @@ from .evaluation.fingerprint_routing import PersistentFingerprintSkillMemoryPlug
 from .evaluation.ml_cl_evaluator import (
     EvaluationMemory,
     EvaluationMemoryPlugin,
+    MLEvaluationPlugin,
     aggregate_experience_metrics,
     build_evaluator,
     compute_class_forgetting,
     compute_peak_class_forgetting,
     consolidate_evaluation_memory,
     evaluate_model_by_class,
-    evaluate_skill_memory,
     make_loader,
     train_evaluator,
 )
 from .evaluation.reverse_engineering import CandidateParameters, NormalMLReverseEngineer
 from .evaluation.routing import RoutingResult, find_best_routing_skill
-from .utils.models import SimpleMLP
+from .strategy import SkillMemoryStrategy
 
 __all__ = [
     "BehaviorFingerprintCache",
@@ -40,7 +40,6 @@ __all__ = [
     "EvaluationMemoryPlugin",
     "ExperienceClassMap",
     "RoutingResult",
-    "SimpleMLP",
     "SkillMemory",
     "SkillMemoryPlugin",
     "PersistentFingerprintSkillMemoryPlugin",
@@ -53,7 +52,7 @@ __all__ = [
     "compute_peak_class_forgetting",
     "consolidate_evaluation_memory",
     "evaluate_model_by_class",
-    "evaluate_skill_memory",
+    "MLEvaluationPlugin",
     "identify_binary_behavior",
     "make_loader",
     "reverse_engineer_scores_from_weights",
@@ -62,4 +61,5 @@ __all__ = [
     "find_best_routing_skill",
     "find_best_skill",
     "train_evaluator",
+    "SkillMemoryStrategy",
 ]
