@@ -39,27 +39,60 @@ def parse_args() -> argparse.Namespace:
         help="Frozen evaluation examples retained per class.",
     )
     parser.add_argument(
-        "--eval-epochs",
+        "--weight-state-ml1-epochs",
         type=int,
-        default=1,
-        help="Number of epochs used by the independent ML evaluator.",
+        default=10,
+        help="Number of epochs used to train ML-1 (x -> omega).",
+    )
+    parser.add_argument(
+        "--weight-state-ml1-batch-size",
+        type=int,
+        default=64,
+        help="Training batch size for ML-1 (x -> omega).",
+    )
+    parser.add_argument(
+        "--weight-state-ml1-learning-rate",
+        type=float,
+        default=0.001,
+        help="Learning rate for ML-1 (x -> omega).",
+    )
+    parser.add_argument(
+        "--weight-state-eval-epochs",
+        type=int,
+        default=10,
+        help="Number of epochs used to train ML-2 (omega -> y).",
+    )
+    parser.add_argument(
+        "--weight-state-eval-batch-size",
+        type=int,
+        default=64,
+        help="Training batch size for ML-2 (omega -> y).",
+    )
+    parser.add_argument(
+        "--weight-state-eval-learning-rate",
+        type=float,
+        default=0.01,
+        help="Learning rate for ML-2 (omega -> y).",
+    )
+    parser.add_argument(
+        "--weight-state-snapshots-per-class",
+        type=int,
+        default=10,
+        help="Maximum retained post-step omega snapshots per class.",
     )
     parser.add_argument("--train-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=0.01)
-    parser.add_argument("--eval-learning-rate", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-skills", type=int, default=20)
     parser.add_argument(
         "--skill-eval-routing",
-        choices=("oracle", "probe", "both", "none"),
+        choices=("none",),
         default="none",
         help=(
-            "Optional direct Skill Memory diagnostic. 'oracle' uses the "
-            "true class-to-skill mapping; 'probe' uses anonymous routing; "
-            "'both' runs both; 'none' disables direct Skill Memory "
-            "evaluation."
+            "Use the anonymous two-stage weight-state evaluator: "
+            "x -> ML-1 -> omega -> ML-2 -> y."
         ),
     )
     return parser.parse_args()
@@ -116,8 +149,9 @@ def main() -> None:
     #   3. independent ML evaluator
     #   4. normal Avalanche evaluation lifecycle
     #
-    # The evaluator receives only x at evaluation time and predicts y.
-    # No experience ID, task label, or skill ID is supplied.
+    # The evaluator receives only x at evaluation time and predicts y
+    # through ML-1 (x -> omega) and ML-2 (omega -> y).
+    # No experience ID, task label, class oracle, or skill ID is supplied.
     # ------------------------------------------------------------------
 
     strategy = SkillMemoryStrategy(
@@ -139,9 +173,14 @@ def main() -> None:
             drop_rate=0.1,
         ),
         eval_memory_per_class=args.eval_memory_per_class,
-        eval_epochs=args.eval_epochs,
-        eval_learning_rate=args.eval_learning_rate,
         skill_eval_routing=args.skill_eval_routing,
+        weight_state_ml1_epochs=args.weight_state_ml1_epochs,
+        weight_state_ml1_batch_size=args.weight_state_ml1_batch_size,
+        weight_state_ml1_learning_rate=args.weight_state_ml1_learning_rate,
+        weight_state_snapshots_per_class=args.weight_state_snapshots_per_class,
+        weight_state_eval_epochs=args.weight_state_eval_epochs,
+        weight_state_eval_batch_size=args.weight_state_eval_batch_size,
+        weight_state_eval_learning_rate=args.weight_state_eval_learning_rate,
         probe_seed=args.seed,
         device=device,
         verbose=True,
@@ -175,18 +214,31 @@ def main() -> None:
 
         # Normal Avalanche evaluation lifecycle.
         #
-        # The standalone ML evaluator is trained automatically on all
-        # accumulated frozen x,y evaluation memory before this evaluation.
+        # The weight-state evaluator is trained automatically on all
+        # accumulated post-step (x, omega, y) trajectory records before
+        # this evaluation.
         strategy.eval(benchmark.test_stream)
 
     # ------------------------------------------------------------------
     # Final results.
     # ------------------------------------------------------------------
 
-    results = strategy.results()
+    results = strategy.results()["weight_state_evaluation"]
 
     print()
     print("=== Summary ===")
+    print(
+        "true_omega_accuracy=",
+        f"{results['true_omega_accuracy']:.4f}",
+    )
+    print(
+        "end_to_end_accuracy=",
+        f"{results['end_to_end_accuracy']:.4f}",
+    )
+    print(
+        "omega_mse=",
+        f"{results['omega_mse']:.4f}",
+    )
 
     print(
         "mean_final_accuracy=",
