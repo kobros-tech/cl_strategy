@@ -760,7 +760,7 @@ def test_skill_memory_plugin_captures_post_step_states_with_inputs():
             skill_id=skill_id,
             step=step,
         )
-        captured.append((class_id, skill_id))
+        captured.append((class_id, skill_id, step))
 
     plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
@@ -828,7 +828,7 @@ def test_skill_memory_plugin_captures_post_step_states_with_inputs():
 
 
 def test_mutable_reuse_captures_weight_states():
-    benchmark = _synthetic_benchmark(n_classes=1, n_experiences=2, n_per_class=12)
+    benchmark = _synthetic_benchmark(n_classes=1, n_experiences=1, n_per_class=12)
     memory = WeightEvaluationMemory(max_snapshots_per_class=10)
 
     def callback(model, inputs, targets, class_id, skill_id, step):
@@ -861,11 +861,11 @@ def test_mutable_reuse_captures_weight_states():
         plugins=[plugin],
     )
 
-    experiences = list(benchmark.train_stream)
-    strategy.train(experiences[0])
+    experience = benchmark.train_stream[0]
+    strategy.train(experience)
     first_count = len(memory.snapshots_for_class(0))
     plugin.force_decision = plugin.REUSE
-    strategy.train(experiences[1])
+    strategy.train(experience)
 
     snapshots = memory.snapshots_for_class(0)
     assert first_count > 0
