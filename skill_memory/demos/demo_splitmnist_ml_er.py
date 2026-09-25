@@ -80,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Maximum retained post-step omega snapshots per class.",
     )
+    parser.add_argument(
+        "--weight-state-representation-size",
+        type=int,
+        default=128,
+        help="Fixed dimensionality of the compact omega representation.",
+    )
     parser.add_argument("--train-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=64)
@@ -178,6 +184,7 @@ def main() -> None:
         weight_state_ml1_batch_size=args.weight_state_ml1_batch_size,
         weight_state_ml1_learning_rate=args.weight_state_ml1_learning_rate,
         weight_state_snapshots_per_class=args.weight_state_snapshots_per_class,
+        weight_state_representation_size=args.weight_state_representation_size,
         weight_state_eval_epochs=args.weight_state_eval_epochs,
         weight_state_eval_batch_size=args.weight_state_eval_batch_size,
         weight_state_eval_learning_rate=args.weight_state_eval_learning_rate,
