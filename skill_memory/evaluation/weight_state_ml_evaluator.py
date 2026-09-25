@@ -113,8 +113,35 @@ def _flatten_inputs(inputs: Tensor) -> Tensor:
     return inputs.reshape(inputs.shape[0], -1).to(dtype=torch.float32)
 
 
+def sketch_weight_state(
+    state: Mapping[str, Tensor],
+    representation_size: int,
+    *,
+    seed: int = 0,
+) -> Tensor:
+    """Map a complete model state to a bounded deterministic state sketch."""
+    if representation_size < 1:
+        raise ValueError("representation_size must be positive")
+    flat = flatten_weight_state(state)
+    indices = torch.arange(flat.numel(), dtype=torch.long)
+    buckets = (indices * 1_000_003 + int(seed)) % representation_size
+    signs = torch.where(
+        ((indices * 9_176 + int(seed)) % 2) == 0,
+        torch.ones_like(flat),
+        -torch.ones_like(flat),
+    )
+    sketch = torch.zeros(representation_size, dtype=torch.float32)
+    sketch.scatter_add_(0, buckets, flat * signs)
+    counts = torch.zeros(representation_size, dtype=torch.float32)
+    counts.scatter_add_(0, buckets, torch.ones_like(flat))
+    return sketch / counts.clamp_min(1.0).sqrt()
+
+
 def consolidate_weight_state_memory(
     memory: WeightEvaluationMemory,
+    *,
+    representation_size: int = 128,
+    seed: int = 0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Build ML-1 pairs and ML-2 pairs from retained trajectory records."""
     snapshots = memory.snapshots()
@@ -127,7 +154,11 @@ def consolidate_weight_state_memory(
     ml2_targets: list[int] = []
 
     for snapshot in snapshots:
-        omega = flatten_weight_state(snapshot.state)
+        omega = sketch_weight_state(
+            snapshot.state,
+            representation_size,
+            seed=seed,
+        )
         batch_x = _flatten_inputs(snapshot.inputs)
         ml1_inputs.append(batch_x)
         ml1_targets.append(omega.unsqueeze(0).expand(batch_x.shape[0], -1))
@@ -144,9 +175,16 @@ def consolidate_weight_state_memory(
 
 def consolidate_weight_evaluation_memory(
     memory: WeightEvaluationMemory,
+    *,
+    representation_size: int = 128,
+    seed: int = 0,
 ) -> tuple[Tensor, Tensor]:
     """Backward-compatible ML-2 consolidation: omega -> class."""
-    _, _, inputs, targets = consolidate_weight_state_memory(memory)
+    _, _, inputs, targets = consolidate_weight_state_memory(
+        memory,
+        representation_size=representation_size,
+        seed=seed,
+    )
     return inputs, targets
 
 
@@ -190,12 +228,17 @@ def train_weight_state_regressor(
     epochs: int,
     device: torch.device,
     seed: int = 0,
+    representation_size: int = 128,
 ) -> None:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     if epochs < 1:
         return
-    inputs, targets, _, _ = consolidate_weight_state_memory(memory)
+    inputs, targets, _, _ = consolidate_weight_state_memory(
+        memory,
+        representation_size=representation_size,
+        seed=seed,
+    )
     loader = DataLoader(
         TensorDataset(inputs, targets),
         batch_size=min(batch_size, len(targets)),
@@ -223,13 +266,18 @@ def train_weight_state_evaluator(
     epochs: int,
     device: torch.device,
     seed: int = 0,
+    representation_size: int = 128,
 ) -> None:
-    """Train the ML-2 omega -> class evaluator."""
+    """Train the ML-2 omega -> class evaluator.""
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     if epochs < 1:
         return
-    inputs, targets = consolidate_weight_evaluation_memory(memory)
+    inputs, targets = consolidate_weight_evaluation_memory(
+        memory,
+        representation_size=representation_size,
+        seed=seed,
+    )
     loader = DataLoader(
         TensorDataset(inputs, targets),
         batch_size=min(batch_size, len(targets)),
@@ -253,8 +301,14 @@ def evaluate_weight_state_memory(
     memory: WeightEvaluationMemory,
     *,
     device: torch.device,
+    representation_size: int = 128,
+    seed: int = 0,
 ) -> dict[str, float]:
-    inputs, targets = consolidate_weight_evaluation_memory(memory)
+    inputs, targets = consolidate_weight_evaluation_memory(
+        memory,
+        representation_size=representation_size,
+        seed=seed,
+    )
     model.to(device).eval()
     logits = model(inputs.to(device))
     targets = targets.to(device)
@@ -283,6 +337,7 @@ class WeightStateMLEvaluation:
         ml1_batch_size: int | None = None,
         seed: int = 0,
         hidden_size: int = 128,
+        state_representation_size: int = 128,
         verbose: bool = True,
     ) -> None:
         if epochs < 1 or (ml1_epochs is not None and ml1_epochs < 1):
@@ -303,6 +358,9 @@ class WeightStateMLEvaluation:
         self.ml1_batch_size = int(ml1_batch_size or batch_size)
         self.seed = int(seed)
         self.hidden_size = int(hidden_size)
+        if state_representation_size < 1:
+            raise ValueError("state_representation_size must be positive")
+        self.state_representation_size = int(state_representation_size)
         self.verbose = verbose
         self.model: nn.Module | None = None
         self.ml1_model: nn.Module | None = None
@@ -312,7 +370,11 @@ class WeightStateMLEvaluation:
         self._last_result: dict[str, object] = {}
 
     def train(self, *, device: torch.device, num_classes: int) -> dict[str, object]:
-        ml1_x, ml1_y, omega, y = consolidate_weight_state_memory(self.memory)
+        ml1_x, ml1_y, omega, y = consolidate_weight_state_memory(
+            self.memory,
+            representation_size=self.state_representation_size,
+            seed=self.seed,
+        )
         input_size = ml1_x.shape[1]
         omega_size = ml1_y.shape[1]
         if self.ml1_model_factory is None:
@@ -332,6 +394,7 @@ class WeightStateMLEvaluation:
             epochs=self.ml1_epochs,
             device=device,
             seed=self.seed,
+            representation_size=self.state_representation_size,
         )
 
         if self.model_factory is None:
@@ -350,6 +413,7 @@ class WeightStateMLEvaluation:
             epochs=self.epochs,
             device=device,
             seed=self.seed,
+            representation_size=self.state_representation_size,
         )
         self._last_result = self.evaluate(device=device)
         return dict(self._last_result)
@@ -360,7 +424,9 @@ class WeightStateMLEvaluation:
             return {}
 
         ml1_x, ml1_targets, omega, targets = consolidate_weight_state_memory(
-            self.memory
+            self.memory,
+            representation_size=self.state_representation_size,
+            seed=self.seed,
         )
         self.ml1_model.to(device).eval()
         self.model.to(device).eval()
