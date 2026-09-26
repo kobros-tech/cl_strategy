@@ -131,9 +131,6 @@ class SkillMemoryStrategy(SupervisedTemplate):
             class_train_batch_size=class_train_batch_size,
             reuse_is_mutable=reuse_is_mutable,
             force_decision=force_decision,
-            # Normal Avalanche evaluation is always handled by the
-            # independent ML evaluator below.
-            eval_routing="none",
             eval_memory_per_class=eval_memory_per_class,
             eval_memory_seed=eval_memory_seed,
             verbose=verbose,
@@ -147,6 +144,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             learning_rate=eval_learning_rate,
             seed=eval_memory_seed,
             verbose=verbose,
+            eval_routing=eval_routing,
         )
 
         strategy_plugins: list[SupervisedPlugin] = [
