@@ -117,6 +117,27 @@ def test_skill_memory_diagnostic_is_separate_from_strategy_eval():
         assert "loss" in metrics
 
 
+def test_training_epochs_and_probe_weight_are_forwarded():
+    strategy = SkillMemoryStrategy(
+        model=SimpleMLP(input_size=6, hidden_size=8, num_classes=2),
+        optimizer=torch.optim.SGD(
+            SimpleMLP(input_size=6, hidden_size=8, num_classes=2).parameters(),
+            lr=0.05,
+        ),
+        criterion=torch.nn.CrossEntropyLoss(),
+        evaluator_model_factory=lambda: SimpleMLP(
+            input_size=6, hidden_size=8, num_classes=2
+        ),
+        train_epochs=3,
+        probe_behavior_weight=0.75,
+    )
+
+    assert strategy.train_epochs == 3
+    assert strategy.skill_memory_plugin.class_train_epochs == 3
+    assert strategy.probe_behavior_weight == 0.75
+    assert strategy.ml_evaluation_plugin.probe_behavior_weight == 0.75
+
+
 def test_public_properties_expose_underlying_components():
     strategy = _make_strategy(n_classes=2)
     assert strategy.memory is strategy.skill_memory_plugin.memory
