@@ -46,6 +46,10 @@ class SkillMemoryStrategy(SupervisedTemplate):
     The Avalanche strategy is responsible for lifecycle integration and for
     exposing the complete experiment through one public object.
 
+    train_epochs controls the number of epochs used for each explicit
+    class-training pass; Avalanche's mixed-experience training loop is disabled
+    by SkillMemoryPlugin after that custom training has been scheduled.
+
     Skill Memory training and evaluation-memory retention remain owned by
     ``EvaluationMemoryPlugin``, which extends ``SkillMemoryPlugin``. The
     independent ML evaluator is the sole evaluation methodology used by the
@@ -70,7 +74,6 @@ class SkillMemoryStrategy(SupervisedTemplate):
         probe_batches: int = 5,
         probe_seed: int | None = None,
         max_safety_candidates: int = 5,
-        class_train_epochs: int = 10,
         class_train_batch_size: int = 64,
         reuse_is_mutable: bool = True,
         force_decision: str | None = None,
@@ -86,9 +89,13 @@ class SkillMemoryStrategy(SupervisedTemplate):
         device: torch.device | str | None = None,
         verbose: bool = True,
         eval_routing: str = "none",
+        probe_behavior_weight: float = 0.5,
     ) -> None:
         if eval_memory_per_class <= 0:
             raise ValueError("eval_memory_per_class must be positive")
+
+        if train_epochs < 1:
+            raise ValueError("train_epochs must be at least 1")
 
         if eval_epochs < 1:
             raise ValueError("eval_epochs must be at least 1")
@@ -98,6 +105,9 @@ class SkillMemoryStrategy(SupervisedTemplate):
 
         if eval_routing not in ("none", "probe"):
             raise ValueError("eval_routing must be one of 'none' or 'probe'")
+
+        if not 0.0 <= probe_behavior_weight <= 1.0:
+            raise ValueError("probe_behavior_weight must be between 0 and 1")
 
         if device is None:
             device = next(model.parameters()).device
@@ -109,6 +119,8 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_learning_rate = eval_learning_rate
         self.verbose = verbose
         self.eval_routing = eval_routing
+        self.train_epochs = train_epochs
+        self.probe_behavior_weight = float(probe_behavior_weight)
 
         # ------------------------------------------------------------------
         # Skill Memory
@@ -127,7 +139,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             probe_batches=probe_batches,
             probe_seed=probe_seed,
             max_safety_candidates=max_safety_candidates,
-            class_train_epochs=class_train_epochs,
+            class_train_epochs=train_epochs,
             class_train_batch_size=class_train_batch_size,
             reuse_is_mutable=reuse_is_mutable,
             force_decision=force_decision,
@@ -145,6 +157,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             seed=eval_memory_seed,
             verbose=verbose,
             eval_routing=eval_routing,
+            probe_behavior_weight=probe_behavior_weight,
         )
 
         strategy_plugins: list[SupervisedPlugin] = [
