@@ -118,12 +118,10 @@ def test_skill_memory_diagnostic_is_separate_from_strategy_eval():
 
 
 def test_training_epochs_and_probe_weight_are_forwarded():
+    model = SimpleMLP(input_size=6, hidden_size=8, num_classes=2)
     strategy = SkillMemoryStrategy(
-        model=SimpleMLP(input_size=6, hidden_size=8, num_classes=2),
-        optimizer=torch.optim.SGD(
-            SimpleMLP(input_size=6, hidden_size=8, num_classes=2).parameters(),
-            lr=0.05,
-        ),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
         criterion=torch.nn.CrossEntropyLoss(),
         evaluator_model_factory=lambda: SimpleMLP(
             input_size=6, hidden_size=8, num_classes=2

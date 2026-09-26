@@ -50,8 +50,8 @@ from ..utils.probing import (
 from .routing import (
     build_skill_behavior_prototypes,
     combine_skill_scores,
-    score_skill_compatibility,
     score_skill_behavior_similarity,
+    score_skill_compatibility,
     select_skill_from_scores,
 )
 
@@ -789,9 +789,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
         if self.eval_routing == "probe":
             slot_ids = sorted(self.memory_plugin.memory.slots())
-            class_to_memory = {
-                int(item.class_id): item for item in memory
-            }
+            class_to_memory = {int(item.class_id): item for item in memory}
             skill_inputs = []
             for slot in slot_ids:
                 classes = self.memory_plugin.class_map.classes_for_skill(slot)

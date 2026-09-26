@@ -64,7 +64,6 @@ def score_skill_compatibility(
     return torch.stack(scores, dim=0)
 
 
-
 @torch.no_grad()
 def build_skill_behavior_prototypes(
     evaluator: torch.nn.Module,
@@ -83,9 +82,7 @@ def build_skill_behavior_prototypes(
             raise ValueError("each skill must provide non-empty batched inputs")
         logits = evaluator(inputs.to(device))
         if logits.ndim != 2:
-            raise RuntimeError(
-                "The evaluator must return [batch, classes] logits."
-            )
+            raise RuntimeError("The evaluator must return [batch, classes] logits.")
         prototypes.append(torch.softmax(logits, dim=1).mean(dim=0))
     return torch.stack(prototypes, dim=0)
 
@@ -128,10 +125,7 @@ def combine_skill_scores(
         behavior_scores.clamp_min(0.0),
         temperature=1.0,
     )
-    return (
-        (1.0 - behavior_weight) * compatibility
-        + behavior_weight * behavior
-    )
+    return (1.0 - behavior_weight) * compatibility + behavior_weight * behavior
 
 
 def select_skill_from_scores(scores: Tensor) -> RoutingResult:
