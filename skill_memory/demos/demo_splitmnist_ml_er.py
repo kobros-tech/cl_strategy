@@ -23,6 +23,11 @@ from avalanche.models import SimpleMLP
 from torch import nn
 
 from skill_memory import SkillMemoryStrategy
+from skill_memory.diagnostics import (
+    diagnose_evaluator_probe,
+    evaluate_class_oracle,
+    evaluate_skill_memory,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +65,14 @@ def parse_args() -> argparse.Namespace:
             "Skill Memory probe."
         ),
     )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "Run optional Skill Memory diagnostics (class oracle and "
+            "anonymous probe). Diagnostics never affect production evaluation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -81,6 +94,7 @@ def main() -> None:
     print("Training method: Skill Memory")
     print("Evaluation method: independent anonymous ML evaluator")
     print(f"Evaluation routing: {args.eval_routing}")
+    print(f"Diagnostics: {'enabled' if args.diagnose else 'disabled'}")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
     print(
@@ -173,6 +187,53 @@ def main() -> None:
         # Normal Avalanche evaluation lifecycle.
         strategy.eval(benchmark.test_stream)
 
+        if args.diagnose:
+            print("---------- Diagnostics ----------")
+            class_oracle = evaluate_class_oracle(
+                strategy.model,
+                strategy.skill_memory_plugin,
+                benchmark.test_stream,
+                experience_index,
+                num_classes=10,
+                batch_size=args.eval_batch_size,
+                device=device,
+            )
+            direct_probe = evaluate_skill_memory(
+                strategy.model,
+                strategy.skill_memory_plugin,
+                benchmark.test_stream,
+                experience_index,
+                num_classes=10,
+                routing="probe",
+                batch_size=args.eval_batch_size,
+                device=device,
+            )
+            evaluator_probe = diagnose_evaluator_probe(
+                strategy,
+                benchmark.test_stream,
+                batch_size=args.eval_batch_size,
+            )
+            print(
+                "class_oracle_mean_accuracy=",
+                f"{np.mean([item['accuracy'] for item in class_oracle.values()]):.4f}",
+            )
+            print(
+                "direct_probe_mean_accuracy=",
+                f"{np.mean([item['accuracy'] for item in direct_probe.values()]):.4f}",
+            )
+            print(
+                "evaluator_probe_routing_accuracy=",
+                f"{evaluator_probe['probe_routing_accuracy']:.4f}",
+            )
+            print(
+                "evaluator_probe_mean_confidence=",
+                f"{evaluator_probe['probe_mean_confidence']:.4f}",
+            )
+            print(
+                "evaluator_probe_mean_margin=",
+                f"{evaluator_probe['probe_mean_margin']:.4f}",
+            )
+
     # ------------------------------------------------------------------
     # Final results.
     # ------------------------------------------------------------------
@@ -198,11 +259,6 @@ def main() -> None:
     print("final_class_loss:")
     for class_id, loss in results["final_class_loss"].items():
         print(f"  class {class_id}: {loss:.4f}")
-
-    if args.eval_routing == "probe":
-        print("probe_routing_accuracy=", f"{results['probe_routing_accuracy']:.4f}")
-        print("probe_mean_confidence=", f"{results['probe_mean_confidence']:.4f}")
-        print("probe_mean_margin=", f"{results['probe_mean_margin']:.4f}")
 
 
 if __name__ == "__main__":

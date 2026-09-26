@@ -28,7 +28,7 @@ from .evaluation.ml_cl_evaluator import (
     train_evaluator,
 )
 from .evaluation.reverse_engineering import CandidateParameters, NormalMLReverseEngineer
-from .evaluation.routing import RoutingResult, find_best_routing_skill
+from .evaluation.routing import RoutingResult
 from .strategy import SkillMemoryStrategy
 
 __all__ = [
@@ -58,7 +58,6 @@ __all__ = [
     "reverse_engineer_scores_from_weights",
     "reverse_engineer_y",
     "reverse_engineer_y_from_weights",
-    "find_best_routing_skill",
     "find_best_skill",
     "train_evaluator",
     "SkillMemoryStrategy",

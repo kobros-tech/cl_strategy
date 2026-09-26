@@ -147,7 +147,6 @@ class SkillMemoryStrategy(SupervisedTemplate):
             learning_rate=eval_learning_rate,
             seed=eval_memory_seed,
             verbose=verbose,
-            eval_routing=eval_routing,
         )
 
         strategy_plugins: list[SupervisedPlugin] = [

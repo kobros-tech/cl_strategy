@@ -13,7 +13,10 @@ from avalanche.benchmarks import nc_benchmark
 from avalanche.models import SimpleMLP
 from torch.utils.data import TensorDataset
 
-from skill_memory.evaluation.ml_cl_evaluator import evaluate_skill_memory
+from skill_memory.diagnostics import (
+    diagnose_evaluator_probe,
+    evaluate_skill_memory,
+)
 from skill_memory.evaluation.routing import (
     score_skill_compatibility,
     select_skill_from_scores,
@@ -83,6 +86,10 @@ def test_standard_train_eval_loop_requires_no_extra_method_calls():
     for key in stream_accuracy_keys:
         assert 0.0 <= results[key] <= 1.0
 
+    assert "mean_final_accuracy" in results
+    assert "final_class_accuracy" in results
+    assert "final_class_loss" in results
+
 
 def test_skill_memory_diagnostic_is_separate_from_strategy_eval():
     """The direct Skill Memory diagnostic remains separate from strategy.eval().
@@ -150,28 +157,48 @@ def test_probe_uses_the_same_evaluator_and_reports_routing_metrics():
         assert torch.equal(strategy.model.state_dict()[name], value)
 
     assert strategy.evaluator_model is strategy.ml_evaluation_plugin.evaluator_model
-    assert "probe_routing_accuracy" in results
-    assert "probe_mean_confidence" in results
-    assert "probe_mean_margin" in results
-    assert "probe_diagnostics" in results
-    assert results["probe_diagnostics"]
-    diagnostic = results["probe_diagnostics"][0]
-    required_keys = {
-        "true_class",
-        "canonical_skill",
-        "selected_skill",
-        "candidate_skills",
-        "candidate_scores",
-        "top_candidates",
-        "evaluation_experience",
-        "confidence",
-        "margin",
-        "correct",
-    }
-    assert required_keys <= diagnostic.keys()
-    assert 0.0 <= results["probe_routing_accuracy"] <= 1.0
-    assert 0.0 <= results["probe_mean_confidence"] <= 1.0
-    assert 0.0 <= results["probe_mean_margin"] <= 1.0
+    assert "probe_routing_accuracy" not in results
+    assert "probe_mean_confidence" not in results
+    assert "probe_mean_margin" not in results
+    assert "probe_diagnostics" not in results
+
+
+def test_probe_diagnostics_are_opt_in():
+    """Diagnostic routing metrics run only through the diagnostics API."""
+    benchmark = _synthetic_benchmark(n_classes=4, n_experiences=2, n_per_class=20)
+    model = SimpleMLP(input_size=6, hidden_size=8, num_classes=4)
+    strategy = SkillMemoryStrategy(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+        criterion=torch.nn.CrossEntropyLoss(),
+        evaluator_model_factory=lambda: SimpleMLP(
+            input_size=6, hidden_size=8, num_classes=4
+        ),
+        eval_routing="probe",
+        max_skills=10,
+        eval_memory_per_class=10,
+        eval_epochs=2,
+        train_mb_size=16,
+        train_epochs=1,
+        eval_mb_size=16,
+        verbose=False,
+    )
+
+    for experience in benchmark.train_stream:
+        strategy.train(experience)
+
+    results = strategy.eval(benchmark.test_stream)
+    assert "probe_routing_accuracy" not in results
+
+    diagnostics = diagnose_evaluator_probe(
+        strategy,
+        benchmark.test_stream,
+        batch_size=16,
+    )
+    assert 0.0 <= diagnostics["probe_routing_accuracy"] <= 1.0
+    assert 0.0 <= diagnostics["probe_mean_confidence"] <= 1.0
+    assert 0.0 <= diagnostics["probe_mean_margin"] <= 1.0
+    assert diagnostics["probe_diagnostics"]
 
 
 def test_none_has_no_probe_metrics():

@@ -48,7 +48,6 @@ from ..utils.probing import (
     resize_incremental_classifiers_for_state,
 )
 from .routing import (
-    find_best_routing_skill,
     score_skill_compatibility,
     select_skill_from_scores,
 )
@@ -625,128 +624,6 @@ def compute_peak_class_forgetting(
     return result
 
 
-def evaluate_skill_memory(
-    model: nn.Module,
-    plugin: SkillMemoryPlugin,
-    test_stream,
-    up_to_index: int,
-    *,
-    num_classes: int,
-    routing: str,
-    batch_size: int,
-    device: torch.device,
-) -> dict[int, dict[str, float]]:
-    """Evaluate stored Skill Memory states with oracle or probe routing."""
-    if not plugin.memory:
-        raise RuntimeError("Cannot evaluate Skill Memory before any skill exists.")
-    if routing not in ("oracle", "probe"):
-        raise ValueError(f"Unknown Skill Memory routing mode: {routing}")
-    if num_classes < 1:
-        raise ValueError("num_classes must be positive")
-    if batch_size < 1:
-        raise ValueError("batch_size must be positive")
-
-    slot_ids = sorted(plugin.memory.slots())
-    skill_states = [plugin.memory.state(slot) for slot in slot_ids]
-    class_correct: dict[int, int] = {}
-    class_total: dict[int, int] = {}
-    class_loss: dict[int, float] = {}
-    original_state = {
-        name: value.detach().clone() for name, value in model.state_dict().items()
-    }
-
-    try:
-        model.eval()
-        for experience_index in range(up_to_index + 1):
-            experience = test_stream[experience_index]
-            loader = DataLoader(
-                experience.dataset, batch_size=batch_size, shuffle=False
-            )
-            for batch in loader:
-                inputs = batch[0].to(device)
-                labels = batch[1].to(device)
-                if routing == "oracle":
-                    chosen_logits = torch.empty(
-                        inputs.shape[0], num_classes, device=device
-                    )
-                    rows_by_skill: dict[int, list[int]] = {}
-                    for row, label in enumerate(labels.detach().cpu().tolist()):
-                        skill = plugin.class_map.find_skill_for_class_anywhere(
-                            int(label)
-                        )
-                        if skill is None:
-                            raise RuntimeError(
-                                f"No canonical skill recorded for class {label}."
-                            )
-                        rows_by_skill.setdefault(int(skill), []).append(row)
-                    for skill, rows in rows_by_skill.items():
-                        state = plugin.memory.state(skill)
-                        row_tensor = torch.tensor(rows, device=device)
-                        apply_skill_state_exact(model, state)
-                        raw_logits = model(inputs[row_tensor])
-                        chosen_logits[row_tensor] = expand_skill_logits(
-                            raw_logits,
-                            state,
-                            plugin.class_map.classes_for_skill(skill),
-                            num_classes,
-                        )
-                else:
-                    raw_logits = []
-                    for state in skill_states:
-                        apply_skill_state_exact(model, state)
-                        raw_logits.append(model(inputs))
-                    routing_result = find_best_routing_skill(
-                        raw_logits,
-                        skill_states,
-                        [plugin.class_map.classes_for_skill(slot) for slot in slot_ids],
-                    )
-                    chosen = routing_result.skill_indices
-                    expanded_by_skill = [
-                        expand_skill_logits(
-                            logits,
-                            state,
-                            plugin.class_map.classes_for_skill(slot),
-                            num_classes,
-                        )
-                        for slot, state, logits in zip(
-                            slot_ids, skill_states, raw_logits, strict=False
-                        )
-                    ]
-                    stacked = torch.stack(expanded_by_skill, dim=0)
-                    rows = torch.arange(inputs.shape[0], device=device)
-                    chosen_logits = stacked[chosen, rows]
-
-                per_sample_loss = nn.functional.cross_entropy(
-                    chosen_logits, labels, reduction="none"
-                )
-                predictions = chosen_logits.argmax(dim=1)
-                for class_id in torch.unique(labels).tolist():
-                    class_id = int(class_id)
-                    mask = labels == class_id
-                    class_loss[class_id] = class_loss.get(class_id, 0.0) + float(
-                        per_sample_loss[mask].sum().item()
-                    )
-                    class_correct[class_id] = class_correct.get(class_id, 0) + int(
-                        (predictions[mask] == labels[mask]).sum().item()
-                    )
-                    class_total[class_id] = class_total.get(class_id, 0) + int(
-                        mask.sum().item()
-                    )
-    finally:
-        apply_skill_state_exact(model, original_state)
-
-    results: dict[int, dict[str, float]] = {}
-    for class_id in sorted(class_total):
-        total = class_total[class_id]
-        if total == 0:
-            raise RuntimeError(f"Class {class_id} has no test samples.")
-        results[class_id] = {
-            "loss": class_loss[class_id] / total,
-            "accuracy": class_correct[class_id] / total,
-        }
-    return results
-
-
 def build_evaluator(
     model_factory: Callable[[], nn.Module],
     *,
@@ -840,11 +717,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_total: dict[int, int] = {}
         self._current_experience_classes: set[int] = set()
         self._main_model_state: dict[str, torch.Tensor] | None = None
-        self._probe_total = 0
-        self._probe_correct = 0
-        self._probe_confidences: list[float] = []
-        self._probe_margins: list[float] = []
-        self._probe_diagnostics: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Training-memory bookkeeping
@@ -913,11 +785,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
             if self.eval_routing != "none"
             else None
         )
-        self._probe_total = 0
-        self._probe_correct = 0
-        self._probe_confidences = []
-        self._probe_margins = []
-        self._probe_diagnostics = []
 
         if self.verbose:
             print(
@@ -997,67 +864,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
             strategy.model.load_state_dict(self._main_model_state)
 
         strategy.mb_output = routed_logits
-
-        if routing is not None:
-            labels = strategy.mbatch[1]
-            self._probe_total += int(labels.numel())
-            for label, chosen_idx in zip(
-                labels.detach().cpu().tolist(),
-                chosen_tensor.detach().cpu().tolist(),
-                strict=False,
-            ):
-                canonical = self.memory_plugin.class_map.find_skill_for_class_anywhere(
-                    int(label)
-                )
-                if canonical is not None and slot_ids[chosen_idx] == canonical:
-                    self._probe_correct += 1
-            candidate_scores = routing.probabilities.detach().cpu().tolist()
-            confidences = routing.best_probability.detach().cpu().tolist()
-            margins = routing.confidence_gap.detach().cpu().tolist()
-            self._probe_confidences.extend(confidences)
-            self._probe_margins.extend(margins)
-
-            labels_cpu = labels.detach().cpu().tolist()
-            chosen_cpu = chosen_tensor.detach().cpu().tolist()
-            for row, (label, chosen_idx) in enumerate(
-                zip(labels_cpu, chosen_cpu, strict=False)
-            ):
-                canonical = self.memory_plugin.class_map.find_skill_for_class_anywhere(
-                    int(label)
-                )
-                self._probe_diagnostics.append(
-                    {
-                        "true_class": int(label),
-                        "canonical_skill": (
-                            int(canonical) if canonical is not None else None
-                        ),
-                        "evaluation_experience": int(
-                            getattr(strategy.experience, "current_experience", -1)
-                        ),
-                        "selected_skill": int(slot_ids[chosen_idx]),
-                        "candidate_skills": [int(slot) for slot in slot_ids],
-                        "candidate_scores": [
-                            float(candidate_scores[skill_index][row])
-                            for skill_index in range(len(candidate_scores))
-                        ],
-                        "top_candidates": [
-                            {
-                                "skill": int(slot_ids[index]),
-                                "score": float(candidate_scores[index][row]),
-                            }
-                            for index in sorted(
-                                range(len(slot_ids)),
-                                key=lambda index: candidate_scores[index][row],
-                                reverse=True,
-                            )[:2]
-                        ],
-                        "confidence": float(confidences[row]),
-                        "margin": float(margins[row]),
-                        "correct": (
-                            canonical is not None and slot_ids[chosen_idx] == canonical
-                        ),
-                    }
-                )
 
     def after_eval_iteration(self, strategy, **kwargs) -> None:
         """Collect class-level metrics from the standalone evaluator."""
@@ -1215,28 +1021,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
                 self._accuracy_history,
                 self._class_to_experience,
                 len(self._accuracy_history),
-            )
-
-        if self.eval_routing == "probe":
-            result.update(
-                {
-                    "probe_routing_accuracy": (
-                        self._probe_correct / self._probe_total
-                        if self._probe_total
-                        else float("nan")
-                    ),
-                    "probe_mean_confidence": (
-                        float(np.mean(self._probe_confidences))
-                        if self._probe_confidences
-                        else float("nan")
-                    ),
-                    "probe_mean_margin": (
-                        float(np.mean(self._probe_margins))
-                        if self._probe_margins
-                        else float("nan")
-                    ),
-                    "probe_diagnostics": list(self._probe_diagnostics),
-                }
             )
 
         return result

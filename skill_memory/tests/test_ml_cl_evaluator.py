@@ -217,7 +217,6 @@ def test_evaluation_memory_plugin_captures_bounded_per_class_samples():
     )
     plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=5,
         eval_memory_seed=0,
         verbose=False,
@@ -260,7 +259,6 @@ def test_evaluate_model_by_class_and_aggregate_and_forgetting_end_to_end():
     )
     plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=10,
         eval_memory_seed=0,
         verbose=False,
@@ -348,7 +346,6 @@ def test_ml_evaluation_plugin_trains_and_reports_class_metrics():
     )
     memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=10,
         eval_memory_seed=0,
         verbose=False,
@@ -419,7 +416,6 @@ def test_ml_evaluator_uses_global_class_output_space():
     )
     memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=10,
         eval_memory_seed=0,
         verbose=False,
@@ -480,7 +476,6 @@ def test_ml_evaluation_does_not_modify_main_model():
     )
     memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=5),
-        eval_routing="none",
         eval_memory_per_class=5,
         eval_memory_seed=0,
         verbose=False,
