@@ -1,6 +1,9 @@
 import torch
 
-from skill_memory.evaluation import find_best_routing_skill, route_probe_logits
+from skill_memory.diagnostics import (
+    find_best_routing_skill,
+    route_probe_logits,
+)
 
 
 def test_route_probe_logits_selects_one_skill_per_sample_without_labels():

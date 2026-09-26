@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -20,69 +20,8 @@ class RoutingResult:
     confidence_gap: Tensor
 
 
-def _routing_scores(
-    raw_skill_logits: Sequence[Tensor],
-    states: Sequence[Mapping[str, torch.Tensor]],
-    skill_classes: Sequence[Sequence[int]],
-) -> torch.Tensor:
-    """Score each skill by probability mass on its owned classes.
-
-    ``logits`` here are a skill's own *raw*, unpadded forward-pass output
-    (see the caller in ``skill_memory_plugin.after_eval_forward``), not a
-    globally-padded tensor. Avalanche's ``IncrementalClassifier`` indexes its
-    output units directly by raw class label (verified against
-    ``avalanche.models.IncrementalClassifier`` - a skill's classifier only
-    ever grows to cover the classes it was actually trained on), so once a
-    skill owns a class, that class's column must already exist in the
-    skill's own raw logits. If it doesn't, class bookkeeping (``skill_classes``)
-    and the model's own output space have silently drifted apart - most
-    likely because the skill's classifier was queried with input from a
-    class it was never trained on, or a benchmark relabels class ids from
-    zero per experience, breaking the whole class_id convention. Either way,
-    silently treating that class as "not present" would make the skill score
-    zero and never win routing regardless of how well it actually matches
-    the input, which looks exactly like a routing failure rather than a
-    bookkeeping bug - so this raises instead of silently dropping the class.
-    """
-    del states
-
-    scores = []
-    for logits, owned_classes in zip(raw_skill_logits, skill_classes, strict=False):
-        if not owned_classes:
-            scores.append(torch.zeros(logits.shape[0], device=logits.device))
-            continue
-
-        if logits.shape[1] == 1:
-            # A one-unit head is a binary "is this the owned class" score,
-            # not a per-class-id column - it doesn't use the class_id-as-
-            # column-index convention the strict check below assumes.
-            scores.append(torch.sigmoid(logits[:, 0]))
-            continue
-
-        out_of_range = sorted(
-            class_id
-            for class_id in owned_classes
-            if not 0 <= class_id < logits.shape[1]
-        )
-        if out_of_range:
-            raise RuntimeError(
-                f"skill owns classes {out_of_range} but its raw output only "
-                f"has {logits.shape[1]} columns; class bookkeeping and the "
-                "model's own output space have drifted apart (see "
-                "_routing_scores docstring)"
-            )
-        valid_classes = sorted(owned_classes)
-
-        probabilities = torch.softmax(logits, dim=1)
-        scores.append(probabilities[:, valid_classes].sum(dim=1))
-
-    if not scores:
-        raise RuntimeError("No skills available for probe routing.")
-    return torch.stack(scores, dim=0)
-
-
 def _normalize_routing_scores(scores: Tensor, temperature: float) -> Tensor:
-    """Normalize bounded routing scores across candidate skills."""
+    """Normalize bounded evaluator routing scores across candidate skills."""
     if temperature <= 0:
         raise ValueError("temperature must be positive")
 
@@ -98,17 +37,103 @@ def _normalize_routing_scores(scores: Tensor, temperature: float) -> Tensor:
     return probabilities
 
 
-def find_best_routing_skill(
-    raw_skill_logits: list[Tensor],
-    states: list[Mapping[str, torch.Tensor]],
-    skill_classes: list[set[int]],
-    temperature: float = 1.0,
-) -> RoutingResult:
-    """Select the best stored skill for every unlabeled probe sample."""
-    scores = _routing_scores(raw_skill_logits, states, skill_classes)
-    probabilities = _normalize_routing_scores(scores, temperature)
-    skill_indices = probabilities.argmax(dim=0)
+def score_skill_compatibility(
+    evaluator_logits: Tensor,
+    skill_classes: Sequence[Sequence[int]],
+) -> Tensor:
+    """Score each skill from one shared independent evaluator."""
+    if evaluator_logits.ndim != 2:
+        raise ValueError("evaluator_logits must have shape [batch, classes]")
+    probabilities = torch.softmax(evaluator_logits, dim=1)
+    scores = []
+    for classes in skill_classes:
+        owned = sorted(int(class_id) for class_id in classes)
+        if not owned:
+            scores.append(
+                torch.zeros(probabilities.shape[0], device=probabilities.device)
+            )
+            continue
+        if max(owned) >= probabilities.shape[1]:
+            raise RuntimeError(
+                f"skill owns class {max(owned)}, but evaluator has only "
+                f"{probabilities.shape[1]} output columns"
+            )
+        scores.append(probabilities[:, owned].sum(dim=1))
+    if not scores:
+        raise RuntimeError("No skills available for probe routing.")
+    return torch.stack(scores, dim=0)
 
+
+@torch.no_grad()
+def build_skill_behavior_prototypes(
+    evaluator: torch.nn.Module,
+    skill_inputs: Sequence[Tensor],
+    *,
+    device: torch.device,
+) -> Tensor:
+    """Build one evaluator-behavior prototype for each stored skill."""
+    if not skill_inputs:
+        raise ValueError("skill_inputs must contain at least one skill")
+
+    evaluator.eval()
+    prototypes = []
+    for inputs in skill_inputs:
+        if inputs.ndim < 2 or inputs.shape[0] == 0:
+            raise ValueError("each skill must provide non-empty batched inputs")
+        logits = evaluator(inputs.to(device))
+        if logits.ndim != 2:
+            raise RuntimeError("The evaluator must return [batch, classes] logits.")
+        prototypes.append(torch.softmax(logits, dim=1).mean(dim=0))
+    return torch.stack(prototypes, dim=0)
+
+
+def score_skill_behavior_similarity(
+    evaluator_logits: Tensor,
+    behavior_prototypes: Tensor,
+) -> Tensor:
+    """Score samples by cosine similarity to skill behavior prototypes."""
+    if evaluator_logits.ndim != 2:
+        raise ValueError("evaluator_logits must have shape [batch, classes]")
+    if behavior_prototypes.ndim != 2:
+        raise ValueError("behavior_prototypes must have shape [skills, classes]")
+    if evaluator_logits.shape[1] != behavior_prototypes.shape[1]:
+        raise ValueError("evaluator and prototype class dimensions must match")
+
+    probabilities = torch.softmax(evaluator_logits, dim=1)
+    sample = torch.nn.functional.normalize(probabilities, dim=1)
+    prototypes = torch.nn.functional.normalize(behavior_prototypes, dim=1)
+    return (sample @ prototypes.T).transpose(0, 1)
+
+
+def combine_skill_scores(
+    compatibility_scores: Tensor,
+    behavior_scores: Tensor,
+    *,
+    behavior_weight: float = 0.5,
+) -> Tensor:
+    """Combine class compatibility with evaluator behavior similarity."""
+    if not 0.0 <= behavior_weight <= 1.0:
+        raise ValueError("behavior_weight must be between 0 and 1")
+    if compatibility_scores.shape != behavior_scores.shape:
+        raise ValueError("skill score tensors must have the same shape")
+
+    compatibility = _normalize_routing_scores(
+        compatibility_scores,
+        temperature=1.0,
+    )
+    behavior = _normalize_routing_scores(
+        behavior_scores.clamp_min(0.0),
+        temperature=1.0,
+    )
+    return (1.0 - behavior_weight) * compatibility + behavior_weight * behavior
+
+
+def select_skill_from_scores(scores: Tensor) -> RoutingResult:
+    """Select one skill per sample from compatibility scores."""
+    if scores.ndim != 2 or scores.shape[0] < 1:
+        raise ValueError("scores must have shape [skills, batch]")
+    probabilities = _normalize_routing_scores(scores, temperature=1.0)
+    skill_indices = probabilities.argmax(dim=0)
     if probabilities.shape[0] == 1:
         best_probability = probabilities[0]
         second_probability = torch.zeros_like(best_probability)
@@ -116,7 +141,6 @@ def find_best_routing_skill(
         top2 = torch.topk(probabilities, k=2, dim=0).values
         best_probability = top2[0]
         second_probability = top2[1]
-
     return RoutingResult(
         skill_indices=skill_indices,
         probabilities=probabilities,
@@ -124,14 +148,3 @@ def find_best_routing_skill(
         second_probability=second_probability,
         confidence_gap=best_probability - second_probability,
     )
-
-
-def route_probe_logits(
-    raw_skill_logits: list[Tensor],
-    states: list[Mapping[str, torch.Tensor]],
-    skill_classes: list[set[int]],
-) -> Tensor:
-    """Compatibility wrapper returning only selected skill indices."""
-    return find_best_routing_skill(
-        raw_skill_logits, states, skill_classes
-    ).skill_indices
