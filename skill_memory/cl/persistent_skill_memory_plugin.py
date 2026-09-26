@@ -39,6 +39,7 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         reverse_batch_size: int = 256,
         reverse_training_mode: str = "listwise",
         record_candidate_diagnostics: bool = True,
+        eval_routing: str = "probe",
         **kwargs,
     ):
         """Configure the persistent fingerprint cache and listwise reverse router.
@@ -51,6 +52,9 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         """
         kwargs.setdefault("reuse_is_mutable", False)
         super().__init__(*args, **kwargs)
+        if eval_routing not in ("none", "probe"):
+            raise ValueError("eval_routing must be one of 'none' or 'probe'")
+        self.eval_routing = eval_routing
         self.behavior = BehaviorFingerprintCache()
         self._custom_reverse_engineer_y = reverse_engineer_y_fn
         self.reverse_engineer = NormalMLReverseEngineer(

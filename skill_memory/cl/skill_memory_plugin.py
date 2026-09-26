@@ -21,20 +21,14 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from copy import deepcopy
-from typing import Any, Literal
+from typing import Any
 
-import torch
 from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
-from torch import Tensor
 
 from ..utils.probing import (
     apply_skill_state_exact,
     classes_in_experience,
-    expand_skill_logits,
-    find_best_routing_skill,
     origin_experience,
-    predict_logits,
     prepare_for_experience,
     restore_initial_state,
 )
@@ -43,8 +37,6 @@ from .skill_registry import ClassRecord, ExperienceClassMap, SkillMemory
 from .training import train_on_class
 
 logger = logging.getLogger(__name__)
-EvalRouting = Literal["none", "probe", "class_oracle", "oracle"]
-_VALID_EVAL_ROUTINGS = ("none", "probe", "class_oracle", "oracle")
 
 
 class SkillMemoryPlugin(SupervisedPlugin):
@@ -68,24 +60,16 @@ class SkillMemoryPlugin(SupervisedPlugin):
         reuse_is_mutable: bool = True,
         skill_name: Callable | None = None,
         force_decision: str | None = None,
-        eval_routing: EvalRouting = "probe",
         verbose: bool = True,
     ):
-        """Configure per-class REUSE/SCRATCH decisions and evaluation routing.
+        """Configure per-class REUSE/SCRATCH decisions.
 
         `memory` stores each skill's frozen weight snapshot; a fresh one is
-        created if not given. `eval_routing` controls how a class is
-        identified at evaluation time; see the module docstring's
-        `EvalRouting` values.
+        created if not given.
         """
         super().__init__()
         if force_decision not in (None, self.REUSE, self.SCRATCH):
             raise ValueError("invalid force_decision")
-        if eval_routing not in _VALID_EVAL_ROUTINGS:
-            raise ValueError(
-                f"invalid eval_routing={eval_routing!r}; "
-                f"must be one of {_VALID_EVAL_ROUTINGS}"
-            )
 
         self.memory = memory if memory is not None else SkillMemory(max_skills)
         self.class_map = ExperienceClassMap()
@@ -100,7 +84,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.reuse_is_mutable = reuse_is_mutable
         self.skill_name = skill_name
         self.force_decision = force_decision
-        self.eval_routing = eval_routing
         self.verbose = verbose
 
         self.last_class_decisions: dict[int, dict[int, dict[str, Any]]] = {}
@@ -112,15 +95,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self._original_train_epochs: int | None = None
         self._pre_eval_state: dict | None = None
         self._eval_active = False
-        self._probe_correct_margins: list[float] = []
-        self._probe_wrong_margins: list[float] = []
-
-        if eval_routing in ("oracle", "class_oracle"):
-            logger.warning(
-                "eval_routing=%r uses ground-truth labels for routing and is "
-                "diagnostic only, not a task-free headline result.",
-                eval_routing,
-            )
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -371,237 +345,31 @@ class SkillMemoryPlugin(SupervisedPlugin):
     # ------------------------------------------------------------------
 
     def before_eval(self, strategy, **kwargs) -> None:
-        """Snapshot the model and reset per-evaluation-phase bookkeeping."""
+        """Snapshot model state before the evaluation phase."""
         self._pre_eval_state = self._snapshot(strategy.model)
         self._eval_active = True
-        self._probe_correct_margins = []
-        self._probe_wrong_margins = []
 
     def before_eval_exp(self, strategy, **kwargs) -> None:
-        """Route this evaluation experience's classes per `self.eval_routing`."""
-        if not self._eval_active or self.eval_routing == "none":
-            return
+        """Prepare an evaluation experience.
 
-        experience = strategy.experience
-
-        if self.eval_routing == "oracle":
-            # Backwards-compatible coarse diagnostic: one skill for the
-            # complete evaluation experience. This is intentionally not the
-            # main class-aware evaluator because one experience can contain
-            # classes owned by several skills.
-            experience_index = getattr(experience, "current_experience", None)
-            if experience_index is None:
-                experience_index = getattr(experience, "experience_id", None)
-            if experience_index is None:
-                return
-            grouped = self.class_map.skills_for_experience(int(experience_index))
-            if not grouped:
-                return
-            skill = max(grouped, key=lambda item: len(item[1]))[0]
-            apply_skill_state_exact(strategy.model, self.memory.state(skill))
-            self._reset_optimizer(strategy)
-            self._log(
-                "[ORACLE eval diagnostic] experience "
-                f"{experience_index} -> skill {skill}"
-            )
-            return
-
-        if self.eval_routing in ("probe", "class_oracle") and self.memory:
-            self._log(
-                f"[{self.eval_routing.upper()} eval] per-sample routing active "
-                f"for experience {getattr(experience, 'current_experience', '?')} "
-                f"({len(self.memory)} skills known)"
-            )
+        Skill Memory does not route evaluation samples here. Anonymous
+        evaluation routing, when enabled, is owned by the independent ML
+        evaluator.
+        """
+        return
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
-        """Route each evaluation sample to a stored skill before metrics.
-
-        ``probe`` is label-free: it compares each sample's prediction across
-        all stored skills and uses a normalized confidence score.
-        ``class_oracle`` is diagnostic only and uses the true label to select
-        the canonical skill. Both operate on the actual minibatch, so samples
-        from different skills may coexist in one Avalanche batch.
-
-        The confidence used by ``probe`` is deliberately based on the
-        classifier output margin rather than raw entropy. Raw entropy is
-        incomparable when skill snapshots have different numbers of output
-        units, and a one-class head has identically zero entropy for every
-        input. The margin is normalized by the L2 norm of the classifier
-        weights when that structure is available.
-        """
-        if not self._eval_active or self.eval_routing not in ("probe", "class_oracle"):
-            return
-        if len(self.memory) == 0:
-            return
-
-        x, y = strategy.mbatch[0], strategy.mbatch[1]
-        device = x.device
-        slot_ids = sorted(self.memory.slots())
-        probe_model = deepcopy(strategy.model)
-
-        raw_skill_logits = [
-            predict_logits(probe_model, self.memory.state(slot), x) for slot in slot_ids
-        ]
-        output_dim = strategy.mb_output.shape[-1]
-        per_skill_logits = [
-            expand_skill_logits(
-                logits,
-                self.memory.state(slot),
-                self.class_map.classes_for_skill(slot),
-                output_dim,
-            )
-            for slot, logits in zip(slot_ids, raw_skill_logits, strict=False)
-        ]
-        batch_size = x.shape[0]
-
-        if self.eval_routing == "class_oracle":
-            chosen = []
-            for label in y.detach().cpu().tolist():
-                skill = self.class_map.find_skill_for_class_anywhere(int(label))
-                chosen.append(slot_ids.index(skill) if skill in slot_ids else 0)
-            chosen = torch.tensor(chosen, device=device, dtype=torch.long)
-        else:
-            routing = find_best_routing_skill(
-                raw_skill_logits,
-                [self.memory.state(slot) for slot in slot_ids],
-                [self.class_map.classes_for_skill(slot) for slot in slot_ids],
-            )
-            chosen = routing.skill_indices
-            self._log_probe_routing_diagnostic(y, chosen, slot_ids, routing)
-
-        strategy.mb_output = torch.stack(per_skill_logits, dim=0)[
-            chosen, torch.arange(batch_size, device=device)
-        ]
+        """Leave evaluation outputs untouched."""
+        return
 
     def after_eval(self, strategy, **kwargs) -> None:
-        """Log probe-margin diagnostics and restore the model to its pre-eval state."""
+        """Restore the model state that existed before evaluation."""
         if not self._eval_active:
             return
         try:
-            self._log_probe_margin_summary()
             if self._pre_eval_state is not None:
                 restore_initial_state(strategy.model, self._pre_eval_state)
                 self._reset_optimizer(strategy)
         finally:
             self._pre_eval_state = None
             self._eval_active = False
-
-    def _log_probe_routing_diagnostic(
-        self,
-        y: Tensor,
-        chosen: Tensor,
-        slot_ids: list[int],
-        routing,
-    ) -> None:
-        """Log probe-vs-oracle skill-selection agreement for this batch.
-
-        This measures routing quality in isolation, separate from the
-        combined probe accuracy number. It answers: "even ignoring
-        whether the final prediction was correct, did probe pick the
-        SAME skill that class_oracle would have picked?" That number
-        distinguishes a routing problem (skills are fine, wrong one
-        got picked) from a skill-quality problem (right skill picked,
-        but its prediction was still wrong).
-
-        Also reports how many samples cleared `self.score_floor`
-        (default 0.9) on `routing.best_probability`. That value is
-        the unsupervised counterpart of the exact same score used by
-        `decision.py`'s `score_floor` check during training -- the
-        training-time version uses the TRUE label as the target
-        because the class being probed is already known; here there
-        is no label, so the "target" is each skill's own claimed
-        class, and the reported probability is how much a skill's own
-        softmax believes the input actually is that class. This does
-        NOT change which skill gets selected (selection is always
-        argmax); it's a diagnostic count of how many routing decisions
-        were made with the same confidence level that training
-        considers reliable.
-
-        This is purely additive logging -- it does not change routing,
-        predictions, or metrics. Safe to run alongside a normal
-        `eval_routing="probe"` pass.
-        """
-        labels = y.detach().cpu().tolist()
-        chosen_list = chosen.detach().cpu().tolist()
-        best_probs = routing.best_probability.detach().cpu().tolist()
-        margins = routing.confidence_gap.detach().cpu().tolist()
-
-        agree = 0
-        above_floor = 0
-        mismatches = []
-        for label, chosen_idx, prob, margin in zip(
-            labels, chosen_list, best_probs, margins, strict=False
-        ):
-            oracle_skill = self.class_map.find_skill_for_class_anywhere(int(label))
-            oracle_idx = (
-                slot_ids.index(oracle_skill) if oracle_skill in slot_ids else None
-            )
-            probe_skill = slot_ids[chosen_idx]
-            correct = oracle_idx is not None and chosen_idx == oracle_idx
-            if correct:
-                agree += 1
-                self._probe_correct_margins.append(margin)
-            else:
-                self._probe_wrong_margins.append(margin)
-                mismatches.append(
-                    (int(label), oracle_skill, probe_skill, round(prob, 4))
-                )
-            floor = self.score_floor if self.score_floor is not None else 0.9
-            if prob >= floor:
-                above_floor += 1
-
-        total = len(labels)
-        routing_acc = agree / total if total else float("nan")
-        self._log(
-            f"[PROBE routing diagnostic] batch routing_accuracy={routing_acc:.4f} "
-            f"({agree}/{total} samples "
-            f"routed to the same skill class_oracle would pick), "
-            f"{above_floor}/{total} at or above score_floor="
-            f"{self.score_floor if self.score_floor is not None else 0.9}"
-        )
-        if mismatches:
-            sample = mismatches[:5]
-            self._log(
-                f"[PROBE routing diagnostic] sample mismatches "
-                f"(label, oracle_skill, probe_skill, best_probability): "
-                f"{sample}"
-            )
-
-    def _log_probe_margin_summary(self) -> None:
-        """Aggregate winner-vs-second-best margin, correct vs wrong routing.
-
-        Called once at the end of an eval phase (see `after_eval`), over
-        every sample seen across the whole phase, not just one batch --
-        the mean-margin comparison is noisy on a single batch and is
-        the number actually worth trusting.
-        """
-        if not self._probe_correct_margins and not self._probe_wrong_margins:
-            return
-
-        def _mean(xs: list[float]) -> float:
-            return sum(xs) / len(xs) if xs else float("nan")
-
-        correct_mean = _mean(self._probe_correct_margins)
-        wrong_mean = _mean(self._probe_wrong_margins)
-        self._log(
-            "[PROBE routing diagnostic] eval-phase margin summary: "
-            f"correct routing n={len(self._probe_correct_margins)} "
-            f"mean_margin={correct_mean:.4f} | "
-            f"wrong routing n={len(self._probe_wrong_margins)} "
-            f"mean_margin={wrong_mean:.4f}"
-        )
-        if self._probe_correct_margins and self._probe_wrong_margins:
-            if correct_mean > wrong_mean:
-                self._log(
-                    "[PROBE routing diagnostic] correct routing has a higher mean "
-                    "margin than wrong routing -- the confidence score is at least "
-                    "partially discriminative."
-                )
-            else:
-                self._log(
-                    "[PROBE routing diagnostic] correct and wrong routing have "
-                    "similar/inverted mean margins -- the confidence score is NOT "
-                    "reliably separating skills; this needs a different signal "
-                    "(e.g. training skills with negative examples), not another "
-                    "formula on top of the current one."
-                )

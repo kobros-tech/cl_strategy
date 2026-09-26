@@ -6,7 +6,6 @@ The strategy integrates two distinct learning/evaluation processes:
    - class-level REUSE/SCRATCH decisions
    - skill allocation and storage
    - class-to-skill bookkeeping
-   - optional direct Skill Memory diagnostics
 
 2. Anonymous ML evaluator
    - receives only x at prediction time
@@ -28,6 +27,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from avalanche.evaluation.metrics import accuracy_metrics, loss_metrics
 from avalanche.training.plugins import SupervisedPlugin
 from avalanche.training.plugins.evaluation import EvaluationPlugin
 from avalanche.training.templates import SupervisedTemplate
@@ -46,10 +46,15 @@ class SkillMemoryStrategy(SupervisedTemplate):
     The Avalanche strategy is responsible for lifecycle integration and for
     exposing the complete experiment through one public object.
 
-    Skill Memory training itself remains in ``EvaluationMemoryPlugin`` /
-    ``SkillMemoryPlugin``. The independent ML evaluator remains owned by this
-    strategy because it is part of the experiment's evaluation methodology,
-    not part of Skill Memory's internal training algorithm.
+    train_epochs controls the number of epochs used for each explicit
+    class-training pass; Avalanche's mixed-experience training loop is disabled
+    by SkillMemoryPlugin after that custom training has been scheduled.
+
+    Skill Memory training and evaluation-memory retention remain owned by
+    ``EvaluationMemoryPlugin``, which extends ``SkillMemoryPlugin``. The
+    independent ML evaluator is the sole evaluation methodology used by the
+    normal ``strategy.eval()`` lifecycle. Direct Skill Memory diagnostics are
+    intentionally separate from this strategy.
     """
 
     def __init__(
@@ -69,12 +74,9 @@ class SkillMemoryStrategy(SupervisedTemplate):
         probe_batches: int = 5,
         probe_seed: int | None = None,
         max_safety_candidates: int = 5,
-        class_train_epochs: int = 10,
         class_train_batch_size: int = 64,
         reuse_is_mutable: bool = True,
         force_decision: str | None = None,
-        skill_eval_routing: str = "none",
-        skill_eval_batch_size: int = 64,
         eval_memory_per_class: int = 20,
         eval_memory_seed: int = 0,
         eval_epochs: int = 1,
@@ -86,25 +88,26 @@ class SkillMemoryStrategy(SupervisedTemplate):
         eval_mb_size: int = 64,
         device: torch.device | str | None = None,
         verbose: bool = True,
+        eval_routing: str = "none",
+        probe_behavior_weight: float = 0.5,
     ) -> None:
-        if skill_eval_routing not in {
-            "none",
-            "oracle",
-            "probe",
-            "both",
-        }:
-            raise ValueError(
-                "skill_eval_routing must be one of {'none', 'oracle', 'probe', 'both'}"
-            )
-
         if eval_memory_per_class <= 0:
             raise ValueError("eval_memory_per_class must be positive")
+
+        if train_epochs < 1:
+            raise ValueError("train_epochs must be at least 1")
 
         if eval_epochs < 1:
             raise ValueError("eval_epochs must be at least 1")
 
         if eval_batch_size < 1:
             raise ValueError("eval_batch_size must be positive")
+
+        if eval_routing not in ("none", "probe"):
+            raise ValueError("eval_routing must be one of 'none' or 'probe'")
+
+        if not 0.0 <= probe_behavior_weight <= 1.0:
+            raise ValueError("probe_behavior_weight must be between 0 and 1")
 
         if device is None:
             device = next(model.parameters()).device
@@ -115,6 +118,9 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_batch_size = eval_batch_size
         self.eval_learning_rate = eval_learning_rate
         self.verbose = verbose
+        self.eval_routing = eval_routing
+        self.train_epochs = train_epochs
+        self.probe_behavior_weight = float(probe_behavior_weight)
 
         # ------------------------------------------------------------------
         # Skill Memory
@@ -133,16 +139,10 @@ class SkillMemoryStrategy(SupervisedTemplate):
             probe_batches=probe_batches,
             probe_seed=probe_seed,
             max_safety_candidates=max_safety_candidates,
-            class_train_epochs=class_train_epochs,
+            class_train_epochs=train_epochs,
             class_train_batch_size=class_train_batch_size,
             reuse_is_mutable=reuse_is_mutable,
             force_decision=force_decision,
-            # Keep the normal Avalanche evaluation path untouched.
-            #
-            # The anonymous ML evaluator below is the primary evaluation
-            # methodology. The plugin's probe routing is currently kept
-            # disabled because it is an independent, known-problematic path.
-            eval_routing="none",
             eval_memory_per_class=eval_memory_per_class,
             eval_memory_seed=eval_memory_seed,
             verbose=verbose,
@@ -156,6 +156,8 @@ class SkillMemoryStrategy(SupervisedTemplate):
             learning_rate=eval_learning_rate,
             seed=eval_memory_seed,
             verbose=verbose,
+            eval_routing=eval_routing,
+            probe_behavior_weight=probe_behavior_weight,
         )
 
         strategy_plugins: list[SupervisedPlugin] = [
@@ -165,6 +167,12 @@ class SkillMemoryStrategy(SupervisedTemplate):
 
         if plugins:
             strategy_plugins.extend(plugins)
+
+        if evaluator is None:
+            evaluator = EvaluationPlugin(
+                accuracy_metrics(stream=True),
+                loss_metrics(stream=True),
+            )
 
         super().__init__(
             model=model,
@@ -179,6 +187,16 @@ class SkillMemoryStrategy(SupervisedTemplate):
             device=device,
             plugins=strategy_plugins,
         )
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def eval(self, exp_list, **kwargs):
+        """Run normal Avalanche evaluation and include ML evaluator results."""
+        avalanche_results = super().eval(exp_list, **kwargs)
+        avalanche_results.update(self.ml_evaluation_plugin.results())
+        return avalanche_results
 
     # ------------------------------------------------------------------
     # Results

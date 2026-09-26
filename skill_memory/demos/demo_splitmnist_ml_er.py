@@ -1,4 +1,4 @@
-"""SplitMNIST Skill Memory experiment with anonymous ML evaluation.
+"""SplitMNIST Skill Memory experiment with ML evaluation.
 
 The public SkillMemoryStrategy owns the complete experiment lifecycle:
 
@@ -23,6 +23,11 @@ from avalanche.models import SimpleMLP
 from torch import nn
 
 from skill_memory import SkillMemoryStrategy
+from skill_memory.diagnostics import (
+    diagnose_evaluator_probe,
+    evaluate_class_oracle,
+    evaluate_skill_memory,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,17 +54,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument("--eval-learning-rate", type=float, default=0.01)
+    parser.add_argument("--probe-behavior-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-skills", type=int, default=20)
     parser.add_argument(
-        "--skill-eval-routing",
-        choices=("oracle", "probe", "both", "none"),
+        "--eval-routing",
+        choices=("none", "probe"),
         default="none",
         help=(
-            "Optional direct Skill Memory diagnostic. 'oracle' uses the "
-            "true class-to-skill mapping; 'probe' uses anonymous routing; "
-            "'both' runs both; 'none' disables direct Skill Memory "
-            "evaluation."
+            "Evaluation routing: independent evaluator only or anonymous "
+            "Skill Memory probe."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "Run optional Skill Memory diagnostics (class oracle and "
+            "anonymous probe). Diagnostics never affect production evaluation."
         ),
     )
     return parser.parse_args()
@@ -82,6 +94,8 @@ def main() -> None:
     print("=== SplitMNIST Skill Memory experiment ===")
     print("Training method: Skill Memory")
     print("Evaluation method: independent anonymous ML evaluator")
+    print(f"Evaluation routing: {args.eval_routing}")
+    print(f"Diagnostics: {'enabled' if args.diagnose else 'disabled'}")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
     print(
@@ -104,9 +118,7 @@ def main() -> None:
     # Main Skill Memory model.
     # ------------------------------------------------------------------
 
-    model = SimpleMLP(
-        num_classes=10,
-    ).to(device)
+    model = SimpleMLP(num_classes=10).to(device)
 
     # ------------------------------------------------------------------
     # SkillMemoryStrategy owns:
@@ -141,10 +153,11 @@ def main() -> None:
         eval_memory_per_class=args.eval_memory_per_class,
         eval_epochs=args.eval_epochs,
         eval_learning_rate=args.eval_learning_rate,
-        skill_eval_routing=args.skill_eval_routing,
         probe_seed=args.seed,
         device=device,
         verbose=True,
+        eval_routing=args.eval_routing,
+        probe_behavior_weight=args.probe_behavior_weight,
     )
 
     # ------------------------------------------------------------------
@@ -156,8 +169,8 @@ def main() -> None:
     # Evaluation:
     #     strategy.eval(benchmark.test_stream)
     #
-    # The ML evaluator is invoked automatically by its Avalanche plugin
-    # during strategy.eval().
+    # The ML evaluator is trained automatically on all accumulated frozen
+    # evaluation memory before the normal Avalanche evaluation pass.
     # ------------------------------------------------------------------
 
     for experience_index, experience in enumerate(benchmark.train_stream):
@@ -174,10 +187,54 @@ def main() -> None:
         print(f"========== Evaluation after experience {experience_index} ==========")
 
         # Normal Avalanche evaluation lifecycle.
-        #
-        # The standalone ML evaluator is trained automatically on all
-        # accumulated frozen x,y evaluation memory before this evaluation.
         strategy.eval(benchmark.test_stream)
+
+        if args.diagnose:
+            print("---------- Diagnostics ----------")
+            class_oracle = evaluate_class_oracle(
+                strategy.model,
+                strategy.skill_memory_plugin,
+                benchmark.test_stream,
+                experience_index,
+                num_classes=10,
+                batch_size=args.eval_batch_size,
+                device=device,
+            )
+            direct_probe = evaluate_skill_memory(
+                strategy.model,
+                strategy.skill_memory_plugin,
+                benchmark.test_stream,
+                experience_index,
+                num_classes=10,
+                routing="probe",
+                batch_size=args.eval_batch_size,
+                device=device,
+            )
+            evaluator_probe = diagnose_evaluator_probe(
+                strategy,
+                benchmark.test_stream,
+                batch_size=args.eval_batch_size,
+            )
+            print(
+                "class_oracle_mean_accuracy=",
+                f"{np.mean([item['accuracy'] for item in class_oracle.values()]):.4f}",
+            )
+            print(
+                "direct_probe_mean_accuracy=",
+                f"{np.mean([item['accuracy'] for item in direct_probe.values()]):.4f}",
+            )
+            print(
+                "evaluator_probe_routing_accuracy=",
+                f"{evaluator_probe['probe_routing_accuracy']:.4f}",
+            )
+            print(
+                "evaluator_probe_mean_confidence=",
+                f"{evaluator_probe['probe_mean_confidence']:.4f}",
+            )
+            print(
+                "evaluator_probe_mean_margin=",
+                f"{evaluator_probe['probe_mean_margin']:.4f}",
+            )
 
     # ------------------------------------------------------------------
     # Final results.

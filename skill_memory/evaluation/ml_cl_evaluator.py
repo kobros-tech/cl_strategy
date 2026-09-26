@@ -42,6 +42,18 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
+from ..utils.probing import (
+    apply_skill_state_exact,
+    expand_skill_logits,
+    resize_incremental_classifiers_for_state,
+)
+from .routing import (
+    build_skill_behavior_prototypes,
+    combine_skill_scores,
+    score_skill_behavior_similarity,
+    score_skill_compatibility,
+    select_skill_from_scores,
+)
 
 
 @dataclass
@@ -456,7 +468,6 @@ def evaluate_model_by_class(
             results[class_id] = {
                 "loss": (class_loss[class_id] / total),
                 "accuracy": (class_correct[class_id] / total),
-                "experience": float(experience_index),
             }
 
     return results
@@ -519,6 +530,9 @@ def compute_class_forgetting(
     )
 
     for class_id in all_classes:
+        if class_id not in class_to_experience:
+            continue
+
         introduction = class_to_experience[class_id]
 
         if introduction >= len(accuracy_history):
@@ -570,6 +584,9 @@ def compute_peak_class_forgetting(
     )
 
     for class_id in all_classes:
+        if class_id not in class_to_experience:
+            continue
+
         introduction = class_to_experience[class_id]
 
         if introduction >= len(accuracy_history):
@@ -665,6 +682,8 @@ class MLEvaluationPlugin(SupervisedPlugin):
         learning_rate: float = 0.01,
         seed: int = 0,
         verbose: bool = True,
+        eval_routing: str = "none",
+        probe_behavior_weight: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -681,6 +700,12 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self.learning_rate = float(learning_rate)
         self.seed = int(seed)
         self.verbose = verbose
+        if eval_routing not in ("none", "probe"):
+            raise ValueError("eval_routing must be one of 'none' or 'probe'")
+        self.eval_routing = eval_routing
+        if not 0.0 <= probe_behavior_weight <= 1.0:
+            raise ValueError("probe_behavior_weight must be between 0 and 1")
+        self.probe_behavior_weight = float(probe_behavior_weight)
 
         self.model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -698,6 +723,8 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct: dict[int, int] = {}
         self._current_class_total: dict[int, int] = {}
         self._current_experience_classes: set[int] = set()
+        self._main_model_state: dict[str, torch.Tensor] | None = None
+        self._skill_behavior_prototypes: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Training-memory bookkeeping
@@ -758,6 +785,40 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct = {}
         self._current_class_total = {}
         self._current_experience_classes = set()
+        self._skill_behavior_prototypes = None
+
+        if self.eval_routing == "probe":
+            slot_ids = sorted(self.memory_plugin.memory.slots())
+            class_to_memory = {int(item.class_id): item for item in memory}
+            skill_inputs = []
+            for slot in slot_ids:
+                classes = self.memory_plugin.class_map.classes_for_skill(slot)
+                inputs = [
+                    class_to_memory[class_id].inputs
+                    for class_id in sorted(classes)
+                    if class_id in class_to_memory
+                ]
+                if not inputs:
+                    raise RuntimeError(
+                        f"Skill {slot} has no retained evaluation examples."
+                    )
+                skill_inputs.append(torch.cat(inputs, dim=0))
+
+            if skill_inputs:
+                self._skill_behavior_prototypes = build_skill_behavior_prototypes(
+                    self.model,
+                    skill_inputs,
+                    device=strategy.device,
+                )
+
+        self._main_model_state = (
+            {
+                name: value.detach().clone()
+                for name, value in strategy.model.state_dict().items()
+            }
+            if self.eval_routing != "none"
+            else None
+        )
 
         if self.verbose:
             print(
@@ -778,16 +839,82 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
     @torch.no_grad()
     def after_eval_forward(self, strategy, **kwargs) -> None:
-        """Replace the main model output with standalone ML predictions."""
+        """Produce normal or skill-routed predictions."""
         if not self._active or self.model is None:
             return
 
         inputs = strategy.mbatch[0]
-
         self.model.eval()
+        evaluator_logits = self.model(inputs)
 
-        # The evaluator sees only x.
-        strategy.mb_output = self.model(inputs)
+        # "none" is the reference implementation.
+        if self.eval_routing == "none":
+            strategy.mb_output = evaluator_logits
+            return
+
+        slot_ids = sorted(self.memory_plugin.memory.slots())
+        if not slot_ids:
+            strategy.mb_output = evaluator_logits
+            return
+
+        skill_classes = [
+            self.memory_plugin.class_map.classes_for_skill(slot) for slot in slot_ids
+        ]
+
+        compatibility_scores = score_skill_compatibility(
+            evaluator_logits,
+            skill_classes,
+        )
+
+        if self._skill_behavior_prototypes is None:
+            scores = compatibility_scores
+        else:
+            behavior_scores = score_skill_behavior_similarity(
+                evaluator_logits,
+                self._skill_behavior_prototypes,
+            )
+            scores = combine_skill_scores(
+                compatibility_scores,
+                behavior_scores,
+                behavior_weight=self.probe_behavior_weight,
+            )
+
+        routing = select_skill_from_scores(scores)
+        chosen_tensor = routing.skill_indices
+
+        if self._main_model_state is None:
+            raise RuntimeError("Missing main-model snapshot for routed evaluation.")
+
+        routed_logits = torch.empty(
+            inputs.shape[0],
+            evaluator_logits.shape[1],
+            device=inputs.device,
+            dtype=evaluator_logits.dtype,
+        )
+
+        try:
+            for skill_index, slot in enumerate(slot_ids):
+                rows = torch.where(chosen_tensor == skill_index)[0]
+                if rows.numel() == 0:
+                    continue
+                state = self.memory_plugin.memory.state(slot)
+                apply_skill_state_exact(strategy.model, state)
+                strategy.model.eval()
+                raw_logits = strategy.model(inputs[rows])
+                routed_logits[rows] = expand_skill_logits(
+                    raw_logits,
+                    state,
+                    self.memory_plugin.class_map.classes_for_skill(slot),
+                    evaluator_logits.shape[1],
+                )
+        finally:
+            resize_incremental_classifiers_for_state(
+                strategy.model,
+                self._main_model_state,
+            )
+            strategy.model.load_state_dict(self._main_model_state)
+
+        strategy.mb_output = routed_logits
 
     def after_eval_iteration(self, strategy, **kwargs) -> None:
         """Collect class-level metrics from the standalone evaluator."""
@@ -884,6 +1011,14 @@ class MLEvaluationPlugin(SupervisedPlugin):
                 f"{np.mean(list(current_accuracy.values())):.4f}"
             )
 
+        if self._main_model_state is not None:
+            resize_incremental_classifiers_for_state(
+                strategy.model,
+                self._main_model_state,
+            )
+            strategy.model.load_state_dict(self._main_model_state)
+        self._main_model_state = None
+        self._skill_behavior_prototypes = None
         self._active = False
 
     # ------------------------------------------------------------------

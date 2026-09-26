@@ -72,6 +72,48 @@ def _synthetic_benchmark(
     )
 
 
+def test_behavior_prototypes_add_an_independent_skill_signal():
+    from skill_memory.evaluation.routing import (
+        build_skill_behavior_prototypes,
+        score_skill_behavior_similarity,
+    )
+
+    model = SimpleMLP(input_size=2, hidden_size=4, num_classes=4)
+    inputs = [
+        torch.tensor([[4.0, 0.0], [4.0, 0.0]]),
+        torch.tensor([[0.0, 4.0], [0.0, 4.0]]),
+    ]
+    prototypes = build_skill_behavior_prototypes(
+        model,
+        inputs,
+        device=torch.device("cpu"),
+    )
+
+    assert prototypes.shape == (2, 4)
+
+    with torch.no_grad():
+        query_logits = model(torch.cat([inputs[0][:1], inputs[1][:1]], dim=0))
+    scores = score_skill_behavior_similarity(query_logits, prototypes)
+
+    assert scores.shape == (2, 2)
+    assert scores.argmax(dim=0).tolist() == [0, 1]
+
+
+def test_behavior_weight_zero_preserves_class_probability_probe():
+    from skill_memory.evaluation.routing import combine_skill_scores
+
+    compatibility = torch.tensor([[0.8, 0.2], [0.2, 0.8]])
+    behavior = torch.tensor([[0.1, 0.9], [0.9, 0.1]])
+
+    combined = combine_skill_scores(
+        compatibility,
+        behavior,
+        behavior_weight=0.0,
+    )
+
+    assert torch.allclose(combined, compatibility / compatibility.sum(dim=0))
+
+
 def test_consolidate_evaluation_memory_merges_by_class_across_experiences():
     memory = [
         EvaluationMemory(
@@ -217,7 +259,6 @@ def test_evaluation_memory_plugin_captures_bounded_per_class_samples():
     )
     plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=5,
         eval_memory_seed=0,
         verbose=False,
@@ -260,7 +301,6 @@ def test_evaluate_model_by_class_and_aggregate_and_forgetting_end_to_end():
     )
     plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=10,
         eval_memory_seed=0,
         verbose=False,
@@ -348,7 +388,6 @@ def test_ml_evaluation_plugin_trains_and_reports_class_metrics():
     )
     memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=10,
         eval_memory_seed=0,
         verbose=False,
@@ -419,7 +458,6 @@ def test_ml_evaluator_uses_global_class_output_space():
     )
     memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=10),
-        eval_routing="none",
         eval_memory_per_class=10,
         eval_memory_seed=0,
         verbose=False,
@@ -480,7 +518,6 @@ def test_ml_evaluation_does_not_modify_main_model():
     )
     memory_plugin = EvaluationMemoryPlugin(
         memory=SkillMemory(max_skills=5),
-        eval_routing="none",
         eval_memory_per_class=5,
         eval_memory_seed=0,
         verbose=False,

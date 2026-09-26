@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from skill_memory.evaluation import find_best_routing_skill
+from skill_memory.diagnostics import find_best_routing_skill
 
 
 def test_routing_selects_skill_with_highest_owned_class_probability():

@@ -1,6 +1,6 @@
 import torch
 
-from skill_memory.evaluation.routing import (
+from skill_memory.diagnostics import (
     find_best_routing_skill,
     route_probe_logits,
 )
@@ -70,8 +70,18 @@ def test_single_skill_has_probability_one_and_zero_second_best():
 def test_temperature_changes_sharpness_not_winner():
     logits, states, classes = _inputs()
 
-    cold = find_best_routing_skill(logits, states, classes, temperature=0.5)
-    hot = find_best_routing_skill(logits, states, classes, temperature=2.0)
+    cold = find_best_routing_skill(
+        logits,
+        states,
+        classes,
+        temperature=0.5,
+    )
+    hot = find_best_routing_skill(
+        logits,
+        states,
+        classes,
+        temperature=2.0,
+    )
 
     assert cold.skill_indices.tolist() == hot.skill_indices.tolist()
     assert not torch.allclose(cold.probabilities, hot.probabilities)
@@ -81,7 +91,12 @@ def test_invalid_temperature_is_rejected():
     logits, states, classes = _inputs()
 
     try:
-        find_best_routing_skill(logits, states, classes, temperature=0.0)
+        find_best_routing_skill(
+            logits,
+            states,
+            classes,
+            temperature=0.0,
+        )
     except ValueError as exc:
         assert "temperature" in str(exc)
     else:

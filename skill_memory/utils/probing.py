@@ -311,16 +311,3 @@ def expand_skill_logits(
     for local_index, global_class in enumerate(owned):
         result[:, global_class] = logits[:, local_index]
     return result
-
-
-# Compatibility re-exports only. The implementations live in evaluation/
-# routing.py; probing itself contains no routing/decision logic. The
-# `as`-aliases below are required so linters treat these as intentional
-# re-exports rather than unused imports; removing them silently breaks
-# `skill_memory_plugin.py`'s `from ..evaluation.routing import
-# find_best_routing_skill` compatibility path.
-from ..evaluation.routing import RoutingResult as RoutingResult  # noqa: E402
-from ..evaluation.routing import (  # noqa: E402
-    find_best_routing_skill as find_best_routing_skill,
-)
-from ..evaluation.routing import route_probe_logits as route_probe_logits  # noqa: E402
