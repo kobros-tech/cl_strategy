@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument("--eval-learning-rate", type=float, default=0.01)
+    parser.add_argument("--probe-behavior-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-skills", type=int, default=20)
     parser.add_argument(
@@ -156,6 +157,7 @@ def main() -> None:
         device=device,
         verbose=True,
         eval_routing=args.eval_routing,
+        probe_behavior_weight=args.probe_behavior_weight,
     )
 
     # ------------------------------------------------------------------
