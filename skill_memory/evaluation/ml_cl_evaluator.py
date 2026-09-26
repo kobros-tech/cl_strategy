@@ -48,7 +48,10 @@ from ..utils.probing import (
     resize_incremental_classifiers_for_state,
 )
 from .routing import (
+    build_skill_behavior_prototypes,
+    combine_skill_scores,
     score_skill_compatibility,
+    score_skill_behavior_similarity,
     select_skill_from_scores,
 )
 
@@ -680,6 +683,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         seed: int = 0,
         verbose: bool = True,
         eval_routing: str = "none",
+        probe_behavior_weight: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -699,6 +703,9 @@ class MLEvaluationPlugin(SupervisedPlugin):
         if eval_routing not in ("none", "probe"):
             raise ValueError("eval_routing must be one of 'none' or 'probe'")
         self.eval_routing = eval_routing
+        if not 0.0 <= probe_behavior_weight <= 1.0:
+            raise ValueError("probe_behavior_weight must be between 0 and 1")
+        self.probe_behavior_weight = float(probe_behavior_weight)
 
         self.model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -717,6 +724,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_total: dict[int, int] = {}
         self._current_experience_classes: set[int] = set()
         self._main_model_state: dict[str, torch.Tensor] | None = None
+        self._skill_behavior_prototypes: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Training-memory bookkeeping
@@ -777,6 +785,34 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct = {}
         self._current_class_total = {}
         self._current_experience_classes = set()
+        self._skill_behavior_prototypes = None
+
+        if self.eval_routing == "probe":
+            slot_ids = sorted(self.memory_plugin.memory.slots())
+            class_to_memory = {
+                int(item.class_id): item for item in memory
+            }
+            skill_inputs = []
+            for slot in slot_ids:
+                classes = self.memory_plugin.class_map.classes_for_skill(slot)
+                inputs = [
+                    class_to_memory[class_id].inputs
+                    for class_id in sorted(classes)
+                    if class_id in class_to_memory
+                ]
+                if not inputs:
+                    raise RuntimeError(
+                        f"Skill {slot} has no retained evaluation examples."
+                    )
+                skill_inputs.append(torch.cat(inputs, dim=0))
+
+            if skill_inputs:
+                self._skill_behavior_prototypes = build_skill_behavior_prototypes(
+                    self.model,
+                    skill_inputs,
+                    device=strategy.device,
+                )
+
         self._main_model_state = (
             {
                 name: value.detach().clone()
@@ -827,7 +863,24 @@ class MLEvaluationPlugin(SupervisedPlugin):
             self.memory_plugin.class_map.classes_for_skill(slot) for slot in slot_ids
         ]
 
-        scores = score_skill_compatibility(evaluator_logits, skill_classes)
+        compatibility_scores = score_skill_compatibility(
+            evaluator_logits,
+            skill_classes,
+        )
+
+        if self._skill_behavior_prototypes is None:
+            scores = compatibility_scores
+        else:
+            behavior_scores = score_skill_behavior_similarity(
+                evaluator_logits,
+                self._skill_behavior_prototypes,
+            )
+            scores = combine_skill_scores(
+                compatibility_scores,
+                behavior_scores,
+                behavior_weight=self.probe_behavior_weight,
+            )
+
         routing = select_skill_from_scores(scores)
         chosen_tensor = routing.skill_indices
 
@@ -967,6 +1020,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
             )
             strategy.model.load_state_dict(self._main_model_state)
         self._main_model_state = None
+        self._skill_behavior_prototypes = None
         self._active = False
 
     # ------------------------------------------------------------------
