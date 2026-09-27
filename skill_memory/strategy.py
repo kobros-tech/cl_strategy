@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """High-level Avalanche strategy with Skill Memory and ML evaluation.
 
 The strategy integrates two distinct learning/evaluation processes:
@@ -34,10 +37,11 @@ from avalanche.training.templates import SupervisedTemplate
 
 from .cl.skill_memory_plugin import SkillMemoryPlugin
 from .cl.skill_registry import SkillMemory
-from .evaluation.ml_cl_evaluator import (
+from .evaluation.independent_evaluator import (
     EvaluationMemoryPlugin,
     MLEvaluationPlugin,
 )
+from .utils.timing import TimingAccumulator
 
 
 class SkillMemoryStrategy(SupervisedTemplate):
@@ -56,6 +60,10 @@ class SkillMemoryStrategy(SupervisedTemplate):
     normal ``strategy.eval()`` lifecycle. Direct Skill Memory diagnostics are
     intentionally separate from this strategy.
     """
+
+    #: Bucket name used with `self.timing` (see
+    #: `skill_memory.diagnostics.timing_report`).
+    TIMING_EVALUATION = "independent_evaluator_and_test_evaluation"
 
     def __init__(
         self,
@@ -121,6 +129,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_routing = eval_routing
         self.train_epochs = train_epochs
         self.probe_behavior_weight = float(probe_behavior_weight)
+        self.timing = TimingAccumulator()
 
         # ------------------------------------------------------------------
         # Skill Memory
@@ -193,8 +202,17 @@ class SkillMemoryStrategy(SupervisedTemplate):
     # ------------------------------------------------------------------
 
     def eval(self, exp_list, **kwargs):
-        """Run normal Avalanche evaluation and include ML evaluator results."""
-        avalanche_results = super().eval(exp_list, **kwargs)
+        """Run normal Avalanche evaluation and include ML evaluator results.
+
+        Timed as one bucket (`self.TIMING_EVALUATION`) because
+        `super().eval()` both trains the independent evaluator (see
+        `MLEvaluationPlugin.before_eval`) and runs the real Avalanche
+        evaluation loop over `exp_list` -- see
+        `skill_memory.diagnostics.timing_report` to read this back
+        alongside Skill Memory's own decision/training timings.
+        """
+        with self.timing.track(self.TIMING_EVALUATION):
+            avalanche_results = super().eval(exp_list, **kwargs)
         avalanche_results.update(self.ml_evaluation_plugin.results())
         return avalanche_results
 

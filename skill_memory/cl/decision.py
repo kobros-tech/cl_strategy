@@ -1,8 +1,10 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Per-class Skill Memory decisions."""
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 from torch import nn
@@ -111,11 +113,18 @@ def score_class_against_skills(
     The second stage measures the *real* old-class score/accuracy only for the
     strongest candidates.  This keeps the safety check faithful while avoiding
     the old O(skills * old_classes) forward-pass explosion.
+
+    Both stages call ``evaluate_state``, which applies each candidate
+    skill's weights functionally (see
+    ``skill_memory.utils.probing.evaluate_state``) rather than mutating a
+    model in place -- so, unlike the original loop this replaced, none of
+    this needs its own copy of ``strategy.model``: ``strategy.model`` is
+    read from directly and is never modified by probing a class.
     """
     new_x, new_y = probe_class(
         experience, target_class, probe_batch_size, probe_batches, probe_seed
     )
-    probe_model = deepcopy(strategy.model)
+    probe_model = strategy.model
 
     # Stage 1: new-class imagination for every skill.
     candidates = []

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Skill Memory extension using a CL-independent normal ML router."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Tests for weight-based reconstruction of classifier decisions."""
 
 import torch

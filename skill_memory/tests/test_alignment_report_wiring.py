@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """diagnose=True must also compute the class-index alignment report.
 
 This is the concrete diagnostic PR review comment issuecomment-5718049313

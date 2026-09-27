@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Input-only evaluation and routing helpers."""
 
 from __future__ import annotations

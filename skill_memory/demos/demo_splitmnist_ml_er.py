@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """SplitMNIST Skill Memory experiment with ML evaluation.
 
 The public SkillMemoryStrategy owns the complete experiment lifecycle:

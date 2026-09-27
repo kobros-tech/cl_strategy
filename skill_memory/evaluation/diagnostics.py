@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Optional, intentionally expensive diagnostics for anonymous routing."""
 
 from __future__ import annotations

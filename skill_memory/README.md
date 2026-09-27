@@ -1,93 +1,151 @@
-# Class-level Skill Memory
+# `skill_memory` — implementation notes
 
-This package is an Avalanche plugin implementing probe-based Skill Memory at
-**class level**, rather than treating an Avalanche experience as one semantic
-unit.
+This is a contributor-facing companion to the [root README](../README.md),
+which covers the concepts, the math, and how to use the package. This
+document covers the internal contracts each module relies on, for anyone
+changing the code rather than just calling it.
 
-## Core semantics
+## Module dependency order
 
-For an experience containing classes `{c1, c2, ...}`:
+Lower modules never import from higher ones — breaking this ordering
+reintroduces a real circular import, not just a lint warning:
 
-1. Extract the labels actually present in `experience.dataset`.
-2. Process each class independently, including classes found in later sub-experiences of the same logical experience.
-3. If the class has already been mastered, use its canonical `class -> skill`
-   mapping. It is not re-assigned by the generic probe heuristic.
-4. For a genuinely new class, probe each stored skill using only that class's
-   samples.
-5. A candidate skill must remain safe on **all** classes that skill already
-   masters.
-6. `REUSE` loads the same reserved slot and, when `reuse_is_mutable=True`,
-   trains it on the new class and stores the updated state back to the same
-   slot.
-7. `SCRATCH` restores the pristine model, adapts it for the current
-   experience, trains only the target class, and stores a new slot.
-
-The bookkeeping is:
-
-```text
-experience -> [(skill, {classes})]
-class      -> canonical skill
-skill      -> all mastered classes
+```
+utils/probing.py, utils/timing.py   (no dependency on cl/ or evaluation/)
+        |
+        v
+cl/skill_registry.py  -->  cl/decision.py  -->  cl/skill_memory_plugin.py
+        |                                              |
+        v                                              v
+cl/training.py                          cl/persistent_skill_memory_plugin.py
+        |
+        v
+evaluation/routing.py --> evaluation/diagnostics.py
+        |
+        v
+evaluation/behavior.py --> evaluation/reverse_engineering.py
+        |
+        v
+evaluation/fingerprint_routing.py, evaluation/global_fingerprint_refresh.py
+        |
+        v
+evaluation/independent_evaluator.py   (subclasses cl.skill_memory_plugin.SkillMemoryPlugin)
+        |
+        v
+strategy.py, diagnostics.py            (top-level; import everything above)
 ```
 
-## Files
+`evaluation/independent_evaluator.py` is deliberately **not** re-exported
+from `evaluation/__init__.py` — only from the top-level `skill_memory`
+package — for exactly this reason (see the comment at the top of
+`evaluation/__init__.py`).
 
-- `skill_registry.py` — skill snapshots and class/experience bookkeeping.
-- `probing.py` — class filtering, probing, model-state helpers, and input-only routing.
-- `decision.py` — REUSE/SCRATCH decision logic.
-- `training.py` — one-class-at-a-time training loop.
-- `skill_memory_plugin.py` — Avalanche orchestration.
+## Bookkeeping invariants (`cl/skill_registry.py`)
 
-## Evaluation routing
+- `SkillMemory` stores `state_dict` snapshots by integer slot;
+  `ExperienceClassMap` stores which slot owns which class. These are kept
+  as two separate objects on purpose: a skill can master more than one
+  class, and one experience can therefore be associated with more than one
+  `(skill, classes)` group.
+- Once `ExperienceClassMap` records a class → skill mapping, it is never
+  overwritten. `find_skill_for_class_anywhere` is the one lookup every
+  other module should use rather than re-deriving it.
+- `SkillMemory.allocate()` reserves the *lowest free* slot and raises
+  `RuntimeError` once `max_skills` is reached — callers (`decision.py`,
+  `skill_memory_plugin.py`) are expected to handle that as "memory full,"
+  not as a bug.
 
-`eval_routing="probe"` is the default and is the task-free evaluation mode.
+## State application (`utils/probing.py`)
 
-Evaluation is still performed by Avalanche experience, matching the benchmark
-protocol used by ordinary continual-learning baselines such as ER. Inside each
-physical evaluation minibatch, however, samples may be routed to different
-stored skills. The probe router does not inspect the target labels.
+Two distinct contracts live side by side here; picking the wrong one for
+a new call site either corrupts the live model or silently reintroduces
+the O(skills) cost this module exists to avoid.
 
-### Best-skill routing API
+**Mutating** (a real, persistent state change): `apply_skill_state_exact`
+first calls `resize_incremental_classifiers_for_state` so
+`nn.Module.load_state_dict` never fails on a shape mismatch between the
+model's current `IncrementalClassifier` width and the snapshot's recorded
+width, then loads it for real. Use this (via `restore_initial_state`,
+its own name for the same operation used to undo scratch-training
+adaptation) wherever a skill's weights need to actually become the live
+model's weights going forward — `SkillMemoryPlugin`'s REUSE/SCRATCH
+training paths, and its before/after-eval snapshot restore.
 
-`find_best_routing_skill()` is the richer API behind `route_probe_logits()`.
-It receives one raw-logit tensor per stored skill plus the classes mastered by
-each skill. It does **not** receive labels.
+**Functional** (a disposable probe): `predict_logits` and
+`evaluate_state` apply a stored snapshot with
+`torch.func.functional_call` instead, so the model they're given is
+*never mutated* — no resize, no restore, and (critically) no per-skill
+`load_state_dict` copy of every parameter tensor. This is what makes
+`score_class_against_skills`' "for every stored skill, forward a probe
+batch" loop, and `MLEvaluationPlugin.after_eval_forward`'s per-batch
+routing, cheap: trying skill `k+1` costs one more forward pass, not one
+more full parameter copy. `evaluate_state`'s classifier-growth rule for a
+genuinely new class (`_functional_growth_for_experience`) deliberately
+duplicates `IncrementalClassifier.adaptation`'s math rather than calling
+`prepare_for_experience` (the mutating version), for the same reason.
+When adding a new read-only probe, prefer this contract; reach for the
+mutating one only when the caller genuinely needs the model itself to
+keep the new state afterwards.
 
-For every sample it:
+`classes_in_experience`/`class_indices` cache each dataset's full label
+list, keyed by the dataset *object* (a `weakref.WeakKeyDictionary`, not
+`id()`), so `decision.py`'s per-`(skill, class)` probing doesn't rescan
+the same dataset once per pair. See
+[`tests/test_probing_cache.py`](tests/test_probing_cache.py) for the
+exact scanning-cost guarantee this cache makes.
 
-1. scores each skill using the existing v0.1.4 routing signal: the strongest
-   logit among that skill's owned global class columns;
-2. applies `softmax(score / temperature)` across skills;
-3. selects the highest-probability skill;
-4. returns the best probability, second-best probability, and their gap.
+## Decision policy (`cl/decision.py`)
 
-The returned probabilities are **normalized routing probabilities**, not
-calibrated probabilities of correctness.
+See the [root README's math section](../README.md#how-it-decides-reuse-vs-scratch)
+for the formulas. Implementation notes that don't belong in that
+higher-level explanation:
 
-The result contains:
+- `score_class_against_skills` is two-staged on purpose: stage 1
+  (`evaluate_state` against the new class) runs for *every* stored skill,
+  cheaply — one functional forward pass each, no model copies (see
+  above); stage 2 (the real old-class safety check) only re-runs for the
+  top `max_safety_candidates` (default 5) by new-class score, since it is
+  `O(skills × old_classes)` forward passes otherwise.
+- `_strongest_candidates` finds the largest gap in a sorted metric
+  ranking rather than a fixed threshold, so the "how much better than the
+  runner-up does a candidate need to be" question doesn't need its own
+  magic number.
+- `evaluate_state` never takes a gradient step — "imagination" means
+  measuring a frozen skill's *existing* representation on a class it may
+  never have trained on, not training it further.
 
-```text
-skill_indices       [batch]
-probabilities       [skills, batch]
-best_probability    [batch]
-second_probability  [batch]
-confidence_gap      [batch]
+## Timing instrumentation (`utils/timing.py`, `diagnostics.py`)
+
+`SkillMemoryPlugin.timing` and `SkillMemoryStrategy.timing` are each a
+`TimingAccumulator`; `diagnostics.timing_report(strategy)` merges both
+into the three buckets described in the
+[root README](../README.md#performance-functional-probing-and-where-the-time-goes).
+If you add a new expensive stage to the lifecycle, wrap it with
+`self.timing.track("some_bucket_name")` on whichever plugin/strategy owns
+it, rather than adding another ad hoc `time.perf_counter()` call — the
+existing three buckets are read together specifically so the report
+stays comparable across runs.
+
+## Anonymous routing (`evaluation/routing.py`, `diagnostics.py`)
+
+`evaluation/routing.py` holds the shared primitives
+(`score_skill_compatibility`, `select_skill_from_scores`,
+`_normalize_routing_scores`) used by both the evaluator-based probe router
+(`evaluation/independent_evaluator.py`) and the evaluator-free anonymous
+router (`find_best_routing_skill` in the top-level `diagnostics.py`). If
+you change the temperature/normalization rule in one, check whether the
+other's tests
+([`tests/test_routing.py`](tests/test_routing.py),
+[`tests/test_continuous_fingerprint_routing.py`](tests/test_continuous_fingerprint_routing.py))
+still hold — they intentionally share the same math.
+
+## Running the tests
+
+```bash
+pytest skill_memory/tests -q
 ```
 
-`route_probe_logits()` remains available and returns only the selected skill
-indices for backwards compatibility.
-
-`class_oracle` is a diagnostic upper bound: it uses the true label to select the
-canonical skill for each sample. `oracle` is retained for backwards
-compatibility and swaps one skill for a whole evaluation experience; neither
-should be reported as the task-free headline result.
-
-The probe router does not use predictive entropy directly. Routing remains an
-input-only heuristic and never uses target labels.
-
-## Important invariant
-
-A class is never silently remapped to another skill. If an attempt is made to
-record a conflicting mapping, `ExperienceClassMap.record()` raises an error.
-This prevents a later experience from accidentally changing the identity of a
-class because of a noisy probe.
+96 tests, no network access and no GPU required; the slowest ones
+(`test_strategy.py`) build tiny synthetic Avalanche benchmarks rather than
+downloading a real dataset, so the whole suite runs in well under two
+minutes on CPU.

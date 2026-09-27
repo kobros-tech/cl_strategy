@@ -1,4 +1,7 @@
-"""Tests for `skill_memory.evaluation.ml_cl_evaluator`.
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
+"""Tests for `skill_memory.evaluation.independent_evaluator`.
 
 Uses a small synthetic (non-MNIST, no download needed) benchmark built
 with Avalanche's own `nc_benchmark` generator, exercising the same code
@@ -15,7 +18,7 @@ from avalanche.training import Naive
 from torch.utils.data import TensorDataset
 
 from skill_memory import SkillMemory
-from skill_memory.evaluation.ml_cl_evaluator import (
+from skill_memory.evaluation.independent_evaluator import (
     EvaluationMemory,
     EvaluationMemoryPlugin,
     MLEvaluationPlugin,

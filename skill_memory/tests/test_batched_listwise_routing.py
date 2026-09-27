@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Regression test: `_route` must route each sample in a batch independently.
 
 `_route` used to score the reverse-router's listwise Transformer once per

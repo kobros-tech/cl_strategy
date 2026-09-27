@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Tests for the per-skill global-class-id / classifier-width diagnostic.
 
 This is the concrete, runnable version of the diagnostic PR review comment

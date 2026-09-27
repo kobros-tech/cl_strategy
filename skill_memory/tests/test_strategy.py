@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Tests for `skill_memory.strategy.SkillMemoryStrategy`.
 
 The central property being verified: a plain
@@ -26,7 +29,7 @@ from skill_memory.strategy import SkillMemoryStrategy
 
 def _synthetic_benchmark(n_classes: int, n_experiences: int, n_per_class: int = 40):
     """A synthetic, well-separated, no-download benchmark (see
-    test_ml_cl_evaluator.py for why each class perturbs its own
+    test_independent_evaluator.py for why each class perturbs its own
     dimension rather than a shared scalar offset)."""
     torch.manual_seed(0)
     n_features = 6

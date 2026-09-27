@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Global synchronization of reverse-engineering fingerprints."""
 
 from __future__ import annotations

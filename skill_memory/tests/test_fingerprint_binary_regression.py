@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Regression tests for the current listwise reverse router."""
 
 from types import SimpleNamespace

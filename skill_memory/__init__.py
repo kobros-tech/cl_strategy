@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Class-level probe-based Skill Memory for Avalanche."""
 
 from .cl.decision import find_best_skill
@@ -14,7 +17,7 @@ from .evaluation.behavior import (
 )
 from .evaluation.diagnostics import class_index_alignment_report
 from .evaluation.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
-from .evaluation.ml_cl_evaluator import (
+from .evaluation.independent_evaluator import (
     EvaluationMemory,
     EvaluationMemoryPlugin,
     MLEvaluationPlugin,

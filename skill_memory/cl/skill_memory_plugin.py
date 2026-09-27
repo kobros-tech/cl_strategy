@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Avalanche plugin for class-level, probe-based Skill Memory.
 
 An Avalanche experience is only a container.  The strategy extracts the
@@ -32,6 +35,7 @@ from ..utils.probing import (
     prepare_for_experience,
     restore_initial_state,
 )
+from ..utils.timing import TimingAccumulator
 from .decision import decide_class
 from .skill_registry import ClassRecord, ExperienceClassMap, SkillMemory
 from .training import train_on_class
@@ -43,6 +47,11 @@ class SkillMemoryPlugin(SupervisedPlugin):
     """Class-level Skill Memory plugin with explicit class bookkeeping."""
 
     REUSE, SCRATCH = "reuse", "scratch"
+
+    #: Bucket names used with `self.timing` (see
+    #: `skill_memory.diagnostics.timing_report`).
+    TIMING_DECISION = "skill_memory_decision_probing"
+    TIMING_CLASS_TRAINING = "skill_memory_class_training"
 
     def __init__(
         self,
@@ -87,6 +96,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.verbose = verbose
 
         self.last_class_decisions: dict[int, dict[int, dict[str, Any]]] = {}
+        self.timing = TimingAccumulator()
         self._initial_state: dict | None = None
         self._task_active = False
         self._seen_experiences: list = []
@@ -202,23 +212,24 @@ class SkillMemoryPlugin(SupervisedPlugin):
             return
 
         for target_class in classes:
-            decision_start = time.perf_counter()
-            decision = decide_class(
-                strategy,
-                experience,
-                target_class,
-                self.memory,
-                self.class_map,
-                self.probe_batch_size,
-                self.probe_batches,
-                self.probe_seed,
-                self._seen_experiences,
-                self.forgetting_margin,
-                self.score_floor,
-                self.force_decision,
-                self._log,
-                max_safety_candidates=self.max_safety_candidates,
-            )
+            with self.timing.track(self.TIMING_DECISION):
+                decision_start = time.perf_counter()
+                decision = decide_class(
+                    strategy,
+                    experience,
+                    target_class,
+                    self.memory,
+                    self.class_map,
+                    self.probe_batch_size,
+                    self.probe_batches,
+                    self.probe_seed,
+                    self._seen_experiences,
+                    self.forgetting_margin,
+                    self.score_floor,
+                    self.force_decision,
+                    self._log,
+                    max_safety_candidates=self.max_safety_candidates,
+                )
             self._log(
                 f"Class {target_class}: imagination+decision "
                 f"time={time.perf_counter() - decision_start:.2f}s"
@@ -241,13 +252,14 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 self._reset_optimizer(strategy)
 
                 if self.reuse_is_mutable:
-                    train_on_class(
-                        strategy,
-                        experience,
-                        target_class,
-                        self.class_train_epochs,
-                        self.class_train_batch_size,
-                    )
+                    with self.timing.track(self.TIMING_CLASS_TRAINING):
+                        train_on_class(
+                            strategy,
+                            experience,
+                            target_class,
+                            self.class_train_epochs,
+                            self.class_train_batch_size,
+                        )
                     self.memory.store(
                         skill,
                         strategy.model.state_dict(),
@@ -264,13 +276,14 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 skill = self.memory.allocate()
                 self._log(f"Class {target_class}: SCRATCH -> new skill {skill}")
                 self._scratch_reset(strategy, experience)
-                train_on_class(
-                    strategy,
-                    experience,
-                    target_class,
-                    self.class_train_epochs,
-                    self.class_train_batch_size,
-                )
+                with self.timing.track(self.TIMING_CLASS_TRAINING):
+                    train_on_class(
+                        strategy,
+                        experience,
+                        target_class,
+                        self.class_train_epochs,
+                        self.class_train_batch_size,
+                    )
                 self.memory.store(
                     skill,
                     strategy.model.state_dict(),

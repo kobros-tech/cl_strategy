@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Regression test for a global-class-id vs observed-logit-width mismatch.
 
 Avalanche's IncrementalClassifier indexes its output units by the raw class
