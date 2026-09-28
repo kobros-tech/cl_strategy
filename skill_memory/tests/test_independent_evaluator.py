@@ -1,8 +1,11 @@
-"""Tests for `skill_memory.evaluation.ml_cl_evaluator`.
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
+"""Tests for `skill_memory.evaluation.independent_evaluator`.
 
 Uses a small synthetic (non-MNIST, no download needed) benchmark built
 with Avalanche's own `nc_benchmark` generator, exercising the same code
-path as `skill_memory/demos/demo_splitmnist_ml_er.py` end to end: Skill
+path as `skill_memory/demos/demo_splitmnist.py` end to end: Skill
 Memory training + evaluation-memory capture, the independent evaluator's
 train/evaluate loop, and ML evaluation through the Avalanche plugin.
 """
@@ -15,7 +18,7 @@ from avalanche.training import Naive
 from torch.utils.data import TensorDataset
 
 from skill_memory import SkillMemory
-from skill_memory.evaluation.ml_cl_evaluator import (
+from skill_memory.evaluation.independent_evaluator import (
     EvaluationMemory,
     EvaluationMemoryPlugin,
     MLEvaluationPlugin,
@@ -564,3 +567,43 @@ def test_ml_evaluation_does_not_modify_main_model():
 
     assert ml_plugin.evaluator_model is not None
     assert ml_plugin.evaluator_model is not model
+
+
+def test_probe_routing_uses_evaluator_logits_for_loss():
+    memory_plugin = EvaluationMemoryPlugin(
+        memory=SkillMemory(max_skills=2),
+        eval_memory_per_class=2,
+        verbose=False,
+    )
+    plugin = MLEvaluationPlugin(
+        memory_plugin=memory_plugin,
+        model_factory=lambda: SimpleMLP(
+            input_size=2,
+            hidden_size=4,
+            num_classes=2,
+        ),
+        verbose=False,
+        eval_routing="probe",
+    )
+    plugin._active = True
+    plugin._current_loss_logits = torch.tensor(
+        [[10.0, -10.0], [-10.0, 10.0]],
+    )
+
+    class Strategy:
+        mb_output = torch.tensor(
+            [[10.0, -20.0], [-20.0, 10.0]],
+        )
+        mbatch = (
+            torch.zeros(2, 2),
+            torch.tensor([0, 1]),
+        )
+
+    plugin.after_eval_iteration(Strategy())
+
+    assert plugin._current_class_loss[0] < 1e-6
+    assert plugin._current_class_loss[1] < 1e-6
+    assert all(
+        torch.isfinite(torch.tensor(value))
+        for value in plugin._current_class_loss.values()
+    )

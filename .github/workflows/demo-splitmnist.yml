@@ -12,7 +12,7 @@ on:
       - main
 
 jobs:
-  run-ml-er-evaluator:
+  run-ml-evaluator:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -49,18 +49,18 @@ jobs:
 
       - name: Run 5 experiences, ${{ matrix.eval_routing }} evaluation, ${{ matrix.eval_epochs }} eval epoch(s)
         run: |
-          python skill_memory/demos/demo_splitmnist_ml_er.py \
+          python skill_memory/demos/demo_splitmnist.py \
             --dataset-root data \
             --n-experiences 5 \
             --eval-epochs ${{ matrix.eval_epochs }} \
             --eval-routing ${{ matrix.eval_routing }} \
-            | tee ml_er_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_${{ github.run_id }}.txt
+            | tee ml_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_${{ github.run_id }}.txt
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ml-er-${{ matrix.eval_routing }}-${{ matrix.eval_epochs }}ep-${{ github.run_id }}
-          path: ml_er_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_*.txt
+          name: ml-${{ matrix.eval_routing }}-${{ matrix.eval_epochs }}ep-${{ github.run_id }}
+          path: ml_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_*.txt
           if-no-files-found: warn
           retention-days: 14

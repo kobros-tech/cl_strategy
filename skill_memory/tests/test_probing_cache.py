@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Regression test for the CI stall: class lookups must be cached.
 
 Before the fix, `class_indices`/`classes_in_experience` called

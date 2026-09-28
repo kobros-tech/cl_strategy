@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Tests for the per-skill global-class-id / classifier-width diagnostic.
 
 This is the concrete, runnable version of the diagnostic PR review comment
@@ -11,7 +14,7 @@ from types import SimpleNamespace
 from avalanche.models import IncrementalClassifier
 from torch import nn
 
-from skill_memory import class_index_alignment_report
+from skill_memory.diagnostics import class_index_alignment_report
 
 
 class _Model(nn.Module):
@@ -34,6 +37,7 @@ def test_alignment_holds_for_non_relabeled_global_class_ids():
         states=[model.state_dict()],
         slot_ids=[7],
         owned_classes_by_slot=[[35, 36, 37, 38, 39]],
+        diagnose=True,
     )
 
     assert report["any_misaligned"] is False
@@ -59,6 +63,7 @@ def test_alignment_breaks_when_classes_are_relabeled_from_zero():
         states=[model.state_dict()],
         slot_ids=[7],
         owned_classes_by_slot=[[35, 36, 37, 38, 39]],
+        diagnose=True,
     )
 
     assert report["any_misaligned"] is True
@@ -82,6 +87,7 @@ def test_alignment_report_covers_multiple_skills_independently():
         states=[aligned_model.state_dict(), misaligned_model.state_dict()],
         slot_ids=[0, 1],
         owned_classes_by_slot=[[0, 1, 2, 3, 4], [50, 51, 52, 53, 54]],
+        diagnose=True,
     )
 
     assert report["skills"][0]["misaligned"] is False

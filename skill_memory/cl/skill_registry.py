@@ -1,4 +1,7 @@
-"""Bookkeeping and immutable skill-state storage.
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
+"""Bookkeeping and skill-state snapshot storage.
 
 The registry deliberately separates two concepts:
 
@@ -46,9 +49,9 @@ class SkillMemory:
     ) -> None:
         """Overwrite `slot` with a detached CPU copy of `state_dict`.
 
-        Copying (rather than keeping a live reference) is what makes a
-        stored skill an immutable snapshot: later changes to the model that
-        produced `state_dict` never leak into what's stored here.
+        Copying prevents later changes to the live model from leaking into the
+        stored snapshot. The snapshot can intentionally be replaced when
+        `reuse_is_mutable=True` updates a canonical skill.
         """
         if not 0 <= slot < self.max_skills:
             raise ValueError(f"invalid skill slot {slot}")

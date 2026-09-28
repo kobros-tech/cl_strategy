@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 import torch
 
 from skill_memory.cl.skill_registry import ClassRecord, ExperienceClassMap, SkillMemory

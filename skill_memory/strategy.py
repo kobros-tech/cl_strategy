@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """High-level Avalanche strategy with Skill Memory and ML evaluation.
 
 The strategy integrates two distinct learning/evaluation processes:
@@ -34,7 +37,8 @@ from avalanche.training.templates import SupervisedTemplate
 
 from .cl.skill_memory_plugin import SkillMemoryPlugin
 from .cl.skill_registry import SkillMemory
-from .evaluation.ml_cl_evaluator import (
+from .diagnostics.timing import TimingAccumulator
+from .evaluation.independent_evaluator import (
     EvaluationMemoryPlugin,
     MLEvaluationPlugin,
 )
@@ -53,9 +57,24 @@ class SkillMemoryStrategy(SupervisedTemplate):
     Skill Memory training and evaluation-memory retention remain owned by
     ``EvaluationMemoryPlugin``, which extends ``SkillMemoryPlugin``. The
     independent ML evaluator is the sole evaluation methodology used by the
-    normal ``strategy.eval()`` lifecycle. Direct Skill Memory diagnostics are
-    intentionally separate from this strategy.
+    normal ``strategy.eval()`` lifecycle. Direct Skill Memory diagnostics
+    (``skill_memory.diagnostics``) are intentionally separate from this
+    strategy and never run as part of it.
+
+    ``diagnose=False`` (the default) means `self.timing` and the skill
+    memory plugin's own `self.timing` never record anything -- every
+    `self.timing.track(...)` call site in the codebase becomes a true
+    no-op. Set ``diagnose=True`` to have `skill_memory.diagnostics.timing_report`
+    return real numbers; it has no effect on which evaluation methodology
+    `strategy.eval()` uses, or on whether `skill_memory.diagnostics`'
+    oracle-routed functions can be called -- those always separately
+    require ``diagnose=True`` at their own call site regardless of this
+    flag.
     """
+
+    #: Bucket name used with `self.timing` (see
+    #: `skill_memory.diagnostics.timing_report`).
+    TIMING_EVALUATION = "independent_evaluator_and_test_evaluation"
 
     def __init__(
         self,
@@ -73,7 +92,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         probe_batch_size: int = 64,
         probe_batches: int = 5,
         probe_seed: int | None = None,
-        max_safety_candidates: int = 5,
+        max_safety_candidates: int | None = None,
         class_train_batch_size: int = 64,
         reuse_is_mutable: bool = True,
         force_decision: str | None = None,
@@ -90,6 +109,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         verbose: bool = True,
         eval_routing: str = "none",
         probe_behavior_weight: float = 0.5,
+        diagnose: bool = False,
     ) -> None:
         if eval_memory_per_class <= 0:
             raise ValueError("eval_memory_per_class must be positive")
@@ -121,6 +141,8 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_routing = eval_routing
         self.train_epochs = train_epochs
         self.probe_behavior_weight = float(probe_behavior_weight)
+        self.diagnose = bool(diagnose)
+        self.timing = TimingAccumulator(enabled=self.diagnose)
 
         # ------------------------------------------------------------------
         # Skill Memory
@@ -146,6 +168,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             eval_memory_per_class=eval_memory_per_class,
             eval_memory_seed=eval_memory_seed,
             verbose=verbose,
+            diagnose=self.diagnose,
         )
 
         self.ml_evaluation_plugin = MLEvaluationPlugin(
@@ -193,8 +216,17 @@ class SkillMemoryStrategy(SupervisedTemplate):
     # ------------------------------------------------------------------
 
     def eval(self, exp_list, **kwargs):
-        """Run normal Avalanche evaluation and include ML evaluator results."""
-        avalanche_results = super().eval(exp_list, **kwargs)
+        """Run normal Avalanche evaluation and include ML evaluator results.
+
+        Timed as one bucket (`self.TIMING_EVALUATION`) because
+        `super().eval()` both trains the independent evaluator (see
+        `MLEvaluationPlugin.before_eval`) and runs the real Avalanche
+        evaluation loop over `exp_list` -- see
+        `skill_memory.diagnostics.timing_report` to read this back
+        alongside Skill Memory's own decision/training timings.
+        """
+        with self.timing.track(self.TIMING_EVALUATION):
+            avalanche_results = super().eval(exp_list, **kwargs)
         avalanche_results.update(self.ml_evaluation_plugin.results())
         return avalanche_results
 

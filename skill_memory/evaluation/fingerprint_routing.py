@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Compatibility entry point for persistent anonymous routing."""
 
 from __future__ import annotations
@@ -5,7 +8,10 @@ from __future__ import annotations
 from ..cl.persistent_skill_memory_plugin import (
     PersistentFingerprintSkillMemoryPlugin as _BaseFingerprintPlugin,
 )
-from .diagnostics import class_index_alignment_report, routing_rank_diagnostics
+from ..diagnostics.alignment import (
+    class_index_alignment_report,
+    routing_rank_diagnostics,
+)
 
 
 class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
@@ -15,12 +21,15 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
     the underlying per-candidate diagnostic breakdown in `_route` itself, so
     the listwise routing forward pass skips the extra per-sample,
     per-candidate dict construction and GPU->CPU syncs entirely rather than
-    building it and discarding it. Set ``diagnose=True`` when detailed
-    routing records (`last_routing_diagnostics`) are needed - this also
-    computes `last_alignment_report` once per completed training experience
-    (see `class_index_alignment_report`), which is the concrete, runnable
-    check for whether a skill's owned global class ids actually fit its own
-    classifier's output space on this benchmark.
+    building it and discarding it -- and also disables `self.timing`
+    (`SkillMemoryPlugin`'s own decision/training timing bookkeeping; see
+    `skill_memory.diagnostics.timing_report`), since it is the same flag
+    forwarded down. Set ``diagnose=True`` when detailed routing records
+    (`last_routing_diagnostics`) are needed - this also computes
+    `last_alignment_report` once per completed training experience (see
+    `skill_memory.diagnostics.class_index_alignment_report`), which is the
+    concrete, runnable check for whether a skill's owned global class ids
+    actually fit its own classifier's output space on this benchmark.
     """
 
     def __init__(
@@ -40,6 +49,7 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
             *args,
             reverse_epochs=reverse_epochs,
             reverse_batch_size=reverse_batch_size,
+            diagnose=self.diagnose,
             **kwargs,
         )
 
@@ -60,6 +70,7 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
             owned_classes_by_slot=[
                 self.class_map.classes_for_skill(slot) for slot in slot_ids
             ],
+            diagnose=True,
         )
 
     def after_eval_forward(self, strategy, **kwargs) -> None:
@@ -67,7 +78,7 @@ class PersistentFingerprintSkillMemoryPlugin(_BaseFingerprintPlugin):
         super().after_eval_forward(strategy, **kwargs)
         if self.diagnose:
             self.last_routing_diagnostics = routing_rank_diagnostics(
-                self.fingerprint_route_history
+                self.fingerprint_route_history, diagnose=True
             )
         else:
             self.last_routing_diagnostics = {}

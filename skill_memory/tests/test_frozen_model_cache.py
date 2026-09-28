@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Tests for the frozen-model cache in PersistentFingerprintSkillMemoryPlugin.
 
 Review comment (pasted from an external thread, referencing

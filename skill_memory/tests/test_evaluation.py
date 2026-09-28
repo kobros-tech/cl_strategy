@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 import torch
 
 from skill_memory.diagnostics import (
@@ -16,6 +19,7 @@ def test_route_probe_logits_selects_one_skill_per_sample_without_labels():
         logits_by_skill,
         [{"classifier.weight": torch.tensor([[2.0, 0.0]])}] * 2,
         [{0}, {0}],
+        diagnose=True,
     )
 
     assert chosen.tolist() == [0, 1]
@@ -29,6 +33,7 @@ def test_one_class_heads_use_raw_logit_confidence():
         ],
         [{"classifier.weight": torch.tensor([[1.0]])}] * 2,
         [{0}, {0}],
+        diagnose=True,
     )
 
     assert result.skill_indices.tolist() == [0, 1]
@@ -47,6 +52,7 @@ def test_routing_uses_owned_global_class_columns():
         [logits_a, logits_b],
         [{"classifier.weight": torch.tensor([[1.0]])}] * 2,
         [{class_a}, {class_b}],
+        diagnose=True,
     )
 
     assert chosen.tolist() == [0, 1]
@@ -72,6 +78,7 @@ def test_routing_raises_instead_of_silently_zeroing_a_skill_with_narrow_output()
             [narrow_logits, wide_logits],
             [{"classifier.weight": torch.tensor([[1.0]])}] * 2,
             [{37}, {37}],
+            diagnose=True,
         )
     except RuntimeError as exc:
         assert "37" in str(exc)

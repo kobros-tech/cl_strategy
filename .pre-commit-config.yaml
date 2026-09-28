@@ -10,6 +10,22 @@ repos:
       - id: check-added-large-files
         args: ["--maxkb=500"]
 
+  # Copyright header: automatically inserts LICENSE-HEADER.txt as a `#`
+  # comment block at the top of every Python file that doesn't already
+  # have it (existing headers are left untouched). This runs BEFORE ruff
+  # so a freshly inserted header is present when ruff checks/formats the
+  # file, rather than needing a second commit.
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.5
+    hooks:
+      - id: insert-license
+        name: insert-license (python)
+        files: \.py$
+        args:
+          - --license-filepath=LICENSE-HEADER.txt
+          - --comment-style=#
+          - --use-current-year
+
   # Python formatting and linting
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.7

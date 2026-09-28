@@ -1,8 +1,10 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Per-class Skill Memory decisions."""
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 from torch import nn
@@ -103,7 +105,7 @@ def score_class_against_skills(
     probe_batches: int,
     probe_seed: int | None,
     seen_experiences: list,
-    max_safety_candidates: int = 5,
+    max_safety_candidates: int | None = None,
 ) -> list[dict[str, Any]]:
     """Probe skills against a new class, then verify only top candidates.
 
@@ -111,11 +113,18 @@ def score_class_against_skills(
     The second stage measures the *real* old-class score/accuracy only for the
     strongest candidates.  This keeps the safety check faithful while avoiding
     the old O(skills * old_classes) forward-pass explosion.
+
+    Both stages call ``evaluate_state``, which applies each candidate
+    skill's weights functionally (see
+    ``skill_memory.utils.probing.evaluate_state``) rather than mutating a
+    model in place -- so, unlike the original loop this replaced, none of
+    this needs its own copy of ``strategy.model``: ``strategy.model`` is
+    read from directly and is never modified by probing a class.
     """
     new_x, new_y = probe_class(
         experience, target_class, probe_batch_size, probe_batches, probe_seed
     )
-    probe_model = deepcopy(strategy.model)
+    probe_model = strategy.model
 
     # Stage 1: new-class imagination for every skill.
     candidates = []
@@ -132,6 +141,7 @@ def score_class_against_skills(
             new_y,
             nn.functional.cross_entropy,
             experience,
+            seed=probe_seed,
         )
         out_features = incremental_out_features(strategy.model, state_dict)
         chance = 1.0 / out_features if out_features else 0.0
@@ -147,9 +157,13 @@ def score_class_against_skills(
             }
         )
 
-    # Stage 2: only top new-class candidates pay the old-class safety cost.
+    # Stage 2: safety is exact by default. A finite cap is an explicit
+    # performance approximation and may miss a reusable lower-ranked skill.
     candidates.sort(key=lambda r: (r["new_score"], r["new_accuracy"]), reverse=True)
-    safety_candidates = candidates[: max(1, max_safety_candidates)]
+    if max_safety_candidates is None:
+        safety_candidates = candidates
+    else:
+        safety_candidates = candidates[:max_safety_candidates]
 
     old_probe_cache: dict[int, tuple | None] = {}
     results = []
@@ -191,6 +205,7 @@ def score_class_against_skills(
                 old_y,
                 nn.functional.cross_entropy,
                 old_experience,
+                seed=probe_seed,
             )
             old_metrics.append(
                 {
@@ -246,7 +261,7 @@ def decide_class(
     score_floor: float | None,
     force_decision: str | None,
     logger_fn,
-    max_safety_candidates: int = 5,
+    max_safety_candidates: int | None = None,
 ) -> dict[str, Any]:
     """Decide for one class, never for an entire multi-class experience.
 

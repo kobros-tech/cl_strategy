@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Continual-learning strategy components."""
 
 from .decision import find_best_skill as find_best_skill

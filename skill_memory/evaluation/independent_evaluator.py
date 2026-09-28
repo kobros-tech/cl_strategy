@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Kobros-Tech Ltd
+# SPDX-License-Identifier: MIT
+
 """Independent ML evaluator for measuring class retention.
 
 This module provides the evaluation-memory and independent-classifier
@@ -42,11 +45,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
-from ..utils.probing import (
-    apply_skill_state_exact,
-    expand_skill_logits,
-    resize_incremental_classifiers_for_state,
-)
+from ..utils.probing import expand_skill_logits, predict_logits
 from .routing import (
     build_skill_behavior_prototypes,
     combine_skill_scores,
@@ -723,7 +722,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct: dict[int, int] = {}
         self._current_class_total: dict[int, int] = {}
         self._current_experience_classes: set[int] = set()
-        self._main_model_state: dict[str, torch.Tensor] | None = None
+        self._current_loss_logits: torch.Tensor | None = None
         self._skill_behavior_prototypes: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
@@ -785,6 +784,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct = {}
         self._current_class_total = {}
         self._current_experience_classes = set()
+        self._current_loss_logits = None
         self._skill_behavior_prototypes = None
 
         if self.eval_routing == "probe":
@@ -810,15 +810,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
                     skill_inputs,
                     device=strategy.device,
                 )
-
-        self._main_model_state = (
-            {
-                name: value.detach().clone()
-                for name, value in strategy.model.state_dict().items()
-            }
-            if self.eval_routing != "none"
-            else None
-        )
 
         if self.verbose:
             print(
@@ -846,6 +837,12 @@ class MLEvaluationPlugin(SupervisedPlugin):
         inputs = strategy.mbatch[0]
         self.model.eval()
         evaluator_logits = self.model(inputs)
+
+        # The independent evaluator remains the loss reference even when
+        # probe routing is enabled. Routed skill logits intentionally mask
+        # non-owned classes, so their cross-entropy would measure the routing
+        # mask penalty rather than the evaluator's predictive quality.
+        self._current_loss_logits = evaluator_logits
 
         # "none" is the reference implementation.
         if self.eval_routing == "none":
@@ -882,9 +879,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
         routing = select_skill_from_scores(scores)
         chosen_tensor = routing.skill_indices
 
-        if self._main_model_state is None:
-            raise RuntimeError("Missing main-model snapshot for routed evaluation.")
-
         routed_logits = torch.empty(
             inputs.shape[0],
             evaluator_logits.shape[1],
@@ -892,27 +886,22 @@ class MLEvaluationPlugin(SupervisedPlugin):
             dtype=evaluator_logits.dtype,
         )
 
-        try:
-            for skill_index, slot in enumerate(slot_ids):
-                rows = torch.where(chosen_tensor == skill_index)[0]
-                if rows.numel() == 0:
-                    continue
-                state = self.memory_plugin.memory.state(slot)
-                apply_skill_state_exact(strategy.model, state)
-                strategy.model.eval()
-                raw_logits = strategy.model(inputs[rows])
-                routed_logits[rows] = expand_skill_logits(
-                    raw_logits,
-                    state,
-                    self.memory_plugin.class_map.classes_for_skill(slot),
-                    evaluator_logits.shape[1],
-                )
-        finally:
-            resize_incremental_classifiers_for_state(
-                strategy.model,
-                self._main_model_state,
+        # `predict_logits` applies each skill's state functionally (see
+        # `skill_memory.utils.probing.predict_logits`), so `strategy.model`
+        # is only ever read here -- never mutated and never restored -- and
+        # a skill with no rows routed to it in this batch costs nothing.
+        for skill_index, slot in enumerate(slot_ids):
+            rows = torch.where(chosen_tensor == skill_index)[0]
+            if rows.numel() == 0:
+                continue
+            state = self.memory_plugin.memory.state(slot)
+            raw_logits = predict_logits(strategy.model, state, inputs[rows])
+            routed_logits[rows] = expand_skill_logits(
+                raw_logits,
+                state,
+                self.memory_plugin.class_map.classes_for_skill(slot),
+                evaluator_logits.shape[1],
             )
-            strategy.model.load_state_dict(self._main_model_state)
 
         strategy.mb_output = routed_logits
 
@@ -926,8 +915,12 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
         predictions = outputs.argmax(dim=1)
 
+        loss_outputs = self._current_loss_logits
+        if loss_outputs is None:
+            raise RuntimeError("Missing evaluator logits for loss computation.")
+
         per_sample_loss = nn.functional.cross_entropy(
-            outputs,
+            loss_outputs,
             targets,
             reduction="none",
         )
@@ -1011,13 +1004,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
                 f"{np.mean(list(current_accuracy.values())):.4f}"
             )
 
-        if self._main_model_state is not None:
-            resize_incremental_classifiers_for_state(
-                strategy.model,
-                self._main_model_state,
-            )
-            strategy.model.load_state_dict(self._main_model_state)
-        self._main_model_state = None
         self._skill_behavior_prototypes = None
         self._active = False
 
