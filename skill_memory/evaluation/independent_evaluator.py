@@ -722,6 +722,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct: dict[int, int] = {}
         self._current_class_total: dict[int, int] = {}
         self._current_experience_classes: set[int] = set()
+        self._current_loss_logits: torch.Tensor | None = None
         self._skill_behavior_prototypes: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
@@ -783,6 +784,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_class_correct = {}
         self._current_class_total = {}
         self._current_experience_classes = set()
+        self._current_loss_logits = None
         self._skill_behavior_prototypes = None
 
         if self.eval_routing == "probe":
@@ -835,6 +837,12 @@ class MLEvaluationPlugin(SupervisedPlugin):
         inputs = strategy.mbatch[0]
         self.model.eval()
         evaluator_logits = self.model(inputs)
+
+        # The independent evaluator remains the loss reference even when
+        # probe routing is enabled. Routed skill logits intentionally mask
+        # non-owned classes, so their cross-entropy would measure the routing
+        # mask penalty rather than the evaluator's predictive quality.
+        self._current_loss_logits = evaluator_logits
 
         # "none" is the reference implementation.
         if self.eval_routing == "none":
@@ -907,8 +915,12 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
         predictions = outputs.argmax(dim=1)
 
+        loss_outputs = self._current_loss_logits
+        if loss_outputs is None:
+            raise RuntimeError("Missing evaluator logits for loss computation.")
+
         per_sample_loss = nn.functional.cross_entropy(
-            outputs,
+            loss_outputs,
             targets,
             reduction="none",
         )
