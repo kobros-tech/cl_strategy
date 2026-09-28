@@ -130,3 +130,36 @@ def test_evaluate_state_restores_model_training_mode():
     )
 
     assert model.training
+
+
+def test_expand_skill_logits_respects_owned_classes_for_global_and_compact_heads():
+    raw = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0]],
+    )
+
+    global_logits = mod.expand_skill_logits(
+        raw,
+        {},
+        {1, 3},
+        output_dim=5,
+    )
+    assert global_logits[0, 1].item() == 2.0
+    assert global_logits[0, 3].item() == 4.0
+    assert torch.equal(
+        global_logits[0, [0, 2, 4]],
+        torch.tensor([-20.0, -20.0, -20.0]),
+    )
+    assert torch.isfinite(global_logits).all()
+
+    compact_logits = mod.expand_skill_logits(
+        torch.tensor([[10.0, 20.0]]),
+        {},
+        {1, 3},
+        output_dim=5,
+    )
+    assert compact_logits[0, 1].item() == 10.0
+    assert compact_logits[0, 3].item() == 20.0
+    assert torch.equal(
+        compact_logits[0, [0, 2, 4]],
+        torch.tensor([-20.0, -20.0, -20.0]),
+    )
