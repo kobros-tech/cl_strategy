@@ -276,24 +276,54 @@ def expand_skill_logits(
 ) -> Tensor:
     """Place one skill's raw response into the shared global-class space.
 
-    `raw_logits` is the skill's own forward-pass output (width equal to
-    that skill's own, possibly narrower, classifier). Every column *not*
-    among `owned_classes` -- including columns that exist in `raw_logits`
-    but were never actually trained on this skill -- is filled with a very
-    negative value, so a downstream ``argmax``/``softmax`` over the
-    combined space can never pick a class this skill was not responsible
-    for. `state` is accepted for interface symmetry with the rest of this
-    module's state-aware helpers; it is not required for this computation.
+    A skill may store either a global Avalanche classifier head or a compact
+    head containing exactly its owned classes. Global heads use class IDs as
+    output columns; compact heads use the sorted owned-class order. Every
+    non-owned global class receives a finite suppression value so routed
+    logits remain safe for downstream metrics.
     """
     del state
     if raw_logits.ndim != 2:
         raise ValueError("raw_logits must have shape [batch, classes]")
-    fill = torch.finfo(raw_logits.dtype).min
-    expanded = raw_logits.new_full((raw_logits.shape[0], output_dim), fill)
+    if output_dim < 1:
+        raise ValueError("output_dim must be positive")
+
+    owned = sorted({int(class_id) for class_id in owned_classes})
+    if not owned:
+        return raw_logits.new_full(
+            (raw_logits.shape[0], output_dim),
+            -20.0,
+        )
+
     width = raw_logits.shape[1]
-    for class_id in sorted(int(c) for c in owned_classes):
-        if 0 <= class_id < width and class_id < output_dim:
-            expanded[:, class_id] = raw_logits[:, class_id]
+    if width > len(owned):
+        # Avalanche's IncrementalClassifier uses global class IDs directly.
+        if max(owned) >= width:
+            raise RuntimeError(
+                f"skill owns class {max(owned)}, but its classifier has only "
+                f"{width} output columns"
+            )
+        source_indices = owned
+    elif width == len(owned):
+        # Compact skill heads map local row i to the i-th owned global class.
+        source_indices = list(range(width))
+    else:
+        raise RuntimeError(
+            f"skill owns {len(owned)} classes but its classifier has only "
+            f"{width} output columns"
+        )
+
+    expanded = raw_logits.new_full(
+        (raw_logits.shape[0], output_dim),
+        -20.0,
+    )
+    for source_index, global_class in zip(source_indices, owned):
+        if global_class >= output_dim:
+            raise RuntimeError(
+                f"skill owns class {global_class}, outside global output "
+                f"dimension {output_dim}"
+            )
+        expanded[:, global_class] = raw_logits[:, source_index]
     return expanded
 
 
