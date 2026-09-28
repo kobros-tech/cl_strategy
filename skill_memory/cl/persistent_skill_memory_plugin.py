@@ -17,12 +17,12 @@ from ..evaluation.behavior import (
     ClassBehaviorRecord,
     build_weight_behavior_statistics,
 )
+from ..evaluation.independent_evaluator import EvaluationMemoryPlugin
 from ..evaluation.reverse_engineering import NormalMLReverseEngineer
 from ..utils.probing import apply_skill_state_exact, predict_logits, probe_class
-from .skill_memory_plugin import SkillMemoryPlugin
 
 
-class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
+class PersistentFingerprintSkillMemoryPlugin(EvaluationMemoryPlugin):
     """Skill Memory with anonymous class routing learned by standalone ML.
 
     The router is trained only after training experiences, from frozen skill
@@ -41,6 +41,8 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         reverse_seed: int = 0,
         reverse_batch_size: int = 256,
         reverse_training_mode: str = "listwise",
+        reverse_warm_start: bool = False,
+        reverse_warm_start_epochs: int | None = None,
         record_candidate_diagnostics: bool = True,
         eval_routing: str = "probe",
         **kwargs,
@@ -52,12 +54,43 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
         experience (see `_fit_reverse_router`). `reuse_is_mutable` defaults
         to `False` here, since a mutable REUSE would invalidate frozen
         fingerprints for that skill.
+
+        By default, every experience fits the reverse router completely from
+        scratch (a fresh `_FeatureReverseModel`, `reverse_epochs` training
+        steps) over the full accumulated candidate history -- this is exact
+        and reproducible, but its cost grows with the number of candidates
+        (empirically faster than linear; see
+        `skill_memory/benchmarks/fingerprint_router_warm_start.py`).
+        `reverse_warm_start=True` instead seeds each experience's router with
+        the previous experience's compatible weights (see
+        `NormalMLReverseEngineer._warm_start_model`: the Transformer encoder
+        and output head are always shape-compatible across experiences;
+        only the input projection grows when new classes widen the feature
+        vector, and its existing columns are preserved) and trains for only
+        `reverse_warm_start_epochs` steps (falling back to `reverse_epochs`
+        when `None`) instead of refitting from scratch. The very first
+        experience always trains from scratch regardless of this flag
+        (there is nothing to warm-start from yet).
+
+        This is NOT a numerically-exact optimization like the
+        `SkillMemoryPlugin` ones it sits on top of -- continuing training
+        from different starting weights for fewer steps is a different
+        training trajectory, so it can change routing decisions. Benchmark
+        before enabling: in a 5-experience SplitMNIST run, warm-starting
+        changed the final-experience accuracy and MRR and cut total router-fit
+        time substantially (see the module docstring above and the
+        benchmark script for current numbers) -- but it is a genuine
+        accuracy/speed tradeoff, not a free win, and is therefore opt-in.
         """
+        if reverse_warm_start_epochs is not None and reverse_warm_start_epochs < 0:
+            raise ValueError("reverse_warm_start_epochs must be non-negative")
         kwargs.setdefault("reuse_is_mutable", False)
         super().__init__(*args, **kwargs)
         if eval_routing not in ("none", "probe"):
             raise ValueError("eval_routing must be one of 'none' or 'probe'")
         self.eval_routing = eval_routing
+        self.reverse_warm_start = bool(reverse_warm_start)
+        self.reverse_warm_start_epochs = reverse_warm_start_epochs
         self.behavior = BehaviorFingerprintCache()
         self._custom_reverse_engineer_y = reverse_engineer_y_fn
         self.reverse_engineer = NormalMLReverseEngineer(
@@ -482,7 +515,15 @@ class PersistentFingerprintSkillMemoryPlugin(SkillMemoryPlugin):
                 (features[sample_index], target_index)
                 for sample_index in range(features.shape[0])
             )
-        self.reverse_engineer.fit_candidate_sets(candidate_sets)
+        self.reverse_engineer.fit_candidate_sets(
+            candidate_sets,
+            warm_start=self.reverse_warm_start,
+            epochs=(
+                self.reverse_warm_start_epochs
+                if self.reverse_warm_start and self.reverse_engineer.model is not None
+                else None
+            ),
+        )
 
     def _route(
         self, strategy, x: Tensor, slot_ids: list[int]

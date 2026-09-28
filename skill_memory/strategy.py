@@ -10,12 +10,14 @@ The strategy integrates two distinct learning/evaluation processes:
    - skill allocation and storage
    - class-to-skill bookkeeping
 
-2. Anonymous ML evaluator
+2. Anonymous ML evaluator + candidate Skill Memory arbitration
    - receives only x at prediction time
    - learns x -> y from frozen examples retained by Skill Memory
-   - is trained on all accumulated evaluation memory
-   - evaluates all classes seen so far
-   - provides the methodology used to measure non-forgetting
+   - proposes the ML top-k classes
+   - canonical Skill Memory states verify candidates and may rescue a
+     lower-ranked ML candidate
+   - routed predictions are used for accuracy; raw ML logits remain the loss
+     reference
 
 The ML evaluator is intentionally independent from the Skill Memory model.
 Its purpose is to measure whether an independently trained classifier can
@@ -35,6 +37,7 @@ from avalanche.training.plugins import SupervisedPlugin
 from avalanche.training.plugins.evaluation import EvaluationPlugin
 from avalanche.training.templates import SupervisedTemplate
 
+from .cl.decision import DEFAULT_MAX_SAFETY_CANDIDATES
 from .cl.skill_memory_plugin import SkillMemoryPlugin
 from .cl.skill_registry import SkillMemory
 from .diagnostics.timing import TimingAccumulator
@@ -56,8 +59,10 @@ class SkillMemoryStrategy(SupervisedTemplate):
 
     Skill Memory training and evaluation-memory retention remain owned by
     ``EvaluationMemoryPlugin``, which extends ``SkillMemoryPlugin``. The
-    independent ML evaluator is the sole evaluation methodology used by the
-    normal ``strategy.eval()`` lifecycle. Direct Skill Memory diagnostics
+    independent ML evaluation remains the candidate-generation and loss
+    reference, while candidate Skill Memory routing is the default prediction
+    path in the normal ``strategy.eval()`` lifecycle. Direct Skill Memory
+    diagnostics
     (``skill_memory.diagnostics``) are intentionally separate from this
     strategy and never run as part of it.
 
@@ -92,8 +97,13 @@ class SkillMemoryStrategy(SupervisedTemplate):
         probe_batch_size: int = 64,
         probe_batches: int = 5,
         probe_seed: int | None = None,
-        max_safety_candidates: int | None = None,
+        max_safety_candidates: int | None = DEFAULT_MAX_SAFETY_CANDIDATES,
         class_train_batch_size: int = 64,
+        class_train_mode: str = "multiclass",
+        skill_train_samples_per_class: int | None = None,
+        validation_fraction: float = 0.2,
+        validation_seed: int = 0,
+        binary_negative_pool=None,
         reuse_is_mutable: bool = True,
         force_decision: str | None = None,
         eval_memory_per_class: int = 20,
@@ -110,9 +120,31 @@ class SkillMemoryStrategy(SupervisedTemplate):
         eval_routing: str = "none",
         probe_behavior_weight: float = 0.5,
         diagnose: bool = False,
+        strict_protocol: bool = True,
+        candidate_skill_routing: bool = True,
+        candidate_k: int = 3,
+        skill_confidence_threshold: float = 0.5,
+        rescue_skill_confidence_threshold: float = 0.85,
+        rescue_skill_margin: float = 0.10,
+        ml_uncertainty_threshold: float = 0.55,
+        calibration_precision_target: float = 0.90,
+        calibration_min_samples: int = 20,
+        candidate_routing_debug: bool = False,
+        candidate_routing_debug_max_samples: int = 20,
+        batch_stage1: bool = False,
+        stage1_chunk_size: int | None = None,
+        skill_memory_plugin: SkillMemoryPlugin | None = None,
     ) -> None:
         if eval_memory_per_class <= 0:
             raise ValueError("eval_memory_per_class must be positive")
+
+        # Preserve the proven benchmark coupling: unless explicitly
+        # overridden, Skill Memory trains on the same bounded per-class
+        # sample count retained by the independent evaluator.
+        if skill_train_samples_per_class is None:
+            skill_train_samples_per_class = eval_memory_per_class
+        if skill_train_samples_per_class <= 0:
+            raise ValueError("skill_train_samples_per_class must be positive")
 
         if train_epochs < 1:
             raise ValueError("train_epochs must be at least 1")
@@ -148,29 +180,42 @@ class SkillMemoryStrategy(SupervisedTemplate):
         # Skill Memory
         # ------------------------------------------------------------------
 
-        self.memory = SkillMemory(max_skills=max_skills)
-
-        # EvaluationMemoryPlugin extends SkillMemoryPlugin. Therefore there
-        # is exactly one Skill Memory plugin in the Avalanche plugin list.
-        self.plugin = EvaluationMemoryPlugin(
-            memory=self.memory,
-            max_skills=max_skills,
-            forgetting_margin=forgetting_margin,
-            score_floor=score_floor,
-            probe_batch_size=probe_batch_size,
-            probe_batches=probe_batches,
-            probe_seed=probe_seed,
-            max_safety_candidates=max_safety_candidates,
-            class_train_epochs=train_epochs,
-            class_train_batch_size=class_train_batch_size,
-            reuse_is_mutable=reuse_is_mutable,
-            force_decision=force_decision,
-            eval_memory_per_class=eval_memory_per_class,
-            eval_memory_seed=eval_memory_seed,
-            verbose=verbose,
-            diagnose=self.diagnose,
-        )
-
+        # EvaluationMemoryPlugin is the default Skill Memory implementation.
+        # A specialized Skill Memory plugin can be injected instead.
+        #
+        # When a plugin is injected, its SkillMemory instance is the
+        # authoritative memory used by the strategy.
+        if skill_memory_plugin is None:
+            self.memory = SkillMemory(max_skills=max_skills)
+            self.plugin = EvaluationMemoryPlugin(
+                memory=self.memory,
+                max_skills=max_skills,
+                forgetting_margin=forgetting_margin,
+                score_floor=score_floor,
+                probe_batch_size=probe_batch_size,
+                probe_batches=probe_batches,
+                probe_seed=probe_seed,
+                max_safety_candidates=max_safety_candidates,
+                class_train_epochs=train_epochs,
+                class_train_batch_size=class_train_batch_size,
+                class_train_mode=class_train_mode,
+                samples_per_class=skill_train_samples_per_class,
+                validation_fraction=validation_fraction,
+                validation_seed=validation_seed,
+                reuse_is_mutable=reuse_is_mutable,
+                binary_negative_pool=binary_negative_pool,
+                force_decision=force_decision,
+                eval_memory_per_class=eval_memory_per_class,
+                eval_memory_seed=eval_memory_seed,
+                verbose=verbose,
+                diagnose=self.diagnose,
+                strict_protocol=strict_protocol,
+                batch_stage1=batch_stage1,
+                stage1_chunk_size=stage1_chunk_size,
+            )
+        else:
+            self.plugin = skill_memory_plugin
+            self.memory = self.plugin.memory
         self.ml_evaluation_plugin = MLEvaluationPlugin(
             memory_plugin=self.plugin,
             model_factory=evaluator_model_factory,
@@ -181,6 +226,17 @@ class SkillMemoryStrategy(SupervisedTemplate):
             verbose=verbose,
             eval_routing=eval_routing,
             probe_behavior_weight=probe_behavior_weight,
+            strict_protocol=strict_protocol,
+            candidate_skill_routing=candidate_skill_routing,
+            candidate_k=candidate_k,
+            skill_confidence_threshold=skill_confidence_threshold,
+            rescue_skill_confidence_threshold=rescue_skill_confidence_threshold,
+            rescue_skill_margin=rescue_skill_margin,
+            ml_uncertainty_threshold=ml_uncertainty_threshold,
+            calibration_precision_target=calibration_precision_target,
+            calibration_min_samples=calibration_min_samples,
+            candidate_routing_debug=candidate_routing_debug,
+            candidate_routing_debug_max_samples=candidate_routing_debug_max_samples,
         )
 
         strategy_plugins: list[SupervisedPlugin] = [

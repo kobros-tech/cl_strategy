@@ -126,13 +126,79 @@ class NormalMLReverseEngineer:
         std = features.std(dim=0, unbiased=False).clamp_min(1e-6)
         return mean, std
 
-    def _fit_model(self, features: Tensor, targets: Tensor) -> None:
-        """Fit either the listwise Transformer or binary compatibility MLP."""
+    @staticmethod
+    def _warm_start_model(
+        previous: nn.Module,
+        feature_dim: int,
+        hidden_size: int,
+        num_heads: int,
+        num_layers: int,
+    ) -> nn.Module:
+        """Build a fresh `_FeatureReverseModel`, preloaded with `previous`'s
+        compatible weights.
+
+        Only `input_projection` can change shape between calls: the listwise
+        feature vector grows when a higher class ID extends the padded
+        frozen-logit/probability columns (see `_fit_reverse_router`), which
+        changes `feature_dim`, the *input* width of `input_projection`.
+        `hidden_size`/`num_heads`/`num_layers` are fixed hyperparameters, so
+        every other layer (the encoder, the output head, and
+        `input_projection`'s output width) is always shape-identical across
+        calls and is copied as-is. For `input_projection`, existing columns
+        (old feature positions) are copied in place; newly introduced
+        columns are left at their fresh random initialization.
+
+        Returns an *untrained* model with these weights preloaded -- the
+        caller still runs the normal training loop on top of them.
+        """
+        model = _FeatureReverseModel(feature_dim, hidden_size, num_heads, num_layers)
+        if not isinstance(previous, _FeatureReverseModel):
+            return model
+
+        previous_state = previous.state_dict()
+        current_state = model.state_dict()
+        with torch.no_grad():
+            for name, value in previous_state.items():
+                current = current_state.get(name)
+                if current is None or current.shape == () or value.numel() == 0:
+                    continue
+                if name == "input_projection.weight":
+                    width = min(value.shape[1], current.shape[1])
+                    current[:, :width].copy_(value[:, :width])
+                elif name == "input_projection.bias":
+                    current.copy_(value)
+                elif value.shape == current.shape:
+                    current.copy_(value)
+        return model
+
+    def _fit_model(
+        self,
+        features: Tensor,
+        targets: Tensor,
+        *,
+        warm_start: bool = False,
+        epochs: int | None = None,
+    ) -> None:
+        """Fit either the listwise Transformer or binary compatibility MLP.
+
+        `warm_start` only ever applies to the listwise Transformer (the
+        binary MLP ignores it): when True and a previously-fit
+        `_FeatureReverseModel` exists, its compatible weights seed the new
+        model (see `_warm_start_model`) instead of starting from a fresh
+        random initialization, and training runs for `epochs` steps (falling
+        back to `self.epochs` when `epochs` is None) on top of that starting
+        point rather than from scratch. `warm_start=False` (the default)
+        reproduces the exact prior from-scratch behavior bit-for-bit.
+        """
         torch.manual_seed(self.seed)
+        previous_model = self.model
         self.feature_dim = int(features.shape[-1])
         flat = features.reshape(-1, self.feature_dim)
         self.feature_mean, self.feature_std = self._fit_scaler(flat)
         normalized = (features - self.feature_mean) / self.feature_std
+        fit_epochs = self.epochs if epochs is None else int(epochs)
+        if fit_epochs < 0:
+            raise ValueError("epochs must be non-negative")
 
         if self.training_mode == "binary":
             model: nn.Module = _BinaryFeatureReverseModel(
@@ -152,7 +218,7 @@ class NormalMLReverseEngineer:
             criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             model.train()
             with torch.enable_grad():
-                for _ in range(self.epochs):
+                for _ in range(fit_epochs):
                     optimizer.zero_grad(set_to_none=True)
                     logits = model(normalized).squeeze(-1)
                     loss = criterion(logits, targets.float().reshape(-1))
@@ -162,19 +228,28 @@ class NormalMLReverseEngineer:
             self.hidden_size = max(self.hidden_size, 128)
             if self.hidden_size % self.num_heads != 0:
                 raise ValueError("hidden_size must be divisible by num_heads")
-            model = _FeatureReverseModel(
-                self.feature_dim,
-                self.hidden_size,
-                self.num_heads,
-                self.num_layers,
-            )
+            if warm_start and previous_model is not None:
+                model = self._warm_start_model(
+                    previous_model,
+                    self.feature_dim,
+                    self.hidden_size,
+                    self.num_heads,
+                    self.num_layers,
+                )
+            else:
+                model = _FeatureReverseModel(
+                    self.feature_dim,
+                    self.hidden_size,
+                    self.num_heads,
+                    self.num_layers,
+                )
             optimizer = torch.optim.AdamW(model.parameters(), lr=self.learning_rate)
             criterion = nn.CrossEntropyLoss()
             sample_count = normalized.shape[0]
             batch_size = max(1, min(self.batch_size, sample_count))
             model.train()
             with torch.enable_grad():
-                for _ in range(self.epochs):
+                for _ in range(fit_epochs):
                     order = torch.randperm(sample_count)
                     for start in range(0, sample_count, batch_size):
                         indices = order[start : start + batch_size]
@@ -191,12 +266,17 @@ class NormalMLReverseEngineer:
     def fit_candidate_sets(
         self,
         candidate_sets: list[tuple[Tensor, Tensor | int]],
+        *,
+        warm_start: bool = False,
+        epochs: int | None = None,
     ) -> None:
         """Fit listwise compatibility scores over complete candidate sets.
 
         Each item is ``(features, target_index)`` where ``features`` has shape
         ``[candidates, feature_dim]`` and ``target_index`` identifies the
         correct candidate. Candidate order has no learned positional meaning.
+
+        `warm_start`/`epochs` are forwarded to `_fit_model` -- see there.
         """
         if not candidate_sets:
             self.model = None
@@ -230,7 +310,7 @@ class NormalMLReverseEngineer:
         features = torch.stack(normalized_sets, dim=0)
         targets = torch.tensor(target_indices, dtype=torch.long)
         self.training_mode = "listwise"
-        self._fit_model(features, targets)
+        self._fit_model(features, targets, warm_start=warm_start, epochs=epochs)
 
     def fit_feature_pairs(
         self,

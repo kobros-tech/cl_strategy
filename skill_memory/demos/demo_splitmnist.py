@@ -54,6 +54,14 @@ def parse_args() -> argparse.Namespace:
         help="Number of epochs used by the independent ML evaluator.",
     )
     parser.add_argument("--train-epochs", type=int, default=1)
+    parser.add_argument(
+        "--class-train-mode",
+        choices=("multiclass", "binary_one_vs_rest"),
+        default="multiclass",
+    )
+    parser.add_argument("--skill-train-samples-per-class", type=int, default=20)
+    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--validation-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=0.01)
@@ -61,6 +69,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-behavior-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-skills", type=int, default=20)
+    parser.add_argument("--candidate-k", type=int, default=3)
+    parser.add_argument("--candidate-routing-debug", action="store_true")
+    parser.add_argument("--candidate-routing-debug-samples", type=int, default=20)
+    parser.add_argument("--routing-validation-precision", type=float, default=0.90)
+    parser.add_argument("--routing-validation-min-samples", type=int, default=20)
     parser.add_argument(
         "--eval-routing",
         choices=("none", "probe"),
@@ -97,8 +110,10 @@ def main() -> None:
 
     print("=== SplitMNIST Skill Memory experiment ===")
     print("Training method: Skill Memory")
+    print(f"Class training mode: {args.class_train_mode}")
+    print(f"Skill training samples/class: {args.skill_train_samples_per_class}")
     print("Evaluation method: independent anonymous ML evaluator")
-    print(f"Evaluation routing: {args.eval_routing}")
+    print("Evaluation routing: candidate-skill arbitration (production)")
     print(f"Diagnostics: {'enabled' if args.diagnose else 'disabled'}")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
@@ -146,6 +161,10 @@ def main() -> None:
         max_skills=args.max_skills,
         train_mb_size=args.batch_size,
         train_epochs=args.train_epochs,
+        class_train_mode=args.class_train_mode,
+        skill_train_samples_per_class=args.skill_train_samples_per_class,
+        validation_fraction=args.validation_fraction,
+        validation_seed=args.validation_seed,
         eval_mb_size=args.eval_batch_size,
         evaluator_model_factory=lambda: SimpleMLP(
             num_classes=10,
@@ -163,6 +182,12 @@ def main() -> None:
         verbose=True,
         eval_routing=args.eval_routing,
         probe_behavior_weight=args.probe_behavior_weight,
+        candidate_skill_routing=True,
+        candidate_k=args.candidate_k,
+        calibration_precision_target=args.routing_validation_precision,
+        calibration_min_samples=args.routing_validation_min_samples,
+        candidate_routing_debug=args.candidate_routing_debug,
+        candidate_routing_debug_max_samples=args.candidate_routing_debug_samples,
     )
 
     # ------------------------------------------------------------------
@@ -193,6 +218,36 @@ def main() -> None:
 
         # Normal Avalanche evaluation lifecycle.
         strategy.eval(benchmark.test_stream)
+
+        routing_stats = strategy.ml_evaluation_plugin._candidate_skill_routing_stats
+        if routing_stats:
+            print("---------- Candidate-skill routing ----------")
+            print(f"candidate_top1_accuracy={routing_stats.get('candidate_top1_accuracy', 0.0):.4f}")
+            print(
+                f"candidate_top{args.candidate_k}_recall="
+                f"{routing_stats.get('candidate_topk_recall', 0.0):.4f}"
+            )
+            print(
+                f"top1_skill_verified_rate="
+                f"{routing_stats.get('top1_skill_verified_rate', 0.0):.4f}"
+            )
+            print(f"rescue_rate={routing_stats.get('rescue_rate', 0.0):.4f}")
+            print(
+                f"skill_override_rate="
+                f"{routing_stats.get('skill_override_rate', 0.0):.4f}"
+            )
+            print(
+                f"ml_top1_accuracy="
+                f"{routing_stats.get('ml_top1_accuracy', 0.0):.4f}"
+            )
+            print(
+                f"final_batch_accuracy="
+                f"{routing_stats.get('final_batch_accuracy', 0.0):.4f}"
+            )
+            print(
+                f"cl_net_accuracy_gain="
+                f"{routing_stats.get('cl_net_accuracy_gain', 0.0):+.4f}"
+            )
 
         if args.diagnose:
             print("---------- Diagnostics ----------")
