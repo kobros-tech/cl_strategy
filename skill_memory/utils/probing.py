@@ -317,7 +317,7 @@ def expand_skill_logits(
         (raw_logits.shape[0], output_dim),
         -20.0,
     )
-    for source_index, global_class in zip(source_indices, owned):
+    for source_index, global_class in zip(source_indices, owned, strict=True):
         if global_class >= output_dim:
             raise RuntimeError(
                 f"skill owns class {global_class}, outside global output "
