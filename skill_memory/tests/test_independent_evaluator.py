@@ -5,7 +5,7 @@
 
 Uses a small synthetic (non-MNIST, no download needed) benchmark built
 with Avalanche's own `nc_benchmark` generator, exercising the same code
-path as `skill_memory/demos/demo_splitmnist_ml_er.py` end to end: Skill
+path as `skill_memory/demos/demo_splitmnist.py` end to end: Skill
 Memory training + evaluation-memory capture, the independent evaluator's
 train/evaluate loop, and ML evaluation through the Avalanche plugin.
 """

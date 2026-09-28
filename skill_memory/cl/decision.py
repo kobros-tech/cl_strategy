@@ -105,7 +105,7 @@ def score_class_against_skills(
     probe_batches: int,
     probe_seed: int | None,
     seen_experiences: list,
-    max_safety_candidates: int = 5,
+    max_safety_candidates: int | None = None,
 ) -> list[dict[str, Any]]:
     """Probe skills against a new class, then verify only top candidates.
 
@@ -141,6 +141,7 @@ def score_class_against_skills(
             new_y,
             nn.functional.cross_entropy,
             experience,
+            seed=probe_seed,
         )
         out_features = incremental_out_features(strategy.model, state_dict)
         chance = 1.0 / out_features if out_features else 0.0
@@ -156,9 +157,13 @@ def score_class_against_skills(
             }
         )
 
-    # Stage 2: only top new-class candidates pay the old-class safety cost.
+    # Stage 2: safety is exact by default. A finite cap is an explicit
+    # performance approximation and may miss a reusable lower-ranked skill.
     candidates.sort(key=lambda r: (r["new_score"], r["new_accuracy"]), reverse=True)
-    safety_candidates = candidates[: max(1, max_safety_candidates)]
+    if max_safety_candidates is None:
+        safety_candidates = candidates
+    else:
+        safety_candidates = candidates[:max_safety_candidates]
 
     old_probe_cache: dict[int, tuple | None] = {}
     results = []
@@ -200,6 +205,7 @@ def score_class_against_skills(
                 old_y,
                 nn.functional.cross_entropy,
                 old_experience,
+                seed=probe_seed,
             )
             old_metrics.append(
                 {
@@ -255,7 +261,7 @@ def decide_class(
     score_floor: float | None,
     force_decision: str | None,
     logger_fn,
-    max_safety_candidates: int = 5,
+    max_safety_candidates: int | None = None,
 ) -> dict[str, Any]:
     """Decide for one class, never for an entire multi-class experience.
 

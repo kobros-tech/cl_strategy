@@ -106,9 +106,9 @@ higher-level explanation:
 - `score_class_against_skills` is two-staged on purpose: stage 1
   (`evaluate_state` against the new class) runs for *every* stored skill,
   cheaply — one functional forward pass each, no model copies (see
-  above); stage 2 (the real old-class safety check) only re-runs for the
-  top `max_safety_candidates` (default 5) by new-class score, since it is
-  `O(skills × old_classes)` forward passes otherwise.
+  above); stage 2 checks old classes for every candidate by default.
+  `max_safety_candidates` can be set to a finite value as an explicit
+  performance approximation when the full safety check is too expensive.
 - `_strongest_candidates` finds the largest gap in a sorted metric
   ranking rather than a fixed threshold, so the "how much better than the
   runner-up does a candidate need to be" question doesn't need its own

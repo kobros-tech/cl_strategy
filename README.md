@@ -3,10 +3,10 @@
 **Skill Memory** is a class-incremental continual-learning strategy for
 [Avalanche](https://avalanche.continualai.org/) that answers a simple
 question directly, instead of hoping a single shared model answers it
-implicitly: *when I meet a new class, should the network reuse an
-existing skill, or does this class need one of its own?*
+implicitly: _when I meet a new class, should the network reuse an
+existing skill, or does this class need one of its own?_
 
-It does this by keeping one **frozen weight snapshot per class** ("skill"),
+It does this by keeping one **stored weight snapshot per skill**,
 probing candidates numerically before committing to either choice, and
 evaluating the result with an evaluator that is architecturally
 independent of the strategy under test — so a passing score can't be an
@@ -52,7 +52,7 @@ $$
 $$
 
 The same measurement, run on skill $s$'s own already-mastered classes
-$c' \in \text{owned}(s)$, gives the *safety* side of the decision — the
+$c' \in \text{owned}(s)$, gives the _safety_ side of the decision — the
 **worst** old class, not the average, so one quietly forgotten class can't
 hide behind the others:
 
@@ -73,7 +73,7 @@ $$
 
 with $\text{chance}_s = 1 / |\text{classifier width of } s|$, forgetting
 margin $\delta$ (default $0.05$), and score floor $\tau$ (default $0.9$).
-Among the skills that pass, the strongest candidates on `new_score` *and*
+Among the skills that pass, the strongest candidates on `new_score` _and_
 on `new_accuracy` are found independently by looking for the largest gap
 in each sorted ranking (`_strongest_candidates`, not just "above the
 floor") — the class is only reused if the two rankings agree on the same
@@ -86,12 +86,12 @@ for worked cases.
 
 **Production evaluation is always the independent ML evaluator**
 ([`skill_memory.evaluation.independent_evaluator`](skill_memory/evaluation/independent_evaluator.py)):
-a *separate* model, trained only on a small held-out memory of past
+a _separate_ model, trained only on a small held-out memory of past
 examples, whose job is exactly what a real deployment needs — take an
 input with no class-identity hint and produce a class prediction. It
 never sees which skill a sample "should" route to; it only sees pixels
 in, a class out. Its accuracy is what `strategy.eval()` reports, and
-`--eval-routing probe` lets the evaluator *also* route to a specific
+`--eval-routing probe` lets the evaluator _also_ route to a specific
 skill's own frozen weights when it's confident, purely to check whether
 skill-specific weights sharpen the shared model's prediction.
 
@@ -99,8 +99,8 @@ skill-specific weights sharpen the shared model's prediction.
 package is opt-in, never runs inside `strategy.eval()`, and refuses to run
 at all unless you pass `diagnose=True` (see
 [Diagnostics and the `diagnose` contract](#diagnostics-and-the-diagnose-contract)).** It exists to answer a
-different, diagnostic question: *could Skill Memory's own stored skills,
-without any evaluator at all, reproduce that accuracy?*
+different, diagnostic question: _could Skill Memory's own stored skills,
+without any evaluator at all, reproduce that accuracy?_
 
 - `evaluate_class_oracle` routes each sample using its **true label** —
   an upper bound that presupposes knowing the answer already.
@@ -116,8 +116,8 @@ never be quietly explained by peeking at ground truth.
 ## Anonymous routing (no task id, no label)
 
 `find_best_routing_skill` (in [`skill_memory/diagnostics/routing.py`](skill_memory/diagnostics/routing.py))
-picks one skill per sample using only *that skill's own* raw response at
-*its own* owned class columns — no shared evaluator, no learned router.
+picks one skill per sample using only _that skill's own_ raw response at
+_its own_ owned class columns — no shared evaluator, no learned router.
 For skill $s$'s raw logits $z_s \in \mathbb{R}^{N \times C_s}$ on owned
 classes $\text{owned}(s)$:
 
@@ -145,7 +145,7 @@ long-running version of this same idea —
 — caches each skill's fingerprint and only recomputes it when
 [`global_fingerprint_refresh`](skill_memory/evaluation/global_fingerprint_refresh.py)
 detects drift, and can optionally reconstruct a class's decision boundary
-directly from a skill's stored *weights* rather than from probe forward
+directly from a skill's stored _weights_ rather than from probe forward
 passes — see
 [`reverse_engineer_scores_from_weights`](skill_memory/evaluation/behavior.py)
 and [`NormalMLReverseEngineer`](skill_memory/evaluation/reverse_engineering.py).
@@ -177,7 +177,7 @@ skill_memory/
 ├── utils/
 │   └── probing.py                 # Dataset probing, exact state application, IncrementalClassifier helpers
 ├── demos/
-│   └── demo_splitmnist_ml_er.py  # End-to-end SplitMNIST example (see below)
+│   └── demo_splitmnist.py  # End-to-end SplitMNIST example (see below)
 └── tests/                          # 96 tests; see "Development"
 ```
 
@@ -262,10 +262,10 @@ probe = evaluate_skill_memory(
 ## Running the SplitMNIST demo
 
 ```bash
-python -m skill_memory.demos.demo_splitmnist_ml_er --n-experiences 5 --train-epochs 1
+python -m skill_memory.demos.demo_splitmnist --n-experiences 5 --train-epochs 1
 ```
 
-Key flags (`python -m skill_memory.demos.demo_splitmnist_ml_er --help` for
+Key flags (`python -m skill_memory.demos.demo_splitmnist --help` for
 the rest): `--eval-routing {none,probe}` (evaluator-only vs. evaluator +
 skill-probe routing at evaluation time), `--diagnose` (also run the opt-in
 class-oracle and anonymous-probe diagnostics above; never affects the

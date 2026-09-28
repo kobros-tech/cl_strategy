@@ -92,7 +92,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         probe_batch_size: int = 64,
         probe_batches: int = 5,
         probe_seed: int | None = None,
-        max_safety_candidates: int = 5,
+        max_safety_candidates: int | None = None,
         class_train_batch_size: int = 64,
         reuse_is_mutable: bool = True,
         force_decision: str | None = None,

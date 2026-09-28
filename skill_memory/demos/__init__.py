@@ -6,7 +6,7 @@
 These are examples, not library code: nothing under `skill_memory` imports
 from `skill_memory.demos`. Run one directly, e.g.:
 
-    python -m skill_memory.demos.demo_splitmnist_ml_er --help
+    python -m skill_memory.demos.demo_splitmnist --help
 """
 
 from __future__ import annotations

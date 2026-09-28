@@ -362,23 +362,25 @@ def restore_initial_state(model: nn.Module, state_dict: Mapping[str, Tensor]) ->
 
 
 def _functional_growth_for_experience(
-    model: nn.Module, state_dict: Mapping[str, Tensor], experience
+    model: nn.Module,
+    state_dict: Mapping[str, Tensor],
+    experience,
+    *,
+    seed: int | None = None,
 ) -> dict[str, Tensor]:
     """Return `state_dict`, expanded to cover `experience`'s classes.
 
     `model` itself is never touched.
 
-    Reproduces Avalanche's own ``IncrementalClassifier.adaptation`` growth
-    rule -- new output width is ``max(old width, max(experience's classes) + 1)``,
-    old rows and active-unit flags preserved, newly added rows freshly
-    initialized and marked active (matching every current call site, which
-    always runs this during Skill Memory's own training-time probing, i.e.
-    exactly when the real, mutating ``adaptation()`` would have marked them
-    active too) -- but returns a plain, detached parameter/buffer dict for
-    :func:`torch.func.functional_call` rather than replacing any module in
-    place. `model` is used only to locate which keys are a classifier's;
-    nothing about it is read or written.
-    """
+    Reproduces Avalanche's ``IncrementalClassifier.adaptation`` growth
+    rule: the output width becomes ``max(old width,
+    max(experience's classes) + 1)``; old rows and active-unit flags are
+    preserved, and only the classes in the experience are activated. Newly
+    added rows use the same ``nn.Linear`` initialization as Avalanche. When
+    ``seed`` is provided, that temporary initialization is deterministic and
+    the caller's global RNG state is left unchanged. This returns a plain,
+    detached parameter/buffer dict for ``torch.func.functional_call`` rather
+    than replacing any module in place."""
     curr_classes = list(getattr(experience, "classes_in_this_experience", ()))
     if not curr_classes:
         return dict(state_dict)
@@ -393,24 +395,44 @@ def _functional_growth_for_experience(
         old_weight = params[weight_key]
         old_out, in_features = old_weight.shape
         new_out = max(old_out, target_min_width)
-        if new_out == old_out:
-            continue
-
-        fresh = nn.Linear(in_features, new_out)
-        fresh.weight.data[:old_out] = old_weight
-        bias_key = _bias_key(name)
-        if bias_key in params:
-            fresh.bias.data[:old_out] = params[bias_key]
-            params[bias_key] = fresh.bias.detach()
-        params[weight_key] = fresh.weight.detach()
 
         active_key = _active_units_key(name)
         old_active = params.get(active_key)
-        new_active = torch.zeros(new_out, dtype=torch.int8)
         if old_active is not None:
+            new_active = torch.zeros(
+                new_out, dtype=old_active.dtype, device=old_active.device
+            )
             new_active[: old_active.shape[0]] = old_active
-        new_active[old_out:new_out] = 1  # newly added columns start active
+        else:
+            new_active = torch.zeros(new_out, dtype=torch.int8)
+
+        # Match Avalanche: activate exactly the classes in this experience,
+        # not every newly allocated column between old_out and max(class)+1.
+        new_active[list(int(c) for c in curr_classes)] = 1
         params[active_key] = new_active
+
+        if new_out == old_out:
+            continue
+
+        if seed is None:
+            fresh = nn.Linear(in_features, new_out)
+        else:
+            # Keep probe initialization deterministic without advancing the
+            # caller's global RNG state.
+            with torch.random.fork_rng():
+                torch.manual_seed(int(seed))
+                fresh = nn.Linear(in_features, new_out)
+
+        fresh = fresh.to(device=old_weight.device, dtype=old_weight.dtype)
+        with torch.no_grad():
+            fresh.weight[:old_out].copy_(old_weight)
+            bias_key = _bias_key(name)
+            if bias_key in params:
+                fresh.bias[:old_out].copy_(params[bias_key])
+        params[weight_key] = fresh.weight.detach()
+        bias_key = _bias_key(name)
+        if bias_key in params:
+            params[bias_key] = fresh.bias.detach()
 
     return params
 
@@ -447,11 +469,15 @@ def predict_logits(
     different skill costs nothing more than a dict lookup, not a full
     `load_state_dict` copy of every parameter tensor.
     """
+    was_training = model.training
     model.eval()
-    device = next(model.parameters()).device
-    params = {key: value.to(device) for key, value in state_dict.items()}
-    with torch.no_grad():
-        return torch.func.functional_call(model, params, (x.to(device),)).detach()
+    try:
+        device = next(model.parameters()).device
+        params = {key: value.to(device) for key, value in state_dict.items()}
+        with torch.no_grad():
+            return torch.func.functional_call(model, params, (x.to(device),)).detach()
+    finally:
+        model.train(was_training)
 
 
 def evaluate_state(
@@ -461,6 +487,8 @@ def evaluate_state(
     y: Tensor,
     loss_fn: Callable[[Tensor, Tensor], Tensor],
     experience,
+    *,
+    seed: int | None = None,
 ) -> tuple[float, float, float]:
     r"""Score one frozen skill snapshot against a probe batch, with no training.
 
@@ -472,16 +500,16 @@ def evaluate_state(
     `experience` may require is computed as a plain tensor dict (see
     :func:`_functional_growth_for_experience`) and substituted in only for
     this one forward pass via :func:`torch.func.functional_call`. Probing
-    ``S`` stored skills against the same class therefore costs one
-    `deepcopy` (of the caller's model, taken once up front) and ``S``
-    forward passes -- not ``S`` full parameter copies plus ``S`` forward
-    passes, which is what a mutate-then-restore implementation costs.
+    ``S`` stored skills against the same class therefore uses one
+    functional forward per skill, without mutating or copying the caller's
+    live model between skills.
 
     The growth rule gives the classifier a column for every class
-    `experience` actually contains -- a genuine no-op when `state_dict`
-    already covers those classes (the old-class safety check), and a
-    freshly, randomly initialized column when it does not (the new-class
-    compatibility check). Given the resulting logits
+    `experience` actually contains and activates exactly those classes.
+    If the stored state already has enough columns, no weights are changed;
+    only the active-unit mask is updated. Newly added classifier rows use
+    Avalanche's normal random initialization, optionally seeded by `seed`.
+    Given the resulting logits
     :math:`z \in \mathbb{R}^{N \times C}` and labels
     :math:`y \in \{0, \dots, C-1\}^N`:
 
@@ -497,15 +525,24 @@ def evaluate_state(
     places on the true label -- is what `find_best_skill`'s `score_floor`
     thresholds; `accuracy` is a plain top-1 accuracy over the same batch.
     """
-    params = _functional_growth_for_experience(model, state_dict, experience)
+    params = _functional_growth_for_experience(
+        model,
+        state_dict,
+        experience,
+        seed=seed,
+    )
+    was_training = model.training
     model.eval()
-    device = next(model.parameters()).device
-    params = {key: value.to(device) for key, value in params.items()}
-    with torch.no_grad():
-        logits = torch.func.functional_call(model, params, (x.to(device),))
-        targets = y.to(device)
-        loss = loss_fn(logits, targets)
-        probabilities = torch.softmax(logits, dim=1)
-        score = probabilities.gather(1, targets.view(-1, 1)).mean()
-        accuracy = logits.argmax(dim=1).eq(targets).float().mean()
-    return float(loss.item()), float(score.item()), float(accuracy.item())
+    try:
+        device = next(model.parameters()).device
+        params = {key: value.to(device) for key, value in params.items()}
+        with torch.no_grad():
+            logits = torch.func.functional_call(model, params, (x.to(device),))
+            targets = y.to(device)
+            loss = loss_fn(logits, targets)
+            probabilities = torch.softmax(logits, dim=1)
+            score = probabilities.gather(1, targets.view(-1, 1)).mean()
+            accuracy = logits.argmax(dim=1).eq(targets).float().mean()
+        return float(loss.item()), float(score.item()), float(accuracy.item())
+    finally:
+        model.train(was_training)

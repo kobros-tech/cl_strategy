@@ -1,0 +1,66 @@
+name: SplitMNIST ML/CL evaluator
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "refactor/**"
+      - "fix/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  run-ml-er-evaluator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - eval_epochs: 1
+            eval_routing: none
+          - eval_epochs: 10
+            eval_routing: none
+          - eval_epochs: 100
+            eval_routing: none
+          - eval_epochs: 10
+            eval_routing: probe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package
+        run: python -m pip install -e .
+
+      - name: Restore or download SplitMNIST dataset
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: splitmnist-dataset-v1-${{ runner.os }}
+
+      - name: Run 5 experiences, ${{ matrix.eval_routing }} evaluation, ${{ matrix.eval_epochs }} eval epoch(s)
+        run: |
+          python skill_memory/demos/demo_splitmnist.py \
+            --dataset-root data \
+            --n-experiences 5 \
+            --eval-epochs ${{ matrix.eval_epochs }} \
+            --eval-routing ${{ matrix.eval_routing }} \
+            | tee ml_er_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_${{ github.run_id }}.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-er-${{ matrix.eval_routing }}-${{ matrix.eval_epochs }}ep-${{ github.run_id }}
+          path: ml_er_${{ matrix.eval_routing }}_${{ matrix.eval_epochs }}ep_*.txt
+          if-no-files-found: warn
+          retention-days: 14
