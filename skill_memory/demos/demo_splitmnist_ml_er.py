@@ -30,6 +30,7 @@ from skill_memory.diagnostics import (
     diagnose_evaluator_probe,
     evaluate_class_oracle,
     evaluate_skill_memory,
+    timing_report,
 )
 
 
@@ -158,6 +159,7 @@ def main() -> None:
         eval_learning_rate=args.eval_learning_rate,
         probe_seed=args.seed,
         device=device,
+        diagnose=args.diagnose,
         verbose=True,
         eval_routing=args.eval_routing,
         probe_behavior_weight=args.probe_behavior_weight,
@@ -202,6 +204,7 @@ def main() -> None:
                 num_classes=10,
                 batch_size=args.eval_batch_size,
                 device=device,
+                diagnose=args.diagnose,
             )
             direct_probe = evaluate_skill_memory(
                 strategy.model,
@@ -212,11 +215,13 @@ def main() -> None:
                 routing="probe",
                 batch_size=args.eval_batch_size,
                 device=device,
+                diagnose=args.diagnose,
             )
             evaluator_probe = diagnose_evaluator_probe(
                 strategy,
                 benchmark.test_stream,
                 batch_size=args.eval_batch_size,
+                diagnose=args.diagnose,
             )
             print(
                 "class_oracle_mean_accuracy=",
@@ -238,6 +243,11 @@ def main() -> None:
                 "evaluator_probe_mean_margin=",
                 f"{evaluator_probe['probe_mean_margin']:.4f}",
             )
+            for bucket, stats in timing_report(strategy).items():
+                print(
+                    f"timing[{bucket}]: total={stats['total_seconds']:.2f}s "
+                    f"calls={stats['calls']} mean={stats['mean_seconds']:.3f}s"
+                )
 
     # ------------------------------------------------------------------
     # Final results.

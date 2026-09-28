@@ -3,6 +3,48 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.0] - 2026
+
+### Breaking
+
+- **All diagnostic code now lives in one package,
+  `skill_memory/diagnostics/`**, replacing the top-level
+  `skill_memory/diagnostics.py`, `skill_memory/evaluation/diagnostics.py`
+  and `skill_memory/utils/timing.py`.
+- **Every diagnostic entry point now requires `diagnose=True`** as a
+  keyword-only argument with no default (`find_best_routing_skill`,
+  `route_probe_logits`, `evaluate_skill_memory`, `evaluate_class_oracle`,
+  `diagnose_evaluator_probe`, `routing_rank_diagnostics`,
+  `class_index_alignment_report`). Omitting it is a `TypeError`;
+  `diagnose=False` is a `RuntimeError`. Migration: add `diagnose=True` at
+  each call site.
+- `class_index_alignment_report` is no longer exported from the top-level
+  `skill_memory` namespace; import it from `skill_memory.diagnostics`.
+- `timing_report` / `reset_timing` now require a strategy built with
+  `SkillMemoryStrategy(..., diagnose=True)` (new argument, default
+  `False`). Previously timing was always recorded.
+
+### Changed
+
+- With `diagnose=False`, every internal `self.timing.track(...)` is a true
+  no-op (no `time.perf_counter()` call), so production runs pay nothing
+  for instrumentation. `PersistentFingerprintSkillMemoryPlugin`'s existing
+  `diagnose` flag now also controls this.
+
+### Added
+
+- `tests/test_diagnostics_gate.py`: enforces the required-keyword
+  signatures, the refusals, that no diagnostic name leaks into the
+  top-level package, and (by parsing imports) that production modules
+  import from `skill_memory.diagnostics` only in three known, gated places.
+- The demo's `--diagnose` flag now drives the strategy's `diagnose=` and
+  prints the timing report.
+
+### Fixed
+
+- README no longer claims probing operates on a `deepcopy` (it has been
+  functional since 1.1.0).
+
 ## [1.1.0] - 2026
 
 ### Changed

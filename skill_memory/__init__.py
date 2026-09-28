@@ -1,7 +1,14 @@
 # Copyright (c) 2026 Kobros-Tech Ltd
 # SPDX-License-Identifier: MIT
 
-"""Class-level probe-based Skill Memory for Avalanche."""
+"""Class-level probe-based Skill Memory for Avalanche.
+
+Diagnostics (anonymous-routing evaluation, oracle-routed evaluation,
+timing, and per-skill alignment reports) live entirely in
+`skill_memory.diagnostics` and are never imported here -- see that
+package's docstring for why, and for the `diagnose=True` contract every
+function there enforces.
+"""
 
 from .cl.decision import find_best_skill
 from .cl.skill_memory_plugin import SkillMemoryPlugin
@@ -15,7 +22,6 @@ from .evaluation.behavior import (
     reverse_engineer_y,
     reverse_engineer_y_from_weights,
 )
-from .evaluation.diagnostics import class_index_alignment_report
 from .evaluation.fingerprint_routing import PersistentFingerprintSkillMemoryPlugin
 from .evaluation.independent_evaluator import (
     EvaluationMemory,
@@ -50,7 +56,6 @@ __all__ = [
     "NormalMLReverseEngineer",
     "aggregate_experience_metrics",
     "build_evaluator",
-    "class_index_alignment_report",
     "compare_binary_behavior",
     "compute_class_forgetting",
     "compute_peak_class_forgetting",

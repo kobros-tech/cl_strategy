@@ -12,15 +12,19 @@ from typing import Any
 from torch import Tensor, nn
 
 from ..utils.probing import incremental_active_units, incremental_out_features
+from ._gate import require_diagnose
 
 
-def routing_rank_diagnostics(routes: list[dict[str, Any]]) -> dict[str, Any]:
+def routing_rank_diagnostics(
+    routes: list[dict[str, Any]], *, diagnose: bool
+) -> dict[str, Any]:
     """Compute rank and confusion diagnostics from retained route records.
 
     This helper is deliberately separate from evaluation so normal routing does
-    not need to compute or retain diagnostic aggregates. Call it only when
-    ``diagnose=True`` and route history is available.
+    not need to compute or retain diagnostic aggregates. Call it only with
+    ``diagnose=True`` and route history available.
     """
+    require_diagnose(diagnose, "routing_rank_diagnostics")
     if not routes:
         return {
             "samples": 0,
@@ -79,6 +83,8 @@ def class_index_alignment_report(
     states: Sequence[Mapping[str, Tensor]],
     slot_ids: Sequence[int],
     owned_classes_by_slot: Sequence[Sequence[int]],
+    *,
+    diagnose: bool,
 ) -> dict[str, Any]:
     """Report, per skill, whether its owned global class ids fit its own
     classifier's output space.
@@ -99,8 +105,11 @@ def class_index_alignment_report(
     frozen snapshot for each slot in ``slot_ids`` (``memory.state(slot)``)
     and ``owned_classes_by_slot`` = the recorded classes for each slot
     (``class_map.classes_for_skill(slot)``), in the same order as
-    ``slot_ids``.
+    ``slot_ids``. Requires ``diagnose=True``: inspecting stored weights
+    like this is diagnostic-only bookkeeping, never part of a production
+    prediction.
     """
+    require_diagnose(diagnose, "class_index_alignment_report")
     per_skill: list[dict[str, Any]] = []
     any_misaligned = False
 

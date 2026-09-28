@@ -28,6 +28,7 @@ from typing import Any
 
 from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 
+from ..diagnostics.timing import TimingAccumulator
 from ..utils.probing import (
     apply_skill_state_exact,
     classes_in_experience,
@@ -35,7 +36,6 @@ from ..utils.probing import (
     prepare_for_experience,
     restore_initial_state,
 )
-from ..utils.timing import TimingAccumulator
 from .decision import decide_class
 from .skill_registry import ClassRecord, ExperienceClassMap, SkillMemory
 from .training import train_on_class
@@ -70,11 +70,15 @@ class SkillMemoryPlugin(SupervisedPlugin):
         skill_name: Callable | None = None,
         force_decision: str | None = None,
         verbose: bool = True,
+        diagnose: bool = False,
     ):
         """Configure per-class REUSE/SCRATCH decisions.
 
         `memory` stores each skill's frozen weight snapshot; a fresh one is
-        created if not given.
+        created if not given. `diagnose` controls only whether `self.timing`
+        actually records anything (see `skill_memory.diagnostics.timing_report`)
+        -- it defaults to `False` so a production run never pays even the
+        cost of `time.perf_counter()` calls it will not read back.
         """
         super().__init__()
         if force_decision not in (None, self.REUSE, self.SCRATCH):
@@ -94,9 +98,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.skill_name = skill_name
         self.force_decision = force_decision
         self.verbose = verbose
+        self.diagnose = bool(diagnose)
 
         self.last_class_decisions: dict[int, dict[int, dict[str, Any]]] = {}
-        self.timing = TimingAccumulator()
+        self.timing = TimingAccumulator(enabled=self.diagnose)
         self._initial_state: dict | None = None
         self._task_active = False
         self._seen_experiences: list = []

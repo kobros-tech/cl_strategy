@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skill-memory"
-version = "1.1.0"
+version = "2.0.0"
 description = "Class-level, probe-based Skill Memory plugin for Avalanche continual learning"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -47,6 +47,7 @@ packages = [
     "skill_memory.cl",
     "skill_memory.evaluation",
     "skill_memory.utils",
+    "skill_memory.diagnostics",
     "skill_memory.demos",
 ]
 

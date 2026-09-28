@@ -21,6 +21,7 @@ artifact of the thing being measured.
 - [Quickstart](#quickstart)
 - [Running the SplitMNIST demo](#running-the-splitmnist-demo)
 - [Performance: functional probing, and where the time goes](#performance-functional-probing-and-where-the-time-goes)
+- [Diagnostics and the `diagnose` contract](#diagnostics-and-the-diagnose-contract)
 - [Development](#development)
 - [Design invariants](#design-invariants)
 - [License](#license)
@@ -94,8 +95,10 @@ in, a class out. Its accuracy is what `strategy.eval()` reports, and
 skill's own frozen weights when it's confident, purely to check whether
 skill-specific weights sharpen the shared model's prediction.
 
-**Everything in [`skill_memory.diagnostics`](skill_memory/diagnostics.py)
-is opt-in and never runs inside `strategy.eval()`.** It exists to answer a
+**Everything in the [`skill_memory.diagnostics`](skill_memory/diagnostics/)
+package is opt-in, never runs inside `strategy.eval()`, and refuses to run
+at all unless you pass `diagnose=True` (see
+[Diagnostics and the `diagnose` contract](#diagnostics-and-the-diagnose-contract)).** It exists to answer a
 different, diagnostic question: *could Skill Memory's own stored skills,
 without any evaluator at all, reproduce that accuracy?*
 
@@ -112,7 +115,7 @@ never be quietly explained by peeking at ground truth.
 
 ## Anonymous routing (no task id, no label)
 
-`find_best_routing_skill` (in [`skill_memory/diagnostics.py`](skill_memory/diagnostics.py))
+`find_best_routing_skill` (in [`skill_memory/diagnostics/routing.py`](skill_memory/diagnostics/routing.py))
 picks one skill per sample using only *that skill's own* raw response at
 *its own* owned class columns — no shared evaluator, no learned router.
 For skill $s$'s raw logits $z_s \in \mathbb{R}^{N \times C_s}$ on owned
@@ -152,7 +155,12 @@ and [`NormalMLReverseEngineer`](skill_memory/evaluation/reverse_engineering.py).
 ```
 skill_memory/
 ├── strategy.py                  # SkillMemoryStrategy: the public Avalanche-facing API
-├── diagnostics.py                # Opt-in routing/evaluation diagnostics (never in strategy.eval())
+├── diagnostics/                   # ALL diagnostic code; every function needs diagnose=True
+│   ├── routing.py                 # find_best_routing_skill, route_probe_logits
+│   ├── evaluation.py              # evaluate_class_oracle, evaluate_skill_memory, diagnose_evaluator_probe
+│   ├── alignment.py               # routing_rank_diagnostics, class_index_alignment_report
+│   ├── timing.py                  # TimingAccumulator, timing_report, reset_timing
+│   └── _gate.py                   # require_diagnose: the one shared enforcement point
 ├── cl/                            # Skill Memory itself: what to freeze, when, and why
 │   ├── skill_registry.py         # SkillMemory (frozen state store) + ExperienceClassMap (bookkeeping)
 │   ├── decision.py                # The reuse-vs-scratch probing/decision policy (math above)
@@ -162,7 +170,6 @@ skill_memory/
 ├── evaluation/                    # Everything about *measuring* the strategy
 │   ├── independent_evaluator.py  # The independent ML evaluator (production eval)
 │   ├── routing.py                 # Shared routing math: score_skill_compatibility, select_skill_from_scores
-│   ├── diagnostics.py             # routing_rank_diagnostics, class_index_alignment_report
 │   ├── behavior.py                 # Per-class behavior fingerprints; reverse-engineering from weights
 │   ├── reverse_engineering.py     # NormalMLReverseEngineer: learned weight -> decision reconstruction
 │   ├── fingerprint_routing.py     # PersistentFingerprintSkillMemoryPlugin (cached anonymous routing)
@@ -237,6 +244,7 @@ oracle = evaluate_class_oracle(
     num_classes=10,
     batch_size=64,
     device=strategy.device,
+    diagnose=True,  # required: this uses true labels to route
 )
 probe = evaluate_skill_memory(
     strategy.model,
@@ -247,6 +255,7 @@ probe = evaluate_skill_memory(
     routing="probe",
     batch_size=64,
     device=strategy.device,
+    diagnose=True,
 )
 ```
 
@@ -291,11 +300,13 @@ apply-and-train paths still use the mutating
 disposable probe.)
 
 To see where wall-clock time is actually going in your own run, rather
-than guessing:
+than guessing, build the strategy with `diagnose=True` (timing is never
+recorded otherwise — see below):
 
 ```python
 from skill_memory.diagnostics import timing_report
 
+strategy = SkillMemoryStrategy(..., diagnose=True)
 # after some strategy.train(...) / strategy.eval(...) calls:
 print(timing_report(strategy))
 # {
@@ -308,6 +319,40 @@ print(timing_report(strategy))
 `reset_timing(strategy)` clears all three buckets, e.g. to isolate one
 experience's timing from the run as a whole.
 
+## Diagnostics and the `diagnose` contract
+
+Production code and diagnostic code are kept structurally apart, so it is
+auditable — not just promised — that nothing diagnostic can reach a
+production number.
+
+- **One package.** Every diagnostic lives in
+  [`skill_memory/diagnostics/`](skill_memory/diagnostics/). Nothing in it
+  is importable from the bare `skill_memory` namespace — you have to
+  write `from skill_memory.diagnostics import ...` on purpose.
+- **A required flag, not a default.** `find_best_routing_skill`,
+  `route_probe_logits`, `evaluate_skill_memory`, `evaluate_class_oracle`,
+  `diagnose_evaluator_probe`, `routing_rank_diagnostics` and
+  `class_index_alignment_report` all take `diagnose` as a required
+  keyword-only argument with **no default**. Leaving it out is a
+  `TypeError`; passing `diagnose=False` is a `RuntimeError`. Anything that
+  could use a true label (oracle routing) or costs real forward passes
+  therefore can't run by accident, whatever the strategy was configured
+  with.
+- **Zero cost when off.** `SkillMemoryStrategy(diagnose=False)` (the
+  default) makes every internal `self.timing.track(...)` a true no-op — it
+  doesn't even call `time.perf_counter()`. `timing_report`/`reset_timing`
+  need a strategy built with `diagnose=True` and say so clearly otherwise.
+- **Enforced by tests.**
+  [`tests/test_diagnostics_gate.py`](skill_memory/tests/test_diagnostics_gate.py)
+  checks the signatures, the refusals, that no diagnostic name leaks into
+  the top-level package, and — by parsing every production module's
+  imports — that only the two files that own a `TimingAccumulator` and the
+  one plugin that already gated its own reports on `diagnose` import from
+  `skill_memory.diagnostics` at all.
+
+To audit a codebase built on this package: grep for `diagnose=True`. Every
+match is a place where ground truth or diagnostic cost could enter.
+
 ## Design invariants
 
 - **One canonical skill per class, for the strategy's whole lifetime.**
@@ -316,11 +361,12 @@ experience's timing from the run as a whole.
   skill later (see [`skill_registry.py`](skill_memory/cl/skill_registry.py)).
 - **A skill's weights are frozen the moment it stops being trained.**
   Nothing outside `cl/training.py`'s scratch-training pass and the
-  probing in `decision.py` (which always operates on a `deepcopy`, never
+  probing in `decision.py` (which applies stored weights functionally via
+  `torch.func.functional_call`, so it never mutates — or needs a copy of —
   the live model) ever calls `.backward()` using a stored skill's weights.
 - **Diagnostics never leak into production metrics.** Everything in
-  `skill_memory.diagnostics` is opt-in, separately called, and absent
-  from `strategy.eval()`'s return value unless explicitly requested.
+  `skill_memory.diagnostics` requires an explicit `diagnose=True` at the
+  call site and is absent from `strategy.eval()`'s return value.
 
 ## License
 

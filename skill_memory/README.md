@@ -11,7 +11,7 @@ Lower modules never import from higher ones — breaking this ordering
 reintroduces a real circular import, not just a lint warning:
 
 ```
-utils/probing.py, utils/timing.py   (no dependency on cl/ or evaluation/)
+utils/probing.py            (no dependency on cl/ or evaluation/)
         |
         v
 cl/skill_registry.py  -->  cl/decision.py  -->  cl/skill_memory_plugin.py
@@ -20,7 +20,7 @@ cl/skill_registry.py  -->  cl/decision.py  -->  cl/skill_memory_plugin.py
 cl/training.py                          cl/persistent_skill_memory_plugin.py
         |
         v
-evaluation/routing.py --> evaluation/diagnostics.py
+evaluation/routing.py
         |
         v
 evaluation/behavior.py --> evaluation/reverse_engineering.py
@@ -32,7 +32,10 @@ evaluation/fingerprint_routing.py, evaluation/global_fingerprint_refresh.py
 evaluation/independent_evaluator.py   (subclasses cl.skill_memory_plugin.SkillMemoryPlugin)
         |
         v
-strategy.py, diagnostics.py            (top-level; import everything above)
+strategy.py                             (top-level; imports everything above)
+
+diagnostics/   (depends only on utils/ and evaluation/routing.py; imported by
+                production code in exactly three places -- see below)
 ```
 
 `evaluation/independent_evaluator.py` is deliberately **not** re-exported
@@ -114,7 +117,7 @@ higher-level explanation:
   measuring a frozen skill's *existing* representation on a class it may
   never have trained on, not training it further.
 
-## Timing instrumentation (`utils/timing.py`, `diagnostics.py`)
+## Timing instrumentation (`diagnostics/timing.py`)
 
 `SkillMemoryPlugin.timing` and `SkillMemoryStrategy.timing` are each a
 `TimingAccumulator`; `diagnostics.timing_report(strategy)` merges both
@@ -126,13 +129,13 @@ it, rather than adding another ad hoc `time.perf_counter()` call — the
 existing three buckets are read together specifically so the report
 stays comparable across runs.
 
-## Anonymous routing (`evaluation/routing.py`, `diagnostics.py`)
+## Anonymous routing (`evaluation/routing.py`, `diagnostics/routing.py`)
 
 `evaluation/routing.py` holds the shared primitives
 (`score_skill_compatibility`, `select_skill_from_scores`,
 `_normalize_routing_scores`) used by both the evaluator-based probe router
 (`evaluation/independent_evaluator.py`) and the evaluator-free anonymous
-router (`find_best_routing_skill` in the top-level `diagnostics.py`). If
+router (`find_best_routing_skill` in `diagnostics/routing.py`). If
 you change the temperature/normalization rule in one, check whether the
 other's tests
 ([`tests/test_routing.py`](tests/test_routing.py),
@@ -149,3 +152,19 @@ pytest skill_memory/tests -q
 (`test_strategy.py`) build tiny synthetic Avalanche benchmarks rather than
 downloading a real dataset, so the whole suite runs in well under two
 minutes on CPU.
+
+## Adding a new diagnostic
+
+1. Put it in `skill_memory/diagnostics/`, never next to production code.
+2. If it can read a true label or costs real forward passes, make
+   `diagnose` a **required keyword-only argument with no default** and call
+   `require_diagnose(diagnose, "your_function_name")` first (see
+   `diagnostics/_gate.py`), then add it to
+   `GATED_FUNCTIONS` in `tests/test_diagnostics_gate.py` — that test
+   asserts the no-default rule mechanically.
+3. Do **not** import it from production modules. If production code truly
+   must (as `fingerprint_routing.py` does for its own already-flag-gated
+   reports), add the import to the `allowed` set in
+   `test_production_modules_do_not_import_diagnostic_functions` and say why
+   in the docstring — the point of that test is that this list stays tiny
+   and deliberate.

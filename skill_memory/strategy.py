@@ -37,11 +37,11 @@ from avalanche.training.templates import SupervisedTemplate
 
 from .cl.skill_memory_plugin import SkillMemoryPlugin
 from .cl.skill_registry import SkillMemory
+from .diagnostics.timing import TimingAccumulator
 from .evaluation.independent_evaluator import (
     EvaluationMemoryPlugin,
     MLEvaluationPlugin,
 )
-from .utils.timing import TimingAccumulator
 
 
 class SkillMemoryStrategy(SupervisedTemplate):
@@ -57,8 +57,19 @@ class SkillMemoryStrategy(SupervisedTemplate):
     Skill Memory training and evaluation-memory retention remain owned by
     ``EvaluationMemoryPlugin``, which extends ``SkillMemoryPlugin``. The
     independent ML evaluator is the sole evaluation methodology used by the
-    normal ``strategy.eval()`` lifecycle. Direct Skill Memory diagnostics are
-    intentionally separate from this strategy.
+    normal ``strategy.eval()`` lifecycle. Direct Skill Memory diagnostics
+    (``skill_memory.diagnostics``) are intentionally separate from this
+    strategy and never run as part of it.
+
+    ``diagnose=False`` (the default) means `self.timing` and the skill
+    memory plugin's own `self.timing` never record anything -- every
+    `self.timing.track(...)` call site in the codebase becomes a true
+    no-op. Set ``diagnose=True`` to have `skill_memory.diagnostics.timing_report`
+    return real numbers; it has no effect on which evaluation methodology
+    `strategy.eval()` uses, or on whether `skill_memory.diagnostics`'
+    oracle-routed functions can be called -- those always separately
+    require ``diagnose=True`` at their own call site regardless of this
+    flag.
     """
 
     #: Bucket name used with `self.timing` (see
@@ -98,6 +109,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         verbose: bool = True,
         eval_routing: str = "none",
         probe_behavior_weight: float = 0.5,
+        diagnose: bool = False,
     ) -> None:
         if eval_memory_per_class <= 0:
             raise ValueError("eval_memory_per_class must be positive")
@@ -129,7 +141,8 @@ class SkillMemoryStrategy(SupervisedTemplate):
         self.eval_routing = eval_routing
         self.train_epochs = train_epochs
         self.probe_behavior_weight = float(probe_behavior_weight)
-        self.timing = TimingAccumulator()
+        self.diagnose = bool(diagnose)
+        self.timing = TimingAccumulator(enabled=self.diagnose)
 
         # ------------------------------------------------------------------
         # Skill Memory
@@ -155,6 +168,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             eval_memory_per_class=eval_memory_per_class,
             eval_memory_seed=eval_memory_seed,
             verbose=verbose,
+            diagnose=self.diagnose,
         )
 
         self.ml_evaluation_plugin = MLEvaluationPlugin(

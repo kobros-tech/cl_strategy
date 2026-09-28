@@ -36,6 +36,7 @@ def _tiny_strategy():
         train_epochs=1,
         eval_mb_size=16,
         verbose=False,
+        diagnose=True,
     )
     return strategy, benchmark
 
