@@ -106,6 +106,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
         skill_train_samples_per_class: int | None = None,
         eval_memory_seed: int = 0,
         eval_epochs: int = 1,
+        eval_update_mode: str = "history",
         eval_batch_size: int = 64,
         eval_learning_rate: float = 0.01,
         evaluator_model_factory: Callable[[], nn.Module] | None = None,
@@ -142,6 +143,11 @@ class SkillMemoryStrategy(SupervisedTemplate):
         if eval_epochs < 1:
             raise ValueError("eval_epochs must be at least 1")
 
+        if eval_update_mode not in ("history", "new_class"):
+            raise ValueError(
+                "eval_update_mode must be one of 'history' or 'new_class'"
+            )
+
         if eval_batch_size < 1:
             raise ValueError("eval_batch_size must be positive")
 
@@ -160,6 +166,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
             device = torch.device(device)
 
         self.eval_epochs = eval_epochs
+        self.eval_update_mode = eval_update_mode
         self.eval_batch_size = eval_batch_size
         self.eval_learning_rate = eval_learning_rate
         self.verbose = verbose
@@ -216,6 +223,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
                 memory_plugin=self.plugin,
                 model_factory=evaluator_model_factory,
                 epochs=eval_epochs,
+                eval_update_mode=eval_update_mode,
                 batch_size=eval_batch_size,
                 learning_rate=eval_learning_rate,
                 seed=eval_memory_seed,
