@@ -45,7 +45,11 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
-from ..utils.probing import expand_skill_logits, predict_logits
+from ..utils.probing import _dataset_labels, expand_skill_logits, predict_logits
+from ..utils.protocol_guard import (
+    assert_evaluation_experiences,
+    assert_memory_classes_match,
+)
 from .routing import (
     build_skill_behavior_prototypes,
     combine_skill_scores,
@@ -117,6 +121,12 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
         )
         experience = strategy.experience
         memories = self._build_evaluation_memory(experience)
+        if self.strict_protocol:
+            # Evaluation memory may only hold classes of THIS (already
+            # trained) experience -- never another, in particular future, one.
+            assert_memory_classes_match(
+                [memory.class_id for memory in memories], experience
+            )
         self.eval_memory.extend(memories)
         if self.verbose:
             experience_index = int(
@@ -149,17 +159,12 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
         dataset = experience.dataset
         samples_by_class: dict[int, list[int]] = {}
 
-        for index in range(len(dataset)):
-            sample = dataset[index]
-            if len(sample) < 2:
-                raise RuntimeError(
-                    "Evaluation dataset samples must contain (input, target)."
-                )
-            target = int(sample[1])
-            samples_by_class.setdefault(
-                target,
-                [],
-            ).append(index)
+        # Labels come from the dataset's `.targets` when it has them (cached,
+        # no decoding); only the handful of samples actually retained below
+        # are ever decoded. Scanning `dataset[i]` for every sample just to
+        # read its label used to dominate the run time.
+        for index, target in enumerate(_dataset_labels(dataset)):
+            samples_by_class.setdefault(target, []).append(index)
 
         experience_index = int(
             getattr(
@@ -191,6 +196,10 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
 
             for index in indices:
                 sample = dataset[index]
+                if len(sample) < 2:
+                    raise RuntimeError(
+                        "Evaluation dataset samples must contain (input, target)."
+                    )
                 input_tensor = sample[0]
 
                 if not isinstance(
@@ -683,6 +692,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         verbose: bool = True,
         eval_routing: str = "none",
         probe_behavior_weight: float = 0.5,
+        strict_protocol: bool = True,
     ) -> None:
         super().__init__()
 
@@ -693,6 +703,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
             raise ValueError("batch_size must be positive")
 
         self.memory_plugin = memory_plugin
+        self.strict_protocol = bool(strict_protocol)
         self.model_factory = model_factory
         self.epochs = int(epochs)
         self.batch_size = int(batch_size)
@@ -754,6 +765,11 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
     def before_eval(self, strategy, **kwargs) -> None:
         """Train the independent evaluator before Avalanche eval starts."""
+        if self.strict_protocol:
+            assert_evaluation_experiences(
+                getattr(strategy, "current_eval_stream", None) or (),
+                self.memory_plugin._seen_experiences,
+            )
         memory = consolidate_evaluation_memory(self.memory_plugin.eval_memory)
 
         self._active = bool(memory)

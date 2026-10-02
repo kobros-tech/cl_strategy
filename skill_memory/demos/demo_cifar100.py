@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Kobros-Tech Ltd
 # SPDX-License-Identifier: MIT
 
-"""SplitMNIST Skill Memory experiment with ML evaluation.
+"""CIFAR-100 Skill Memory experiment with ML evaluation.
 
 The public SkillMemoryStrategy owns the complete experiment lifecycle:
 
@@ -21,8 +21,8 @@ import argparse
 
 import numpy as np
 import torch
-from avalanche.benchmarks.classic import SplitMNIST
-from avalanche.models import SimpleMLP
+from avalanche.benchmarks.classic import SplitCIFAR100
+from avalanche.models import SlimResNet18
 from torch import nn
 
 from skill_memory import SkillMemoryStrategy
@@ -41,11 +41,21 @@ from skill_memory.evaluation.independent_evaluator import EvaluationMemory
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate Skill Memory on SplitMNIST."
+        description="Train and evaluate Skill Memory on CIFAR-100."
     )
     parser.add_argument("--dataset-root", default="data")
     parser.add_argument("--download-only", action="store_true")
-    parser.add_argument("--n-experiences", type=int, default=5)
+    parser.add_argument("--n-experiences", type=int, default=20)
+    parser.add_argument(
+        "--experience-index",
+        type=int,
+        nargs="+",
+        default=[1],
+        help=(
+            "CIFAR-100 experience indices to run sequentially in one process. "
+            "For example: --experience-index 1 2 3."
+        ),
+    )
     parser.add_argument(
         "--eval-memory-per-class",
         type=int,
@@ -77,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--binary-negative-source",
         choices=("seen_classes", "all_train_classes"),
-        default="seen_classes",
+        default="all_train_classes",
         help=(
             "Binary verifier negatives: seen/current classes for valid CL, or "
             "all training-stream classes for the explicit offline experiment."
@@ -89,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-learning-rate", type=float, default=0.01)
     parser.add_argument("--probe-behavior-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-skills", type=int, default=10)
+    parser.add_argument("--max-skills", type=int, default=20)
     parser.add_argument(
         "--force-decision",
         choices=("none", "reuse", "scratch"),
@@ -296,25 +306,38 @@ def main() -> None:
     #     dataset_root=args.dataset_root,
     # )
         
-    print("Preparing SplitMNIST dataset...")
+    print("Preparing CIFAR-100 dataset...")
     print(f"Dataset root: {args.dataset_root}")
-    print("If SplitMNIST is not already downloaded, downloading it now...")
+    print("If CIFAR-100 is not already downloaded, downloading it now...")
 
-    benchmark = SplitMNIST(
+    benchmark = SplitCIFAR100(
         n_experiences=args.n_experiences,
         seed=args.seed,
         dataset_root=args.dataset_root,
     )
 
-    print("SplitMNIST dataset is ready.")
+    print("CIFAR-100 dataset is ready.")
 
-    experience_indices = list(range(len(benchmark.train_stream)))
+    experience_indices = list(dict.fromkeys(args.experience_index))
+    if not experience_indices:
+        raise ValueError("At least one --experience-index is required.")
+    invalid = [
+        index
+        for index in experience_indices
+        if index < 0 or index >= len(benchmark.train_stream)
+    ]
+    if invalid:
+        raise ValueError(
+            f"--experience-index values must be between 0 and "
+            f"{len(benchmark.train_stream) - 1}: {invalid}"
+        )
+
     print(
-        "Using all SplitMNIST experiences sequentially: "
+        "Selected CIFAR-100 experiences: "
         + ", ".join(str(index) for index in experience_indices)
     )
 
-    print("=== SplitMNIST Skill Memory experiment ===")
+    print("=== CIFAR-100 Skill Memory experiment ===")
     print("Training method: Skill Memory")
     print(
         f"CL update mode: {args.cl_update_mode}"
@@ -373,7 +396,7 @@ def main() -> None:
         )
 
     if args.download_only:
-        print(f"SplitMNIST dataset prepared at {args.dataset_root}")
+        print(f"CIFAR-100 dataset prepared at {args.dataset_root}")
         return
 
     binary_negative_pool = None
@@ -403,7 +426,7 @@ def main() -> None:
             print("Binary negative source: seen/current classes (valid CL)")
 
     # model = SimpleMLP(num_classes=10).to(device)
-    model = SimpleMLP(num_classes=10).to(device)
+    model = SlimResNet18(nclasses=100).to(device)
 
     force_decision = None if args.force_decision == "none" else args.force_decision
 
@@ -423,7 +446,7 @@ def main() -> None:
         train_mb_size=args.batch_size,
         train_epochs=args.train_epochs,
         eval_mb_size=args.eval_batch_size,
-        evaluator_model_factory=lambda: SimpleMLP(num_classes=10),
+        evaluator_model_factory=lambda: SlimResNet18(nclasses=100),
         eval_memory_per_class=args.eval_memory_per_class,
         eval_epochs=args.eval_epochs,
         eval_learning_rate=args.eval_learning_rate,
@@ -460,7 +483,7 @@ def main() -> None:
 
         eval_stream = [
             benchmark.test_stream[index]
-            for index in range(experience_index + 1)
+            for index in experience_indices[: step + 1]
         ]
 
         class_map = strategy.skill_memory_plugin.class_map
@@ -480,7 +503,7 @@ def main() -> None:
 
         forgetting_values = []
         for class_id, introduction_step in class_to_step.items():
-            if class_id not in current_accuracy:
+            if introduction_step > step or class_id not in current_accuracy:
                 continue
             observed = [
                 history[class_id]
@@ -565,7 +588,7 @@ def main() -> None:
                 strategy.skill_memory_plugin,
                 benchmark.test_stream,
                 experience_index,
-                num_classes=10,
+                num_classes=100,
                 batch_size=args.eval_batch_size,
                 device=device,
                 diagnose=args.diagnose,
@@ -575,7 +598,7 @@ def main() -> None:
                 strategy.skill_memory_plugin,
                 benchmark.test_stream,
                 experience_index,
-                num_classes=10,
+                num_classes=100,
                 routing="probe",
                 batch_size=args.eval_batch_size,
                 device=device,
@@ -617,6 +640,7 @@ def main() -> None:
                 )
 
     results = strategy.results()
+
     final_accuracy = dict(results["final_class_accuracy"])
     final_forgetting_values = []
     for class_id, introduction_step in class_to_step.items():
@@ -628,7 +652,9 @@ def main() -> None:
             if class_id in history
         ]
         if observed:
-            final_forgetting_values.append(max(observed) - final_accuracy[class_id])
+            final_forgetting_values.append(
+                max(observed) - final_accuracy[class_id]
+            )
     mean_forgetting = (
         float(np.mean(final_forgetting_values))
         if final_forgetting_values
