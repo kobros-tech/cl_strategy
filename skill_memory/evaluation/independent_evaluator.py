@@ -45,7 +45,11 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
-from ..utils.probing import expand_skill_logits, predict_logits
+from ..utils.probing import _dataset_labels, expand_skill_logits, predict_logits
+from ..utils.protocol_guard import (
+    assert_evaluation_experiences,
+    assert_memory_classes_match,
+)
 from .routing import (
     build_skill_behavior_prototypes,
     combine_skill_scores,
@@ -62,6 +66,7 @@ class EvaluationMemory:
     inputs: torch.Tensor
     targets: torch.Tensor
     class_id: int
+    experience_index: int | None = None
 
     @property
     def size(self) -> int:
@@ -117,6 +122,12 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
         )
         experience = strategy.experience
         memories = self._build_evaluation_memory(experience)
+        if self.strict_protocol:
+            # Evaluation memory may only hold classes of THIS (already
+            # trained) experience -- never another, in particular future, one.
+            assert_memory_classes_match(
+                [memory.class_id for memory in memories], experience
+            )
         self.eval_memory.extend(memories)
         if self.verbose:
             experience_index = int(
@@ -149,17 +160,12 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
         dataset = experience.dataset
         samples_by_class: dict[int, list[int]] = {}
 
-        for index in range(len(dataset)):
-            sample = dataset[index]
-            if len(sample) < 2:
-                raise RuntimeError(
-                    "Evaluation dataset samples must contain (input, target)."
-                )
-            target = int(sample[1])
-            samples_by_class.setdefault(
-                target,
-                [],
-            ).append(index)
+        # Labels come from the dataset's `.targets` when it has them (cached,
+        # no decoding); only the handful of samples actually retained below
+        # are ever decoded. Scanning `dataset[i]` for every sample just to
+        # read its label used to dominate the run time.
+        for index, target in enumerate(_dataset_labels(dataset)):
+            samples_by_class.setdefault(target, []).append(index)
 
         experience_index = int(
             getattr(
@@ -191,6 +197,10 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
 
             for index in indices:
                 sample = dataset[index]
+                if len(sample) < 2:
+                    raise RuntimeError(
+                        "Evaluation dataset samples must contain (input, target)."
+                    )
                 input_tensor = sample[0]
 
                 if not isinstance(
@@ -215,6 +225,7 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
                         dtype=torch.long,
                     ),
                     class_id=class_id,
+                    experience_index=experience_index,
                 )
             )
 
@@ -303,6 +314,41 @@ def consolidate_evaluation_memory(
 
     return consolidated
 
+
+def select_evaluation_memory(
+    memory: list[EvaluationMemory],
+    *,
+    update_mode: str,
+) -> list[EvaluationMemory]:
+    """Select retained examples used for the next evaluator update.
+
+    ``history`` retrains a fresh evaluator on all retained examples, while
+    ``new_class`` trains only on examples retained from the most recently
+    trained experience.
+    """
+    if update_mode not in ("history", "new_class"):
+        raise ValueError("update_mode must be one of 'history' or 'new_class'")
+    if not memory:
+        return []
+    if update_mode == "history":
+        return consolidate_evaluation_memory(memory)
+
+    indexed = [item for item in memory if item.experience_index is not None]
+    if not indexed:
+        raise RuntimeError(
+            "new_class evaluation updates require evaluation memory entries "
+            "with an experience_index."
+        )
+    latest_experience = max(int(item.experience_index) for item in indexed)
+    latest = [
+        item for item in memory if item.experience_index == latest_experience
+    ]
+    if not latest:
+        raise RuntimeError(
+            "No retained evaluation examples were found for the latest "
+            f"experience {latest_experience}."
+        )
+    return consolidate_evaluation_memory(latest)
 
 def train_evaluator(
     model: nn.Module,
@@ -660,8 +706,9 @@ def build_evaluator(
 class MLEvaluationPlugin(SupervisedPlugin):
     """Avalanche plugin for anonymous standalone ML evaluation.
 
-    The evaluator is trained on the accumulated raw evaluation memory before
-    each call to ``strategy.eval()``. During the normal Avalanche evaluation
+    The evaluator is trained before each call to ``strategy.eval()`` using either
+    all accumulated raw evaluation memory (``history``) or only the retained
+    examples from the newest training experience (``new_class``). During the normal Avalanche evaluation
     loop, the evaluator replaces ``strategy.mb_output`` so Avalanche's own
     evaluation metrics operate on:
 
@@ -681,8 +728,10 @@ class MLEvaluationPlugin(SupervisedPlugin):
         learning_rate: float = 0.01,
         seed: int = 0,
         verbose: bool = True,
+        eval_update_mode: str = "history",
         eval_routing: str = "none",
         probe_behavior_weight: float = 0.5,
+        strict_protocol: bool = True,
     ) -> None:
         super().__init__()
 
@@ -693,12 +742,18 @@ class MLEvaluationPlugin(SupervisedPlugin):
             raise ValueError("batch_size must be positive")
 
         self.memory_plugin = memory_plugin
+        self.strict_protocol = bool(strict_protocol)
         self.model_factory = model_factory
         self.epochs = int(epochs)
         self.batch_size = int(batch_size)
         self.learning_rate = float(learning_rate)
         self.seed = int(seed)
         self.verbose = verbose
+        if eval_update_mode not in ("history", "new_class"):
+            raise ValueError(
+                "eval_update_mode must be one of 'history' or 'new_class'"
+            )
+        self.eval_update_mode = eval_update_mode
         if eval_routing not in ("none", "probe"):
             raise ValueError("eval_routing must be one of 'none' or 'probe'")
         self.eval_routing = eval_routing
@@ -754,7 +809,18 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
     def before_eval(self, strategy, **kwargs) -> None:
         """Train the independent evaluator before Avalanche eval starts."""
-        memory = consolidate_evaluation_memory(self.memory_plugin.eval_memory)
+        if self.strict_protocol:
+            assert_evaluation_experiences(
+                getattr(strategy, "current_eval_stream", None) or (),
+                self.memory_plugin._seen_experiences,
+            )
+        memory = select_evaluation_memory(
+            self.memory_plugin.eval_memory,
+            update_mode=self.eval_update_mode,
+        )
+        routing_memory = consolidate_evaluation_memory(
+            self.memory_plugin.eval_memory
+        )
 
         self._active = bool(memory)
 
@@ -789,7 +855,9 @@ class MLEvaluationPlugin(SupervisedPlugin):
 
         if self.eval_routing == "probe":
             slot_ids = sorted(self.memory_plugin.memory.slots())
-            class_to_memory = {int(item.class_id): item for item in memory}
+            class_to_memory = {
+                int(item.class_id): item for item in routing_memory
+            }
             skill_inputs = []
             for slot in slot_ids:
                 classes = self.memory_plugin.class_map.classes_for_skill(slot)
@@ -814,7 +882,8 @@ class MLEvaluationPlugin(SupervisedPlugin):
         if self.verbose:
             print(
                 "ML evaluation: trained standalone evaluator on "
-                f"{sum(item.size for item in memory)} retained samples"
+                f"{sum(item.size for item in memory)} retained samples "
+                f"(update_mode={self.eval_update_mode})"
             )
 
     def before_eval_exp(self, strategy, **kwargs) -> None:

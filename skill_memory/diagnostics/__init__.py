@@ -50,11 +50,21 @@ from .evaluation import (
     evaluate_class_oracle,
     evaluate_skill_memory,
 )
+from .leakage import (
+    assert_no_split_overlap,
+    audit_split_overlap,
+    audit_strategy_leakage,
+)
+from .old_scores import measure_old_class_scores
 from .routing import find_best_routing_skill, route_probe_logits
 from .timing import TimingAccumulator, reset_timing, timing_report
 
 __all__ = [
     "TimingAccumulator",
+    "assert_no_split_overlap",
+    "audit_split_overlap",
+    "audit_strategy_leakage",
+    "measure_old_class_scores",
     "class_index_alignment_report",
     "diagnose_evaluator_probe",
     "evaluate_class_oracle",
