@@ -66,6 +66,7 @@ class EvaluationMemory:
     inputs: torch.Tensor
     targets: torch.Tensor
     class_id: int
+    experience_index: int | None = None
 
     @property
     def size(self) -> int:
@@ -224,6 +225,7 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
                         dtype=torch.long,
                     ),
                     class_id=class_id,
+                    experience_index=experience_index,
                 )
             )
 
@@ -312,6 +314,41 @@ def consolidate_evaluation_memory(
 
     return consolidated
 
+
+def select_evaluation_memory(
+    memory: list[EvaluationMemory],
+    *,
+    update_mode: str,
+) -> list[EvaluationMemory]:
+    """Select retained examples used for the next evaluator update.
+
+    ``history`` retrains a fresh evaluator on all retained examples, while
+    ``new_class`` trains only on examples retained from the most recently
+    trained experience.
+    """
+    if update_mode not in ("history", "new_class"):
+        raise ValueError("update_mode must be one of 'history' or 'new_class'")
+    if not memory:
+        return []
+    if update_mode == "history":
+        return consolidate_evaluation_memory(memory)
+
+    indexed = [item for item in memory if item.experience_index is not None]
+    if not indexed:
+        raise RuntimeError(
+            "new_class evaluation updates require evaluation memory entries "
+            "with an experience_index."
+        )
+    latest_experience = max(int(item.experience_index) for item in indexed)
+    latest = [
+        item for item in memory if item.experience_index == latest_experience
+    ]
+    if not latest:
+        raise RuntimeError(
+            "No retained evaluation examples were found for the latest "
+            f"experience {latest_experience}."
+        )
+    return consolidate_evaluation_memory(latest)
 
 def train_evaluator(
     model: nn.Module,
@@ -690,6 +727,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         learning_rate: float = 0.01,
         seed: int = 0,
         verbose: bool = True,
+        eval_update_mode: str = "history",
         eval_routing: str = "none",
         probe_behavior_weight: float = 0.5,
         strict_protocol: bool = True,
@@ -710,6 +748,11 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self.learning_rate = float(learning_rate)
         self.seed = int(seed)
         self.verbose = verbose
+        if eval_update_mode not in ("history", "new_class"):
+            raise ValueError(
+                "eval_update_mode must be one of 'history' or 'new_class'"
+            )
+        self.eval_update_mode = eval_update_mode
         if eval_routing not in ("none", "probe"):
             raise ValueError("eval_routing must be one of 'none' or 'probe'")
         self.eval_routing = eval_routing
@@ -770,7 +813,10 @@ class MLEvaluationPlugin(SupervisedPlugin):
                 getattr(strategy, "current_eval_stream", None) or (),
                 self.memory_plugin._seen_experiences,
             )
-        memory = consolidate_evaluation_memory(self.memory_plugin.eval_memory)
+        memory = select_evaluation_memory(
+            self.memory_plugin.eval_memory,
+            update_mode=self.eval_update_mode,
+        )
 
         self._active = bool(memory)
 
@@ -830,7 +876,8 @@ class MLEvaluationPlugin(SupervisedPlugin):
         if self.verbose:
             print(
                 "ML evaluation: trained standalone evaluator on "
-                f"{sum(item.size for item in memory)} retained samples"
+                f"{sum(item.size for item in memory)} retained samples "
+                f"(update_mode={self.eval_update_mode})"
             )
 
     def before_eval_exp(self, strategy, **kwargs) -> None:
