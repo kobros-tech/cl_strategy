@@ -69,6 +69,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of epochs used by the independent ML evaluator.",
     )
+    parser.add_argument(
+        "--eval-update-mode",
+        choices=("history", "new_class"),
+        default="history",
+        help=(
+            "Evaluator training data: replay all retained class history plus "
+            "the new classes, or train only on the newest classes."
+        ),
+    )
     parser.add_argument("--train-epochs", type=int, default=1)
     parser.add_argument(
         "--class-train-mode",
@@ -318,6 +327,7 @@ def main() -> None:
         )
     else:
         print(f"Evaluation routing: {args.eval_routing}")
+    print(f"Evaluator update mode: {args.eval_update_mode}")
     print(f"Diagnostics: {'enabled' if args.diagnose else 'disabled'}")
     print(f"Device: {device}")
     print(f"Experiences: {len(benchmark.train_stream)}")
@@ -395,6 +405,7 @@ def main() -> None:
         evaluator_model_factory=lambda: SlimResNet18(nclasses=100),
         eval_memory_per_class=args.eval_memory_per_class,
         eval_epochs=args.eval_epochs,
+        eval_update_mode=args.eval_update_mode,
         eval_learning_rate=args.eval_learning_rate,
         probe_seed=args.seed,
         device=device,
