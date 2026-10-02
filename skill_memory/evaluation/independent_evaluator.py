@@ -706,8 +706,9 @@ def build_evaluator(
 class MLEvaluationPlugin(SupervisedPlugin):
     """Avalanche plugin for anonymous standalone ML evaluation.
 
-    The evaluator is trained on the accumulated raw evaluation memory before
-    each call to ``strategy.eval()``. During the normal Avalanche evaluation
+    The evaluator is trained before each call to ``strategy.eval()`` using either
+    all accumulated raw evaluation memory (``history``) or only the retained
+    examples from the newest training experience (``new_class``). During the normal Avalanche evaluation
     loop, the evaluator replaces ``strategy.mb_output`` so Avalanche's own
     evaluation metrics operate on:
 
