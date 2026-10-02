@@ -219,9 +219,7 @@ class SkillMemoryStrategy(SupervisedTemplate):
     # ------------------------------------------------------------------
 
     def eval(self, exp_list, **kwargs):
-        """Run normal Avalanche evaluation using stored Skill Memory states.
-
-        """
+        """Run normal Avalanche evaluation using stored Skill Memory states."""
         with self.timing.track(self.TIMING_EVALUATION):
             avalanche_results = super().eval(exp_list, **kwargs)
         avalanche_results.update(self.evaluation_plugin.results())
@@ -248,4 +246,3 @@ class SkillMemoryStrategy(SupervisedTemplate):
     def skill_memory_plugin(self) -> SkillMemoryPlugin:
         """Return the underlying Skill Memory plugin."""
         return self.plugin
-

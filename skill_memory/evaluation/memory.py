@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from avalanche.training.plugins import SupervisedPlugin
 
 from ..cl.skill_memory_plugin import SkillMemoryPlugin
 from ..utils.probing import _dataset_labels
@@ -184,5 +183,3 @@ class EvaluationMemoryPlugin(SkillMemoryPlugin):
             )
 
         return memories
-
-

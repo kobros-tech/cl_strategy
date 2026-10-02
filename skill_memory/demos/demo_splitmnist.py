@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--binary-negative-source",
         choices=("seen_classes", "all_train_classes"),
-        default="seen_classes",
+        default="all_train_classes",
         help=(
             "Binary verifier negatives: seen/current classes for valid CL, or "
             "all training-stream classes for the explicit offline experiment."
@@ -148,7 +148,7 @@ def main() -> None:
     #     seed=args.seed,
     #     dataset_root=args.dataset_root,
     # )
-        
+
     print("Preparing SplitMNIST dataset...")
     print(f"Dataset root: {args.dataset_root}")
     print("If SplitMNIST is not already downloaded, downloading it now...")
@@ -285,8 +285,7 @@ def main() -> None:
         # ]
 
         eval_stream = [
-            benchmark.test_stream[index]
-            for index in range(experience_index + 1)
+            benchmark.test_stream[index] for index in range(experience_index + 1)
         ]
 
         class_map = strategy.skill_memory_plugin.class_map
@@ -355,19 +354,7 @@ def main() -> None:
                 "direct_probe_mean_accuracy=",
                 f"{np.mean([item['accuracy'] for item in direct_probe.values()]):.4f}",
             )
-            if evaluator_probe is not None:
-                print(
-                    "evaluator_probe_routing_accuracy=",
-                    f"{evaluator_probe['probe_routing_accuracy']:.4f}",
-                )
-                print(
-                    "evaluator_probe_mean_confidence=",
-                    f"{evaluator_probe['probe_mean_confidence']:.4f}",
-                )
-                print(
-                    "evaluator_probe_mean_margin=",
-                    f"{evaluator_probe['probe_mean_margin']:.4f}",
-                )
+
             for bucket, stats in timing_report(strategy).items():
                 print(
                     f"timing[{bucket}]: total={stats['total_seconds']:.2f}s "
@@ -388,9 +375,7 @@ def main() -> None:
         if observed:
             final_forgetting_values.append(max(observed) - final_accuracy[class_id])
     mean_forgetting = (
-        float(np.mean(final_forgetting_values))
-        if final_forgetting_values
-        else 0.0
+        float(np.mean(final_forgetting_values)) if final_forgetting_values else 0.0
     )
 
     print()

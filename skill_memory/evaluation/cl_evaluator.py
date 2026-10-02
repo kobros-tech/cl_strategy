@@ -135,9 +135,7 @@ class CLEvaluationPlugin(SupervisedPlugin):
         self._raw_current_class_correct: dict[int, int] = {}
         self._calibrators: dict[int, tuple[int, float, float]] = {}
         self._num_classes = 0
-        self._eval_skill_groups: list[
-            list[tuple[int, dict[str, torch.Tensor]]]
-        ] = []
+        self._eval_skill_groups: list[list[tuple[int, dict[str, torch.Tensor]]]] = []
         self._score_debug_printed = False
 
     def after_training_exp(self, strategy, **kwargs) -> None:
@@ -203,11 +201,15 @@ class CLEvaluationPlugin(SupervisedPlugin):
                     negative_scores = raw_score[negative]
                     if positive_scores.numel() and negative_scores.numel():
                         pairwise = (
-                            positive_scores[:, None] > negative_scores[None, :]
-                        ).float().mean()
+                            (positive_scores[:, None] > negative_scores[None, :])
+                            .float()
+                            .mean()
+                        )
                         ties = (
-                            positive_scores[:, None] == negative_scores[None, :]
-                        ).float().mean()
+                            (positive_scores[:, None] == negative_scores[None, :])
+                            .float()
+                            .mean()
+                        )
                         roc_auc = pairwise + 0.5 * ties
                     else:
                         roc_auc = torch.tensor(float("nan"), device=raw_score.device)

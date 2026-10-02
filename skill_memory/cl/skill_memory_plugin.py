@@ -149,8 +149,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.binary_negative_pool = binary_negative_pool
         if cl_update_mode not in ("replay", "small_replay", "new_class"):
             raise ValueError(
-                "cl_update_mode must be one of "
-                "'replay', 'small_replay', or 'new_class'"
+                "cl_update_mode must be one of 'replay', 'small_replay', or 'new_class'"
             )
         if cl_replay_per_class < 1:
             raise ValueError("cl_replay_per_class must be positive")
@@ -511,9 +510,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
             return
 
         historical_samples_per_class = (
-            None
-            if self.cl_update_mode == "replay"
-            else self.cl_replay_per_class
+            None if self.cl_update_mode == "replay" else self.cl_replay_per_class
         )
         if self.cl_update_mode == "small_replay":
             self._log(

@@ -140,6 +140,7 @@ def _strategy(n_classes=6, *, strict=True, per_class=None, **kw):
         **kw,
     )
 
+
 def _classes(experience):
     return {int(c) for c in experience.classes_in_this_experience}
 

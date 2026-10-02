@@ -19,6 +19,25 @@ from ..utils.probing import class_subset
 VALID_CLASS_TRAIN_MODES = ("multiclass", "binary_one_vs_rest")
 
 
+def _select_historical_samples(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    limit: int | None,
+    seed: int,
+    class_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select a deterministic per-class historical replay subset."""
+    if limit is None or len(inputs) <= limit:
+        return inputs, targets
+    if limit <= 0:
+        raise ValueError("limit must be positive or None")
+
+    generator = torch.Generator().manual_seed(int(seed) + int(class_id))
+    indices = torch.randperm(len(inputs), generator=generator)[:limit]
+    return inputs[indices], targets[indices]
+
+
 def train_on_class(
     strategy,
     experience,
@@ -264,6 +283,7 @@ def train_skill_on_domain(
     retained_memory=None,
     samples_per_class: int | None = None,
     historical_samples_per_class: int | None = None,
+    training_counts: dict[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Update one binary skill against the complete observed class domain."""
     if not positive_classes:
@@ -313,11 +333,7 @@ def train_skill_on_domain(
 
     # Current-experience data keeps the normal samples_per_class budget.
     # Only retained historical classes are bounded by small_replay.
-    replay_limit = (
-        historical_samples_per_class
-        if historical_samples_per_class is not None
-        else samples_per_class
-    )
+    replay_limit = historical_samples_per_class
 
     class_pools: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -337,9 +353,7 @@ def train_skill_on_domain(
                 torch.tensor(class_targets, dtype=torch.long),
             )
 
-    retained_by_class = {
-        int(item.class_id): item for item in (retained_memory or [])
-    }
+    retained_by_class = {int(item.class_id): item for item in (retained_memory or [])}
     for class_id in sorted(observed_classes - current_classes):
         item = retained_by_class.get(class_id)
         if item is None:
@@ -351,20 +365,16 @@ def train_skill_on_domain(
 
     for class_id in sorted(class_pools):
         class_inputs, class_targets = class_pools[class_id]
-        if class_id not in current_classes and replay_limit is not None:
-            n_select = min(int(replay_limit), len(class_inputs))
-            if n_select <= 0:
-                continue
-            if len(class_inputs) > n_select:
-                replay_generator = torch.Generator().manual_seed(
-                    int(validation_seed) + 1543 + int(class_id)
-                )
-                indices = torch.randperm(
-                    len(class_inputs),
-                    generator=replay_generator,
-                )[:n_select]
-                class_inputs = class_inputs[indices]
-                class_targets = class_targets[indices]
+        if class_id not in current_classes:
+            class_inputs, class_targets = _select_historical_samples(
+                class_inputs,
+                class_targets,
+                limit=replay_limit,
+                seed=int(validation_seed) + 1543,
+                class_id=class_id,
+            )
+        if training_counts is not None:
+            training_counts[class_id] = len(class_inputs)
         inputs.extend(list(class_inputs))
         targets.extend(int(value) for value in class_targets.tolist())
 
@@ -396,10 +406,6 @@ def train_skill_on_domain(
     # Balance positive and negative evidence through sampling rather than
     # changing the BCE objective with pos_weight.
     negative_classes = sorted(set(targets) - set(owned_classes))
-    negative_counts_by_class = {
-        class_id: sum(label == class_id for label in targets)
-        for class_id in negative_classes
-    }
     if not negative_classes:
         raise RuntimeError("skill-domain update requires negative samples")
     # Balance the binary objective independently of the replay policy.
