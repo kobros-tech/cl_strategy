@@ -1,13 +1,13 @@
 # Copyright (c) 2026 Kobros-Tech Ltd
 # SPDX-License-Identifier: MIT
 
-"""Focused tests for production candidate-skill routing."""
+"""Focused tests for the experimental candidate-skill routing patch."""
 
 from types import SimpleNamespace
 
 import torch
 
-import skill_memory.evaluation.candidate_routing as routing
+import skill_memory.demos.candidate_skill_routing_patch as routing
 
 
 class FakeClassMap:
@@ -336,46 +336,6 @@ def test_binary_skill_uses_independent_yes_no_scores(monkeypatch):
     # ML top-1. Binary verification must not softmax the two YES/NO heads.
     assert int(routed.argmax(1).item()) == 1
     assert stats["skill_override_rate"] == 1.0
-
-
-def test_singleton_skill_uses_configured_floor_when_calibration_has_no_negatives(
-    monkeypatch,
-):
-    validation_inputs = torch.zeros(20, 1)
-    validation_targets = torch.zeros(20, dtype=torch.long)
-    strategy, _ = _strategy(
-        mapping={0: 0},
-        owned={0: [0]},
-        states={0: 0},
-        targets=torch.tensor([0]),
-        metadata={
-            0: {
-                "verification_examples": [(validation_inputs, validation_targets)],
-            }
-        },
-    )
-    strategy.model = torch.nn.Linear(1, 1)
-    _install_fake_skill_predictor(
-        monkeypatch,
-        {0: {20: torch.full((20, 1), 4.0), 1: torch.tensor([[4.0]])}},
-    )
-
-    routed, stats = routing.route_candidate_classes(
-        torch.tensor([[1.0, 1.1]]),
-        torch.zeros(1, 1),
-        strategy,
-        candidate_k=2,
-        skill_confidence_threshold=0.5,
-        rescue_skill_confidence_threshold=0.9,
-        rescue_skill_margin=0.0,
-        ml_uncertainty_threshold=0.55,
-        calibration_precision_target=0.9,
-        calibration_min_samples=20,
-    )
-
-    assert int(routed.argmax(1).item()) == 0
-    assert stats["skill_override_rate"] == 1.0
-    assert stats["rescue_rate"] == 1.0
 
 
 def test_validation_gate_blocks_unvalidated_cl_override(monkeypatch):

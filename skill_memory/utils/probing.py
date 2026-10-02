@@ -517,7 +517,7 @@ def prepare_for_experience(model: nn.Module, experience) -> None:
 
 
 def prepare_for_classes(model: nn.Module, classes: set[int]) -> None:
-    """Grow an incremental classifier head to cover explicit global classes."""
+    """Grow incremental classifier heads to cover explicit global classes."""
     if not classes:
         return
 

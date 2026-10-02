@@ -3,50 +3,6 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [2.3.0] - 2026
-
-### Added
-
-- `reverse_warm_start` / `reverse_warm_start_epochs` on
-  `PersistentFingerprintSkillMemoryPlugin` (default `False` / `None`,
-  preserving exact prior from-scratch behavior). When enabled, each
-  experience after the first seeds its listwise reverse router
-  (`NormalMLReverseEngineer`) with the previous experience's compatible
-  weights (`_warm_start_model`: the Transformer encoder and output head are
-  always shape-compatible across experiences since `hidden_size`/
-  `num_heads`/`num_layers` are fixed; only `input_projection` grows when new
-  classes widen the candidate feature vector, and its existing columns are
-  preserved) and trains for `reverse_warm_start_epochs` steps instead of
-  refitting the whole candidate history from scratch every time.
-- This is **not** a numerically-exact optimization like the
-  `SkillMemoryPlugin` ones from 2.1.0/2.2.0 -- it is a genuine accuracy/speed
-  tradeoff, measured on a 5-experience SplitMNIST run
-  (`reverse_epochs=10`, `reverse_warm_start_epochs=3`):
-
-  | experience | skills | router fit, from-scratch | router fit, warm-start | accuracy, from-scratch | accuracy, warm-start |
-  |---|---|---|---|---|---|
-  | 0 | 2 | 1.3s | 1.1s | 99.4% | 99.4% |
-  | 1 | 4 | 4.0s | 1.3s | 96.4% | 91.3% |
-  | 2 | 6 | 8.0s | 2.8s | 92.3% | 89.0% |
-  | 3 | 8 | 15.1s | 5.1s | 90.1% | 89.5% |
-  | 4 | 10 | ~24s | 8.0s | 89.6% | 88.4% |
-
-  Router-fit time roughly triples at the final experience; accuracy drops by
-  up to ~5 points (most visibly at experience 1). Mean forgetting was
-  measured *lower* with warm-starting (0.7%-2.4% vs. 1.3%-5.5%) in this run,
-  despite lower absolute accuracy -- forgetting is peak-minus-current per
-  class, and warm-starting's accuracy was more stable rather than peaking
-  high early, so this is not a second accuracy advantage to read into it.
-  `reverse_warm_start_epochs` was not tuned beyond the single value above;
-  a larger value would likely narrow the accuracy gap at some cost to the
-  speedup. Default remains `False` pending that tuning.
-- `skill_memory/tests/test_reverse_router_warm_start.py`: a from-scratch
-  reference implementation checked bit-for-bit against the current default
-  call, direct weight-level checks that warm-starting reuses compatible
-  weights (encoder/output exactly, `input_projection` columns preserved
-  under both growing and shrinking feature width), and plugin-level wiring
-  checks (epoch selection on the first vs. later fits, validation).
-
 ## [2.2.0] - 2026
 
 ### Added

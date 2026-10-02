@@ -1,11 +1,10 @@
 # Copyright (c) 2026 Kobros-Tech Ltd
 # SPDX-License-Identifier: MIT
 
-"""Evaluator-candidate -> Skill Memory arbitration.
+"""Experimental evaluator-candidate -> Skill Memory arbitration.
 
-This is the production candidate-routing implementation used by the
-independent evaluator. The ML evaluator proposes candidates; Skill Memory
-verifies them and may rescue a lower-ranked candidate.
+This module is intentionally a demo-only patch. It changes no production
+Skill Memory code.
 
 The normal independent evaluator remains the candidate generator:
 
@@ -26,6 +25,9 @@ Skill Memory probabilities are never compared to elect a class. Evaluator and
 Skill Memory probabilities are not multiplied because they are not calibrated
 onto a common scale.
 
+This is deliberately implemented by monkey-patching
+MLEvaluationPlugin.after_eval_forward so it can be tested without changing
+the package's production API or default behavior.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from dataclasses import dataclass
 
 import torch
 
+from skill_memory.evaluation.independent_evaluator import MLEvaluationPlugin
 from skill_memory.utils.probing import expand_skill_logits, predict_logits
 
 
@@ -139,18 +142,14 @@ def _calibrate_skill_thresholds(
         examples = metadata.get("verification_examples")
         if examples is None:
             return {class_id: minimum_threshold for class_id in owned_classes}
-    # Calibration is optional evidence, not a requirement for verification.
-    # Empty or undersized validation data cannot establish a precision
-    # threshold, so use the configured verification floor rather than turning
-    # the candidate into an impossible threshold of 1.0.
     if not examples:
-        return {class_id: minimum_threshold for class_id in owned_classes}
+        return {class_id: None for class_id in owned_classes}
 
     device = next(strategy.model.parameters()).device
     inputs = torch.cat([item[0] for item in examples], dim=0).to(device)
     targets = torch.cat([item[1] for item in examples], dim=0).to(device)
     if len(targets) < min_samples:
-        return {class_id: minimum_threshold for class_id in owned_classes}
+        return {class_id: None for class_id in owned_classes}
 
     with torch.no_grad():
         validation_logits = predict_logits(strategy.model, state, inputs)
@@ -170,12 +169,8 @@ def _calibrate_skill_thresholds(
         positive = targets == class_id
         positive_count = int(positive.sum().item())
         negative_count = int((~positive).sum().item())
-        # A singleton skill has positive validation examples but no negatives
-        # inside the skill. Precision calibration is therefore undefined for
-        # that class. Fall back to the configured verification floor instead
-        # of using 1.0, which would reject every singleton candidate.
         if positive_count == 0 or negative_count == 0:
-            thresholds[class_id] = minimum_threshold
+            thresholds[class_id] = None
             continue
 
         order = torch.argsort(scores, descending=True)
@@ -774,3 +769,142 @@ def route_candidate_classes(
     }
     return routed_logits, stats
 
+
+def _candidate_skill_after_eval_forward(
+    self: MLEvaluationPlugin,
+    strategy,
+    *,
+    debug: bool = False,
+    debug_max_samples: int = 20,
+    **kwargs,
+) -> None:
+    """Use the candidate-skill arbitration during Avalanche evaluation."""
+    if not self._active or self.model is None:
+        return
+
+    inputs = strategy.mbatch[0]
+    self.model.eval()
+    evaluator_logits = self.model(inputs)
+    self._current_loss_logits = evaluator_logits
+
+    config: CandidateSkillRoutingConfig = self._candidate_skill_routing_config
+    routed_logits, stats = route_candidate_classes(
+        evaluator_logits,
+        inputs,
+        strategy,
+        candidate_k=config.candidate_k,
+        skill_confidence_threshold=config.skill_confidence_threshold,
+        rescue_skill_confidence_threshold=config.rescue_skill_confidence_threshold,
+        rescue_skill_margin=config.rescue_skill_margin,
+        ml_uncertainty_threshold=config.ml_uncertainty_threshold,
+        calibration_precision_target=config.calibration_precision_target,
+        calibration_min_samples=config.calibration_min_samples,
+        debug=debug,
+        debug_max_samples=debug_max_samples,
+    )
+    self._candidate_skill_stats = stats
+    strategy.mb_output = routed_logits
+
+
+def install_candidate_skill_routing(
+    *,
+    candidate_k: int = 3,
+    skill_confidence_threshold: float = 0.5,
+    rescue_skill_confidence_threshold: float = 0.85,
+    rescue_skill_margin: float = 0.10,
+    ml_uncertainty_threshold: float = 0.55,
+    calibration_precision_target: float = 0.90,
+    calibration_min_samples: int = 20,
+    debug: bool = False,
+    debug_max_samples: int = 20,
+) -> CandidateSkillRoutingConfig:
+    """Install the experimental routing patch globally for this process.
+
+    Call this before constructing SkillMemoryStrategy. The returned config is
+    stored on each subsequently-created MLEvaluationPlugin instance.
+
+    The patch is intentionally process-local and demo-only.
+    """
+
+    config = CandidateSkillRoutingConfig(
+        candidate_k=candidate_k,
+        skill_confidence_threshold=skill_confidence_threshold,
+        rescue_skill_confidence_threshold=rescue_skill_confidence_threshold,
+        rescue_skill_margin=rescue_skill_margin,
+        ml_uncertainty_threshold=ml_uncertainty_threshold,
+        calibration_precision_target=calibration_precision_target,
+        calibration_min_samples=calibration_min_samples,
+        debug=debug,
+        debug_max_samples=debug_max_samples,
+    )
+
+    original_init = MLEvaluationPlugin.__init__
+    original_before_eval = MLEvaluationPlugin.before_eval
+    original_after_eval_forward = MLEvaluationPlugin.after_eval_forward
+    original_after_eval = MLEvaluationPlugin.after_eval
+
+    if getattr(MLEvaluationPlugin, "_candidate_skill_patch_installed", False):
+        MLEvaluationPlugin._candidate_skill_routing_config = config
+        return config
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._candidate_skill_routing_config = (
+            MLEvaluationPlugin._candidate_skill_routing_config
+        )
+        self._candidate_skill_routing_stats = {}
+
+    def patched_before_eval(self, strategy, **kwargs):
+        self._candidate_skill_routing_stats = {}
+        self._candidate_skill_routing_stat_sums = {}
+        self._candidate_skill_routing_stat_count = 0
+        self._candidate_skill_routing_debug_count = 0
+        # Thresholds are valid for a fixed evaluation experience. Keeping this
+        # cache across batches avoids recalibrating the same skill repeatedly.
+        strategy._candidate_skill_calibration_cache = {}
+        return original_before_eval(self, strategy, **kwargs)
+
+    def patched_after_eval_forward(self, strategy, **kwargs):
+        if not hasattr(self, "_candidate_skill_routing_config"):
+            return original_after_eval_forward(self, strategy, **kwargs)
+
+        config = self._candidate_skill_routing_config
+        debug_remaining = max(
+            config.debug_max_samples - self._candidate_skill_routing_debug_count,
+            0,
+        )
+        _candidate_skill_after_eval_forward(
+            self,
+            strategy,
+            debug=config.debug and debug_remaining > 0,
+            debug_max_samples=debug_remaining,
+            **kwargs,
+        )
+        if config.debug:
+            self._candidate_skill_routing_debug_count += min(
+                int(strategy.mbatch[0].shape[0]), debug_remaining
+            )
+        stats = self._candidate_skill_stats
+        batch_size = int(strategy.mbatch[0].shape[0])
+        sums = self._candidate_skill_routing_stat_sums
+        for name, value in stats.items():
+            sums[name] = sums.get(name, 0.0) + value * batch_size
+        self._candidate_skill_routing_stat_count += batch_size
+
+    def patched_after_eval(self, strategy, **kwargs):
+        count = self._candidate_skill_routing_stat_count
+        if count:
+            self._candidate_skill_routing_stats = {
+                name: total / count
+                for name, total in self._candidate_skill_routing_stat_sums.items()
+            }
+        return original_after_eval(self, strategy, **kwargs)
+
+    MLEvaluationPlugin.__init__ = patched_init
+    MLEvaluationPlugin.before_eval = patched_before_eval
+    MLEvaluationPlugin.after_eval_forward = patched_after_eval_forward
+    MLEvaluationPlugin.after_eval = patched_after_eval
+    MLEvaluationPlugin._candidate_skill_patch_installed = True
+    MLEvaluationPlugin._candidate_skill_routing_config = config
+
+    return config

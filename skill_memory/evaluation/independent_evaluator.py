@@ -50,10 +50,6 @@ from ..utils.protocol_guard import (
     assert_evaluation_experiences,
     assert_memory_classes_match,
 )
-from .candidate_routing import (
-    CandidateSkillRoutingConfig,
-    route_candidate_classes,
-)
 from .routing import (
     build_skill_behavior_prototypes,
     combine_skill_scores,
@@ -674,15 +670,14 @@ class MLEvaluationPlugin(SupervisedPlugin):
     """Avalanche plugin for anonymous standalone ML evaluation.
 
     The evaluator is trained on the accumulated raw evaluation memory before
-    each call to ``strategy.eval()``. During normal evaluation, it proposes
-    top-k candidates and canonical Skill Memory verifies/rescues them before
-    the routed output is written to ``strategy.mb_output``:
+    each call to ``strategy.eval()``. During the normal Avalanche evaluation
+    loop, the evaluator replaces ``strategy.mb_output`` so Avalanche's own
+    evaluation metrics operate on:
 
-        x -> independent ML evaluator -> top-k -> Skill Memory verification/rescue -> y
+        x -> standalone ML evaluator -> y
 
-    The raw evaluator logits remain the independent loss reference; routed
-    logits are the predictions used for accuracy. No Skill Memory weights,
-    skill IDs, task labels, or experience IDs are supplied to the evaluator.
+    No Skill Memory weights, skill IDs, task labels, or experience IDs are
+    supplied to the evaluator.
     """
 
     def __init__(
@@ -698,16 +693,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
         eval_routing: str = "none",
         probe_behavior_weight: float = 0.5,
         strict_protocol: bool = True,
-        candidate_skill_routing: bool = True,
-        candidate_k: int = 3,
-        skill_confidence_threshold: float = 0.5,
-        rescue_skill_confidence_threshold: float = 0.85,
-        rescue_skill_margin: float = 0.10,
-        ml_uncertainty_threshold: float = 0.55,
-        calibration_precision_target: float = 0.90,
-        calibration_min_samples: int = 20,
-        candidate_routing_debug: bool = False,
-        candidate_routing_debug_max_samples: int = 20,
     ) -> None:
         super().__init__()
 
@@ -731,18 +716,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
         if not 0.0 <= probe_behavior_weight <= 1.0:
             raise ValueError("probe_behavior_weight must be between 0 and 1")
         self.probe_behavior_weight = float(probe_behavior_weight)
-        self.candidate_skill_routing = bool(candidate_skill_routing)
-        self.candidate_skill_routing_config = CandidateSkillRoutingConfig(
-            candidate_k=candidate_k,
-            skill_confidence_threshold=skill_confidence_threshold,
-            rescue_skill_confidence_threshold=rescue_skill_confidence_threshold,
-            rescue_skill_margin=rescue_skill_margin,
-            ml_uncertainty_threshold=ml_uncertainty_threshold,
-            calibration_precision_target=calibration_precision_target,
-            calibration_min_samples=calibration_min_samples,
-            debug=candidate_routing_debug,
-            debug_max_samples=candidate_routing_debug_max_samples,
-        )
 
         self.model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -762,10 +735,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_experience_classes: set[int] = set()
         self._current_loss_logits: torch.Tensor | None = None
         self._skill_behavior_prototypes: torch.Tensor | None = None
-        self._candidate_skill_routing_stats: dict[str, float] = {}
-        self._candidate_skill_routing_stat_sums: dict[str, float] = {}
-        self._candidate_skill_routing_stat_count = 0
-        self._candidate_skill_routing_debug_count = 0
 
     # ------------------------------------------------------------------
     # Training-memory bookkeeping
@@ -808,14 +777,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
         if not self._active:
             return
 
-        # The evaluator seed must control model initialization as well as
-        # DataLoader shuffling. Without this, identical experiments can start
-        # from different random weights and produce materially different
-        # accuracy even when all CLI seeds are unchanged.
-        torch.manual_seed(self.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.seed)
-
         self.model = self.model_factory().to(strategy.device)
 
         self.optimizer = torch.optim.SGD(
@@ -841,13 +802,8 @@ class MLEvaluationPlugin(SupervisedPlugin):
         self._current_experience_classes = set()
         self._current_loss_logits = None
         self._skill_behavior_prototypes = None
-        self._candidate_skill_routing_stats = {}
-        self._candidate_skill_routing_stat_sums = {}
-        self._candidate_skill_routing_stat_count = 0
-        self._candidate_skill_routing_debug_count = 0
-        strategy._candidate_skill_calibration_cache = {}
 
-        if self.eval_routing == "probe" and not self.candidate_skill_routing:
+        if self.eval_routing == "probe":
             slot_ids = sorted(self.memory_plugin.memory.slots())
             class_to_memory = {int(item.class_id): item for item in memory}
             skill_inputs = []
@@ -904,51 +860,7 @@ class MLEvaluationPlugin(SupervisedPlugin):
         # mask penalty rather than the evaluator's predictive quality.
         self._current_loss_logits = evaluator_logits
 
-        # Candidate routing is the general production evaluation path.
-        # The independent ML evaluator still generates the candidate ranking,
-        # but its raw top-1 output is not used as the final prediction when
-        # Skill Memory can verify/rescue a candidate.
-        if self.candidate_skill_routing:
-            config = self.candidate_skill_routing_config
-            debug_remaining = max(
-                config.debug_max_samples
-                - self._candidate_skill_routing_debug_count,
-                0,
-            )
-            routed_logits, stats = route_candidate_classes(
-                evaluator_logits,
-                inputs,
-                strategy,
-                candidate_k=config.candidate_k,
-                skill_confidence_threshold=config.skill_confidence_threshold,
-                rescue_skill_confidence_threshold=(
-                    config.rescue_skill_confidence_threshold
-                ),
-                rescue_skill_margin=config.rescue_skill_margin,
-                ml_uncertainty_threshold=config.ml_uncertainty_threshold,
-                calibration_precision_target=config.calibration_precision_target,
-                calibration_min_samples=config.calibration_min_samples,
-                debug=config.debug and debug_remaining > 0,
-                debug_max_samples=debug_remaining,
-            )
-            batch_size = int(inputs.shape[0])
-            for name, value in stats.items():
-                self._candidate_skill_routing_stat_sums[name] = (
-                    self._candidate_skill_routing_stat_sums.get(name, 0.0)
-                    + value * batch_size
-                )
-            self._candidate_skill_routing_stat_count += batch_size
-            if config.debug:
-                self._candidate_skill_routing_debug_count += min(
-                    batch_size,
-                    debug_remaining,
-                )
-            self._candidate_skill_routing_stats = stats
-            strategy.mb_output = routed_logits
-            return
-
-        # Legacy probe/independent paths remain available only when the
-        # production candidate-routing layer is explicitly disabled.
+        # "none" is the reference implementation.
         if self.eval_routing == "none":
             strategy.mb_output = evaluator_logits
             return
@@ -1107,19 +1019,6 @@ class MLEvaluationPlugin(SupervisedPlugin):
                 f"mean_accuracy="
                 f"{np.mean(list(current_accuracy.values())):.4f}"
             )
-            if self._candidate_skill_routing_stat_count:
-                count = self._candidate_skill_routing_stat_count
-                self._candidate_skill_routing_stats = {
-                    name: total / count
-                    for name, total in self._candidate_skill_routing_stat_sums.items()
-                }
-                print(
-                    "Candidate Skill Routing: "
-                    f"ml_top1_accuracy={self._candidate_skill_routing_stats.get('ml_top1_accuracy', 0.0):.4f} "
-                    f"final_accuracy={self._candidate_skill_routing_stats.get('final_batch_accuracy', 0.0):.4f} "
-                    f"override_rate={self._candidate_skill_routing_stats.get('skill_override_rate', 0.0):.4f} "
-                    f"rescue_rate={self._candidate_skill_routing_stats.get('rescue_rate', 0.0):.4f}"
-                )
 
         self._skill_behavior_prototypes = None
         self._active = False
