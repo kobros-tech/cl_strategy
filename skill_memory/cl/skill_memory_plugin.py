@@ -527,6 +527,34 @@ class SkillMemoryPlugin(SupervisedPlugin):
             prepare_for_classes(strategy.model, observed_classes)
             self._reset_optimizer(strategy, group_by_name)
 
+            if getattr(self, "_cl_replay_per_class", None) is not None:
+                replay_budget = int(self._cl_replay_per_class)
+                retained_by_class = {
+                    int(item.class_id): int(len(item.inputs))
+                    for item in (retained_memory or [])
+                }
+                replay_counts = {
+                    class_id: min(retained_by_class.get(class_id, 0), replay_budget)
+                    for class_id in sorted(observed_classes - current_classes)
+                }
+                current_counts = {}
+                labels = [
+                    int(experience.dataset[index][1])
+                    for index in range(len(experience.dataset))
+                ]
+                for class_id in sorted(current_classes):
+                    available = sum(label == class_id for label in labels)
+                    if self.samples_per_class is not None:
+                        available = min(available, self.samples_per_class)
+                    current_counts[class_id] = available
+                self._log(
+                    f"Domain update: skill {skill} small_replay "
+                    f"historical_counts={replay_counts}; "
+                    f"current_counts={current_counts}; "
+                    f"historical_total={sum(replay_counts.values())}; "
+                    f"current_total={sum(current_counts.values())}"
+                )
+
             with self.timing.track(self.TIMING_CLASS_TRAINING):
                 validation_inputs, validation_targets = train_skill_on_domain(
                     strategy,
@@ -539,6 +567,9 @@ class SkillMemoryPlugin(SupervisedPlugin):
                     validation_seed=self.validation_seed,
                     retained_memory=retained_memory,
                     samples_per_class=self.samples_per_class,
+                    historical_samples_per_class=getattr(
+                        self, "_cl_replay_per_class", None
+                    ),
                 )
 
             validation_by_class = dict(

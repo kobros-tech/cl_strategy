@@ -263,6 +263,7 @@ def train_skill_on_domain(
     validation_seed: int = 0,
     retained_memory=None,
     samples_per_class: int | None = None,
+    historical_samples_per_class: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Update one binary skill against the complete observed class domain."""
     if not positive_classes:
@@ -273,6 +274,8 @@ def train_skill_on_domain(
         raise ValueError("validation_fraction must be in [0, 1)")
     if samples_per_class is not None and samples_per_class <= 0:
         raise ValueError("samples_per_class must be positive")
+    if historical_samples_per_class is not None and historical_samples_per_class <= 0:
+        raise ValueError("historical_samples_per_class must be positive")
     if epochs < 1:
         return torch.empty(0), torch.empty(0, dtype=torch.long)
 
@@ -307,23 +310,63 @@ def train_skill_on_domain(
     inputs = []
     targets = []
     current_classes = set(by_class)
-    for index in training_indices:
-        sample = full_dataset[index]
-        inputs.append(torch.as_tensor(sample[0]).detach().cpu())
-        targets.append(int(sample[1]))
 
-    retained_by_class = {int(item.class_id): item for item in (retained_memory or [])}
+    # Current-experience data keeps the normal samples_per_class budget.
+    # Only retained historical classes are bounded by small_replay.
+    replay_limit = (
+        historical_samples_per_class
+        if historical_samples_per_class is not None
+        else samples_per_class
+    )
+
+    class_pools: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    for class_id in sorted(current_classes):
+        class_indices = [
+            index for index in training_indices if labels[index] == class_id
+        ]
+        class_inputs = []
+        class_targets = []
+        for index in class_indices:
+            sample = full_dataset[index]
+            class_inputs.append(torch.as_tensor(sample[0]).detach().cpu())
+            class_targets.append(int(sample[1]))
+        if class_inputs:
+            class_pools[class_id] = (
+                torch.stack(class_inputs),
+                torch.tensor(class_targets, dtype=torch.long),
+            )
+
+    retained_by_class = {
+        int(item.class_id): item for item in (retained_memory or [])
+    }
     for class_id in sorted(observed_classes - current_classes):
         item = retained_by_class.get(class_id)
         if item is None:
             continue
-        retained_inputs = item.inputs.detach().cpu()
-        retained_targets = item.targets.detach().cpu()
-        if samples_per_class is not None:
-            retained_inputs = retained_inputs[:samples_per_class]
-            retained_targets = retained_targets[:samples_per_class]
-        inputs.extend(list(retained_inputs))
-        targets.extend(int(value) for value in retained_targets.tolist())
+        class_pools[class_id] = (
+            item.inputs.detach().cpu(),
+            item.targets.detach().cpu(),
+        )
+
+    for class_id in sorted(class_pools):
+        class_inputs, class_targets = class_pools[class_id]
+        if class_id not in current_classes and replay_limit is not None:
+            n_select = min(int(replay_limit), len(class_inputs))
+            if n_select <= 0:
+                continue
+            if len(class_inputs) > n_select:
+                replay_generator = torch.Generator().manual_seed(
+                    int(validation_seed) + 1543 + int(class_id)
+                )
+                indices = torch.randperm(
+                    len(class_inputs),
+                    generator=replay_generator,
+                )[:n_select]
+                class_inputs = class_inputs[indices]
+                class_targets = class_targets[indices]
+        inputs.extend(list(class_inputs))
+        targets.extend(int(value) for value in class_targets.tolist())
 
     if not inputs:
         raise RuntimeError("skill-domain update has no training samples")
@@ -352,16 +395,22 @@ def train_skill_on_domain(
     )
     # Balance positive and negative evidence through sampling rather than
     # changing the BCE objective with pos_weight.
-    negative_total = sum(label not in owned_classes for label in targets)
+    negative_classes = sorted(set(targets) - set(owned_classes))
+    negative_counts_by_class = {
+        class_id: sum(label == class_id for label in targets)
+        for class_id in negative_classes
+    }
+    if not negative_classes:
+        raise RuntimeError("skill-domain update requires negative samples")
+    # Balance the binary objective independently of the replay policy.
+    # small_replay controls how much historical data enters the dataset; it
+    # must not change the positive-vs-negative objective itself.
+    negative_total = len(targets) - int(positive_counts.sum().item())
     if negative_total <= 0:
         raise RuntimeError("skill-domain update requires negative samples")
     sample_weights = [
         (
-            0.5
-            / (
-                len(owned_classes)
-                * int(positive_counts[owned_classes.index(label)].item())
-            )
+            0.5 / int(positive_counts[owned_classes.index(label)].item())
             if label in owned_classes
             else 0.5 / negative_total
         )

@@ -36,6 +36,7 @@ from dataclasses import dataclass
 
 import torch
 
+from skill_memory.cl.skill_memory_plugin import SkillMemoryPlugin
 from skill_memory.evaluation.independent_evaluator import MLEvaluationPlugin
 from skill_memory.utils.probing import expand_skill_logits, predict_logits
 
@@ -45,6 +46,8 @@ class CandidateSkillRoutingConfig:
     """Configuration for the experimental candidate arbitration."""
 
     candidate_k: int = 3
+    cl_update_mode: str = "replay"
+    cl_replay_per_class: int = 5
     skill_confidence_threshold: float = 0.5
     rescue_skill_confidence_threshold: float = 0.85
     rescue_skill_margin: float = 0.10
@@ -55,6 +58,12 @@ class CandidateSkillRoutingConfig:
     debug_max_samples: int = 20
 
     def __post_init__(self) -> None:
+        if self.cl_update_mode not in ("replay", "small_replay", "new_class"):
+            raise ValueError(
+                "cl_update_mode must be one of 'replay', 'small_replay', or 'new_class'"
+            )
+        if self.cl_replay_per_class < 1:
+            raise ValueError("cl_replay_per_class must be positive")
         if self.candidate_k < 1:
             raise ValueError("candidate_k must be positive")
         if not 0.0 <= self.skill_confidence_threshold <= 1.0:
@@ -806,9 +815,104 @@ def _candidate_skill_after_eval_forward(
     strategy.mb_output = routed_logits
 
 
+
+def install_cl_update_mode(
+    cl_update_mode: str = "replay",
+    cl_replay_per_class: int = 5,
+) -> str:
+    """Install the demo-only CL skill-update policy."""
+    if cl_update_mode not in ("replay", "small_replay", "new_class"):
+        raise ValueError(
+            "cl_update_mode must be one of 'replay', 'small_replay', or 'new_class'"
+        )
+    if cl_replay_per_class < 1:
+        raise ValueError("cl_replay_per_class must be positive")
+
+    if getattr(SkillMemoryPlugin, "_cl_update_mode_patch_installed", False):
+        SkillMemoryPlugin._cl_update_mode = cl_update_mode
+        SkillMemoryPlugin._cl_replay_per_class = (
+            cl_replay_per_class if cl_update_mode == "small_replay" else None
+        )
+        return cl_update_mode
+
+    original_update_binary_skill_domains = (
+        SkillMemoryPlugin._update_binary_skill_domains
+    )
+
+    def patched_update_binary_skill_domains(
+        self, strategy, experience, experience_index
+    ) -> None:
+        mode = getattr(
+            self,
+            "_cl_update_mode",
+            getattr(SkillMemoryPlugin, "_cl_update_mode", "replay"),
+        )
+        replay_budget = getattr(
+            self,
+            "_cl_replay_per_class",
+            getattr(SkillMemoryPlugin, "_cl_replay_per_class", None),
+        )
+        current_classes = sorted(
+            int(class_id)
+            for class_id in experience.classes_in_this_experience
+        )
+        historical_classes = sorted(
+            {
+                int(class_id)
+                for skill in self.memory.slots()
+                for class_id in self.class_map.classes_for_skill(skill)
+            }
+            - set(current_classes)
+        )
+
+        if mode == "new_class":
+            self._log(
+                "CL update mode: new_class; "
+                f"current_classes={current_classes}; "
+                f"historical_classes={historical_classes}; "
+                "historical skill-domain replay=DISABLED"
+            )
+            return
+
+        if mode == "small_replay":
+            self._log(
+                "CL update mode: small_replay; "
+                f"current_classes={current_classes}; "
+                f"historical_classes={historical_classes}; "
+                f"replay_per_class={replay_budget}; "
+                "ALL existing skills will be updated with bounded history"
+            )
+            self._log(
+                "CL small-replay semantics: historical samples per class are "
+                f"capped at {replay_budget}; current/new-class training is unchanged"
+            )
+        else:
+            self._log(
+                "CL update mode: replay; "
+                f"current_classes={current_classes}; "
+                f"historical_classes={historical_classes}; "
+                "historical skill-domain replay=ENABLED (full retained history)"
+            )
+
+        return original_update_binary_skill_domains(
+            self, strategy, experience, experience_index
+        )
+
+    SkillMemoryPlugin._update_binary_skill_domains = (
+        patched_update_binary_skill_domains
+    )
+    SkillMemoryPlugin._cl_update_mode_patch_installed = True
+    SkillMemoryPlugin._cl_update_mode = cl_update_mode
+    SkillMemoryPlugin._cl_replay_per_class = (
+        cl_replay_per_class if cl_update_mode == "small_replay" else None
+    )
+    return cl_update_mode
+
 def install_candidate_skill_routing(
     *,
     candidate_k: int = 3,
+    cl_update_mode: str = "replay",
+    cl_replay_per_class: int = 5,
     skill_confidence_threshold: float = 0.5,
     rescue_skill_confidence_threshold: float = 0.85,
     rescue_skill_margin: float = 0.10,
@@ -828,6 +932,8 @@ def install_candidate_skill_routing(
 
     config = CandidateSkillRoutingConfig(
         candidate_k=candidate_k,
+        cl_update_mode=cl_update_mode,
+        cl_replay_per_class=cl_replay_per_class,
         skill_confidence_threshold=skill_confidence_threshold,
         rescue_skill_confidence_threshold=rescue_skill_confidence_threshold,
         rescue_skill_margin=rescue_skill_margin,
@@ -838,14 +944,23 @@ def install_candidate_skill_routing(
         debug_max_samples=debug_max_samples,
     )
 
+    original_skill_memory_init = SkillMemoryPlugin.__init__
     original_init = MLEvaluationPlugin.__init__
     original_before_eval = MLEvaluationPlugin.before_eval
     original_after_eval_forward = MLEvaluationPlugin.after_eval_forward
     original_after_eval = MLEvaluationPlugin.after_eval
+    original_update_binary_skill_domains = SkillMemoryPlugin._update_binary_skill_domains
 
     if getattr(MLEvaluationPlugin, "_candidate_skill_patch_installed", False):
         MLEvaluationPlugin._candidate_skill_routing_config = config
+        SkillMemoryPlugin._candidate_skill_cl_update_config = config
         return config
+
+    def patched_skill_memory_init(self, *args, **kwargs):
+        original_skill_memory_init(self, *args, **kwargs)
+        self._candidate_skill_cl_update_config = (
+            SkillMemoryPlugin._candidate_skill_cl_update_config
+        )
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -900,11 +1015,36 @@ def install_candidate_skill_routing(
             }
         return original_after_eval(self, strategy, **kwargs)
 
+    def patched_update_binary_skill_domains(
+        self, strategy, experience, experience_index
+    ) -> None:
+        patch_config = getattr(
+            self, "_candidate_skill_cl_update_config", config
+        )
+        if patch_config.cl_update_mode == "new_class":
+            self._log(
+                "CL update mode: new_class; "
+                "only the newly exposed class skills are updated. "
+                "Historical skill-domain replay is disabled."
+            )
+            return
+        self._log(
+            "CL update mode: replay; "
+            "retraining existing binary skills over the observed domain "
+            "with retained historical examples plus the current experience."
+        )
+        return original_update_binary_skill_domains(
+            self, strategy, experience, experience_index
+        )
+
+    SkillMemoryPlugin.__init__ = patched_skill_memory_init
+    SkillMemoryPlugin._update_binary_skill_domains = patched_update_binary_skill_domains
     MLEvaluationPlugin.__init__ = patched_init
     MLEvaluationPlugin.before_eval = patched_before_eval
     MLEvaluationPlugin.after_eval_forward = patched_after_eval_forward
     MLEvaluationPlugin.after_eval = patched_after_eval
     MLEvaluationPlugin._candidate_skill_patch_installed = True
     MLEvaluationPlugin._candidate_skill_routing_config = config
+    SkillMemoryPlugin._candidate_skill_cl_update_config = config
 
     return config
