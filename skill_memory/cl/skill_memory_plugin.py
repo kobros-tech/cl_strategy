@@ -521,9 +521,9 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 "ALL existing skills will be updated with bounded history"
             )
             self._log(
-                "CL small-replay semantics: historical samples per class are "
-                f"capped at {self.cl_replay_per_class}; "
-                "current/new-class training is unchanged"
+                "CL small-replay semantics: historical classes get up to "
+                f"{self.cl_replay_per_class} replay examples; current classes "
+                "use the normal skill-training sample budget"
             )
         else:
             self._log(
@@ -581,22 +581,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
                     class_id: min(retained_by_class.get(class_id, 0), replay_budget)
                     for class_id in sorted(observed_classes - current_classes)
                 }
-                current_counts = {}
-                labels = [
-                    int(experience.dataset[index][1])
-                    for index in range(len(experience.dataset))
-                ]
-                for class_id in sorted(current_classes):
-                    available = sum(label == class_id for label in labels)
-                    if self.samples_per_class is not None:
-                        available = min(available, self.samples_per_class)
-                    current_counts[class_id] = available
                 self._log(
                     f"Domain update: skill {skill} small_replay "
                     f"historical_counts={replay_counts}; "
-                    f"current_counts={current_counts}; "
-                    f"historical_total={sum(replay_counts.values())}; "
-                    f"current_total={sum(current_counts.values())}"
+                    "current classes use normal skill-training sample budget"
                 )
 
             with self.timing.track(self.TIMING_CLASS_TRAINING):

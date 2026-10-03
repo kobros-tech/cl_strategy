@@ -117,6 +117,7 @@ def test_domain_training_consumes_full_vs_small_historical_replay():
         batch_size=8,
         validation_fraction=0.0,
         retained_memory=retained,
+        samples_per_class=4,
         historical_samples_per_class=3,
         training_counts=small_counts,
     )

@@ -330,9 +330,6 @@ def train_skill_on_domain(
     inputs = []
     targets = []
     current_classes = set(by_class)
-
-    # Current-experience data keeps the normal samples_per_class budget.
-    # Only retained historical classes are bounded by small_replay.
     replay_limit = historical_samples_per_class
 
     class_pools: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}

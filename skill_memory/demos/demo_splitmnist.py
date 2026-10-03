@@ -30,7 +30,6 @@ from skill_memory.diagnostics import (
     evaluate_skill_memory,
     timing_report,
 )
-from skill_memory.evaluation.memory import EvaluationMemory
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,15 +59,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Skill class-training objective: multiclass positive-only or "
             "binary one-vs-rest YES/NO."
-        ),
-    )
-    parser.add_argument(
-        "--binary-negative-source",
-        choices=("seen_classes", "all_train_classes"),
-        default="all_train_classes",
-        help=(
-            "Binary verifier negatives: seen/current classes for valid CL, or "
-            "all training-stream classes for the explicit offline experiment."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=64)
@@ -106,8 +96,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help=(
-            "Historical examples retained per class during small_replay. "
-            "All existing skills are still updated."
+            "Examples per historical class during small_replay. Current "
+            "classes keep --skill-train-samples-per-class."
         ),
     )
     parser.add_argument(
@@ -206,32 +196,6 @@ def main() -> None:
         print(f"SplitMNIST dataset prepared at {args.dataset_root}")
         return
 
-    binary_negative_pool = None
-    if args.class_train_mode == "binary_one_vs_rest":
-        if args.binary_negative_source == "all_train_classes":
-            samples_by_class = {}
-            for train_experience in benchmark.train_stream:
-                for index in range(len(train_experience.dataset)):
-                    sample = train_experience.dataset[index]
-                    class_id = int(sample[1])
-                    samples_by_class.setdefault(class_id, []).append(
-                        torch.as_tensor(sample[0]).detach().cpu()
-                    )
-            binary_negative_pool = [
-                EvaluationMemory(
-                    inputs=torch.stack(inputs),
-                    targets=torch.full((len(inputs),), class_id, dtype=torch.long),
-                    class_id=class_id,
-                )
-                for class_id, inputs in sorted(samples_by_class.items())
-            ]
-            print(
-                "Binary negative source: all training-stream classes "
-                "(explicit offline/full-dataset experiment)"
-            )
-        else:
-            print("Binary negative source: seen/current classes (valid CL)")
-
     # model = SimpleMLP(num_classes=10).to(device)
     model = SimpleMLP(num_classes=10).to(device)
 
@@ -258,7 +222,6 @@ def main() -> None:
         device=device,
         diagnose=args.diagnose,
         verbose=True,
-        binary_negative_pool=binary_negative_pool,
         cl_update_mode=args.cl_update_mode,
         cl_replay_per_class=args.cl_replay_per_class,
     )
