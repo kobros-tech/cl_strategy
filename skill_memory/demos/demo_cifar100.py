@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Kobros-Tech Ltd
 # SPDX-License-Identifier: MIT
 
-"""SplitMNIST Skill Memory experiment with CL evaluation.
+"""CIFAR-100 Skill Memory experiment with CL evaluation.
 
 The public SkillMemoryStrategy owns the complete experiment lifecycle:
 
@@ -20,26 +20,35 @@ import argparse
 
 import numpy as np
 import torch
-from avalanche.benchmarks.classic import SplitMNIST
-from avalanche.models import SimpleMLP
+from avalanche.benchmarks.classic import SplitCIFAR100
+from avalanche.models import SlimResNet18
 from torch import nn
 
 from skill_memory import SkillMemoryStrategy
 from skill_memory.diagnostics import (
     evaluate_class_oracle,
     evaluate_skill_memory,
-    replay_provenance_report,
     timing_report,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate Skill Memory on SplitMNIST."
+        description="Train and evaluate Skill Memory on CIFAR-100."
     )
     parser.add_argument("--dataset-root", default="data")
     parser.add_argument("--download-only", action="store_true")
-    parser.add_argument("--n-experiences", type=int, default=5)
+    parser.add_argument("--n-experiences", type=int, default=20)
+    parser.add_argument(
+        "--experience-index",
+        type=int,
+        nargs="+",
+        default=[1],
+        help=(
+            "CIFAR-100 experience indices to run sequentially in one process. "
+            "For example: --experience-index 1 2 3."
+        ),
+    )
     parser.add_argument(
         "--eval-memory-per-class",
         type=int,
@@ -66,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-skills", type=int, default=10)
+    parser.add_argument("--max-skills", type=int, default=20)
     parser.add_argument(
         "--force-decision",
         choices=("none", "reuse", "scratch"),
@@ -88,9 +97,8 @@ def parse_args() -> argparse.Namespace:
         choices=("replay", "small_replay", "new_class"),
         default="replay",
         help=(
-            "Historical data used to train each class: all currently retained "
-            "examples (replay), at most K retained examples per old class "
-            "(small_replay), or none (new_class)."
+            "CL skill update data: full retained-history replay, bounded historical "
+            "replay for every existing skill, or newly exposed class only."
         ),
     )
     parser.add_argument(
@@ -105,19 +113,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--refresh-existing-skills",
         action="store_true",
-        help=(
-            "Independently retrain every existing skill on the enlarged "
-            "domain after each experience (needs history: not with "
-            "--cl-update-mode new_class). Costs one training pass per skill "
-            "per experience."
-        ),
+        help="Retrain every existing skill on the enlarged domain each experience.",
     )
-    parser.add_argument(
-        "--training-seed",
-        type=int,
-        default=0,
-        help="Seed for mini-batch order / balanced re-sampling / dropout.",
-    )
+    parser.add_argument("--training-seed", type=int, default=0)
     parser.add_argument(
         "--skill-validation-fraction",
         type=float,
@@ -157,25 +155,38 @@ def main() -> None:
     #     dataset_root=args.dataset_root,
     # )
 
-    print("Preparing SplitMNIST dataset...")
+    print("Preparing CIFAR-100 dataset...")
     print(f"Dataset root: {args.dataset_root}")
-    print("If SplitMNIST is not already downloaded, downloading it now...")
+    print("If CIFAR-100 is not already downloaded, downloading it now...")
 
-    benchmark = SplitMNIST(
+    benchmark = SplitCIFAR100(
         n_experiences=args.n_experiences,
         seed=args.seed,
         dataset_root=args.dataset_root,
     )
 
-    print("SplitMNIST dataset is ready.")
+    print("CIFAR-100 dataset is ready.")
 
-    experience_indices = list(range(len(benchmark.train_stream)))
+    experience_indices = list(dict.fromkeys(args.experience_index))
+    if not experience_indices:
+        raise ValueError("At least one --experience-index is required.")
+    invalid = [
+        index
+        for index in experience_indices
+        if index < 0 or index >= len(benchmark.train_stream)
+    ]
+    if invalid:
+        raise ValueError(
+            f"--experience-index values must be between 0 and "
+            f"{len(benchmark.train_stream) - 1}: {invalid}"
+        )
+
     print(
-        "Using all SplitMNIST experiences sequentially: "
+        "Selected CIFAR-100 experiences: "
         + ", ".join(str(index) for index in experience_indices)
     )
 
-    print("=== SplitMNIST Skill Memory experiment ===")
+    print("=== CIFAR-100 Skill Memory experiment ===")
     print("Training method: Skill Memory")
     print(
         f"CL update mode: {args.cl_update_mode}"
@@ -185,7 +196,6 @@ def main() -> None:
             else ""
         )
     )
-    print(f"Refresh existing skills: {args.refresh_existing_skills}")
     print(f"Skill class-training mode: {args.class_train_mode}")
     print("Evaluation: Skill Memory CL evaluator")
     print(f"Diagnostics: {'enabled' if args.diagnose else 'disabled'}")
@@ -212,11 +222,11 @@ def main() -> None:
         )
 
     if args.download_only:
-        print(f"SplitMNIST dataset prepared at {args.dataset_root}")
+        print(f"CIFAR-100 dataset prepared at {args.dataset_root}")
         return
 
     # model = SimpleMLP(num_classes=10).to(device)
-    model = SimpleMLP(num_classes=10).to(device)
+    model = SlimResNet18(nclasses=100).to(device)
 
     force_decision = None if args.force_decision == "none" else args.force_decision
 
@@ -242,9 +252,9 @@ def main() -> None:
         diagnose=args.diagnose,
         verbose=True,
         cl_update_mode=args.cl_update_mode,
-        cl_replay_per_class=args.cl_replay_per_class,
         refresh_existing_skills=args.refresh_existing_skills,
         training_seed=args.training_seed,
+        cl_replay_per_class=args.cl_replay_per_class,
     )
 
     accuracy_history: list[dict[int, float]] = []
@@ -269,7 +279,7 @@ def main() -> None:
         # ]
 
         eval_stream = [
-            benchmark.test_stream[index] for index in range(experience_index + 1)
+            benchmark.test_stream[index] for index in experience_indices[: step + 1]
         ]
 
         class_map = strategy.skill_memory_plugin.class_map
@@ -289,7 +299,7 @@ def main() -> None:
 
         forgetting_values = []
         for class_id, introduction_step in class_to_step.items():
-            if class_id not in current_accuracy:
+            if introduction_step > step or class_id not in current_accuracy:
                 continue
             observed = [
                 history[class_id]
@@ -314,7 +324,7 @@ def main() -> None:
                 strategy.skill_memory_plugin,
                 benchmark.test_stream,
                 experience_index,
-                num_classes=10,
+                num_classes=100,
                 batch_size=args.eval_batch_size,
                 device=device,
                 diagnose=args.diagnose,
@@ -324,7 +334,7 @@ def main() -> None:
                 strategy.skill_memory_plugin,
                 benchmark.test_stream,
                 experience_index,
-                num_classes=10,
+                num_classes=100,
                 routing="probe",
                 batch_size=args.eval_batch_size,
                 device=device,
@@ -346,6 +356,7 @@ def main() -> None:
                 )
 
     results = strategy.results()
+
     final_accuracy = dict(results["final_class_accuracy"])
     final_forgetting_values = []
     for class_id, introduction_step in class_to_step.items():
@@ -366,29 +377,13 @@ def main() -> None:
     print("=== Summary ===")
     print("mean_forgetting=", f"{mean_forgetting:.4f}")
     print(
-        "mean_final_accuracy (calibrated)=",
+        "mean_final_accuracy=",
         f"{results['mean_final_accuracy']:.4f}",
-    )
-    print(
-        "raw_mean_final_accuracy (primary diagnostic)=",
-        f"{results['raw_mean_final_accuracy']:.4f}",
     )
     print(
         "mean_final_loss=",
         f"{results['mean_final_loss']:.4f}",
     )
-
-    if args.diagnose:
-        audit = replay_provenance_report(strategy, diagnose=True)
-        print("replay provenance:")
-        for kind in ("class_training", "refresh"):
-            row = audit[kind]
-            print(
-                f"  {kind}: calls={row['calls']} "
-                f"optimizer_steps={row['optimizer_steps']} "
-                f"historical_examples={row['historical_examples']}"
-            )
-        print(f"  violations: {audit['violations'] or 'none'}")
 
     print("final_class_accuracy:")
     for class_id, accuracy in final_accuracy.items():

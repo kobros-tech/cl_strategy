@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -17,17 +18,61 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        include:
+          - python-version: "3.10"
+            torch: ""
+          - python-version: "3.11"
+            torch: ""
+          - python-version: "3.12"
+            torch: ""
+          # Oldest torch line exercised in CI (torch.func / vmap paths).
+          - python-version: "3.11"
+            torch: "torch==2.3.*"
+            numpy: "numpy<2"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
       - name: Install package and dev dependencies
         run: |
-          pip install -e .
-          pip install -r requirements-dev.txt
-      - name: Run tests
-        run: pytest skill_memory/tests -q
+          pip install -e ".[dev]"
+          if [ -n "${{ matrix.torch }}" ]; then
+            pip install "${{ matrix.torch }}" "${{ matrix.numpy }}"
+          fi
+          python -c "import torch; print('torch', torch.__version__)"
+      - name: Run tests (offline; no dataset downloads)
+        run: python -m pytest -q
+
+  replay-ablation:
+    # The offline replay/refresh comparison must keep running and keep its
+    # audit clean (the 'viol' column / exit status is checked by the tests).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e .
+      - name: Run the replay ablation demo
+        run: |
+          python -m skill_memory.demos.demo_replay_ablation --seeds 0 1 --json ablation.json \
+            | tee ablation.txt
+          python - <<'PY'
+          import json
+          rows = json.load(open("ablation.json"))
+          assert all(r["violations"] == 0 for r in rows), rows
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-ablation
+          path: |
+            ablation.txt
+            ablation.json
