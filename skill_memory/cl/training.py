@@ -51,6 +51,7 @@ def train_on_class(
     retained_memory=None,
     negative_pool=None,
     samples_per_class: int | None = None,
+    historical_samples_per_class: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Train one target class with multiclass or one-vs-rest supervision.
 
@@ -77,6 +78,11 @@ def train_on_class(
         )
     if samples_per_class is not None and samples_per_class <= 0:
         raise ValueError("samples_per_class must be positive")
+    if (
+        historical_samples_per_class is not None
+        and historical_samples_per_class <= 0
+    ):
+        raise ValueError("historical_samples_per_class must be positive")
 
     positive_dataset = class_subset(experience, target_class)
     if len(positive_dataset) == 0:
@@ -143,25 +149,31 @@ def train_on_class(
             prior_inputs = []
             prior_targets = []
             current_classes = set(by_class)
-            source_items = list(retained_memory or []) + list(negative_pool or [])
+            source_items = [
+                (item, historical_samples_per_class)
+                for item in (retained_memory or [])
+            ] + [
+                (item, samples_per_class) for item in (negative_pool or [])
+            ]
             seen_source_classes = set()
-            for item in source_items:
+            for item, source_limit in source_items:
                 class_id = int(item.class_id)
                 if class_id in current_classes or class_id == target_class:
                     continue
                 if class_id in seen_source_classes:
                     continue
                 seen_source_classes.add(class_id)
-                prior_inputs.append(
-                    item.inputs.detach().cpu()[:samples_per_class]
-                    if samples_per_class is not None
-                    else item.inputs.detach().cpu()
+                item_inputs = item.inputs.detach().cpu()
+                item_targets = item.targets.detach().cpu()
+                item_inputs, item_targets = _select_historical_samples(
+                    item_inputs,
+                    item_targets,
+                    limit=source_limit,
+                    seed=int(validation_seed) + 1543,
+                    class_id=class_id,
                 )
-                prior_targets.append(
-                    item.targets.detach().cpu()[:samples_per_class]
-                    if samples_per_class is not None
-                    else item.targets.detach().cpu()
-                )
+                prior_inputs.append(item_inputs)
+                prior_targets.append(item_targets)
             if prior_inputs:
                 prior_dataset = TensorDataset(
                     torch.cat(prior_inputs, dim=0),
@@ -169,24 +181,14 @@ def train_on_class(
                 )
                 dataset = ConcatDataset([dataset, prior_dataset])
 
-    train_labels = [labels[index] for index in training_indices]
-    if mode == "binary_one_vs_rest" and (retained_memory or negative_pool):
-        source_items = list(retained_memory or []) + list(negative_pool or [])
-        seen_source_classes = set()
-        for item in source_items:
-            class_id = int(item.class_id)
-            if (
-                class_id not in by_class
-                and class_id != target_class
-                and class_id not in seen_source_classes
-            ):
-                seen_source_classes.add(class_id)
-                count = (
-                    min(int(item.targets.numel()), samples_per_class)
-                    if samples_per_class is not None
-                    else int(item.targets.numel())
-                )
-                train_labels.extend([class_id] * count)
+    if mode == "binary_one_vs_rest":
+        # Build sampler weights from the actual assembled dataset. Historical
+        # replay may be capped independently from the current-class budget,
+        # so reconstructing counts from ``samples_per_class`` would disagree
+        # with the assembled dataset length.
+        train_labels = [int(dataset[index][1]) for index in range(len(dataset))]
+    else:
+        train_labels = [labels[index] for index in training_indices]
     positive_count = sum(label == target_class for label in train_labels)
     negative_count = len(train_labels) - positive_count
     if len(dataset) == 0:
@@ -208,7 +210,11 @@ def train_on_class(
         # more comparable across skills than a per-skill pos_weight.
         sampler_weights = torch.tensor(
             [
-                0.5 / positive_count if label == target_class else 0.5 / negative_count
+                (
+                    0.5 / positive_count
+                    if label == target_class
+                    else 0.5 / negative_count
+                )
                 for label in train_labels
             ],
             dtype=torch.double,

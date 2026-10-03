@@ -167,3 +167,112 @@ def test_full_replay_is_not_capped_by_current_class_sample_budget():
     )
 
     assert counts == {0: 10, 1: 2}
+
+
+def test_class_training_replay_budget_is_independent_of_current_class_budget(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import skill_memory.cl.training as training
+    from skill_memory.evaluation.memory import EvaluationMemory
+
+    class Experience:
+        dataset = torch.utils.data.TensorDataset(
+            torch.tensor([[1.0], [1.1], [1.2], [1.3]]),
+            torch.tensor([1, 1, 1, 1]),
+        )
+
+    class Strategy:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 2)
+            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
+            self.clock = SimpleNamespace(train_iterations=0)
+
+    retained = [
+        EvaluationMemory(
+            inputs=torch.arange(10, dtype=torch.float32).reshape(10, 1),
+            targets=torch.zeros(10, dtype=torch.long),
+            class_id=0,
+        )
+    ]
+
+    original_loader = training.DataLoader
+    captured = []
+
+    def spy_loader(*args, **kwargs):
+        loader = original_loader(*args, **kwargs)
+        captured.append((len(loader.dataset), len(loader.sampler)))
+        return loader
+
+    monkeypatch.setattr(training, "DataLoader", spy_loader)
+
+    training.train_on_class(
+        Strategy(),
+        Experience(),
+        target_class=1,
+        epochs=1,
+        batch_size=8,
+        mode="binary_one_vs_rest",
+        validation_fraction=0.0,
+        retained_memory=retained,
+        samples_per_class=4,
+        historical_samples_per_class=3,
+    )
+
+    # Four current samples + three historical negatives. The sampler must
+    # describe that exact assembled dataset; it must not use the current-class
+    # budget (4) for historical replay.
+    assert captured[-1] == (7, 7)
+
+
+def test_class_training_full_replay_uses_all_retained_history(monkeypatch):
+    from types import SimpleNamespace
+
+    import skill_memory.cl.training as training
+    from skill_memory.evaluation.memory import EvaluationMemory
+
+    class Experience:
+        dataset = torch.utils.data.TensorDataset(
+            torch.tensor([[1.0], [1.1], [1.2], [1.3]]),
+            torch.tensor([1, 1, 1, 1]),
+        )
+
+    class Strategy:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 2)
+            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
+            self.clock = SimpleNamespace(train_iterations=0)
+
+    retained = [
+        EvaluationMemory(
+            inputs=torch.arange(10, dtype=torch.float32).reshape(10, 1),
+            targets=torch.zeros(10, dtype=torch.long),
+            class_id=0,
+        )
+    ]
+
+    original_loader = training.DataLoader
+    captured = []
+
+    def spy_loader(*args, **kwargs):
+        loader = original_loader(*args, **kwargs)
+        captured.append((len(loader.dataset), len(loader.sampler)))
+        return loader
+
+    monkeypatch.setattr(training, "DataLoader", spy_loader)
+
+    training.train_on_class(
+        Strategy(),
+        Experience(),
+        target_class=1,
+        epochs=1,
+        batch_size=8,
+        mode="binary_one_vs_rest",
+        validation_fraction=0.0,
+        retained_memory=retained,
+        samples_per_class=2,
+        historical_samples_per_class=None,
+    )
+
+    assert captured[-1] == (12, 12)

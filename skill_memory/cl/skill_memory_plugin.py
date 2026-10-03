@@ -322,6 +322,27 @@ class SkillMemoryPlugin(SupervisedPlugin):
             return
 
         retained_memory = getattr(self, "eval_memory", None)
+        if self.cl_update_mode == "new_class":
+            historical_replay_memory = None
+            historical_replay_limit = None
+        elif self.cl_update_mode == "small_replay":
+            historical_replay_memory = retained_memory
+            historical_replay_limit = self.cl_replay_per_class
+        else:
+            historical_replay_memory = retained_memory
+            historical_replay_limit = None
+
+        historical_replay_description = (
+            historical_replay_limit
+            if historical_replay_limit is not None
+            else ("disabled" if historical_replay_memory is None else "all_retained")
+        )
+        self._log(
+            "Initial class-training replay: "
+            f"mode={self.cl_update_mode}; "
+            f"historical_per_class={historical_replay_description}"
+        )
+
         for target_class in classes:
             if self.class_train_mode == "binary_one_vs_rest":
                 seen_classes = set(classes)
@@ -329,8 +350,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
                     seen_classes.update(
                         int(item.class_id) for item in self.binary_negative_pool
                     )
-                if retained_memory:
-                    seen_classes.update(int(item.class_id) for item in retained_memory)
+                if historical_replay_memory:
+                    seen_classes.update(
+                        int(item.class_id) for item in historical_replay_memory
+                    )
                 negatives = sorted(
                     class_id for class_id in seen_classes if class_id != target_class
                 )
@@ -399,9 +422,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
                             mode=self.class_train_mode,
                             validation_fraction=self.validation_fraction,
                             validation_seed=self.validation_seed,
-                            retained_memory=retained_memory,
+                            retained_memory=historical_replay_memory,
                             negative_pool=self.binary_negative_pool,
                             samples_per_class=self.samples_per_class,
+                            historical_samples_per_class=historical_replay_limit,
                         )
                     previous_metadata = self.memory.metadata(skill)
                     validation_by_class = dict(
@@ -442,9 +466,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
                         mode=self.class_train_mode,
                         validation_fraction=self.validation_fraction,
                         validation_seed=self.validation_seed,
-                        retained_memory=getattr(self, "eval_memory", None),
+                        retained_memory=historical_replay_memory,
                         negative_pool=self.binary_negative_pool,
                         samples_per_class=self.samples_per_class,
+                        historical_samples_per_class=historical_replay_limit,
                     )
                 validation_by_class = {}
                 for class_id in torch.unique(validation_targets).tolist():
