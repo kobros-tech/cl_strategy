@@ -65,7 +65,8 @@ def train_on_class(
     negatives. If ``negative_pool`` is supplied, it is an explicit offline
     experiment source containing all requested non-target classes. Future
     classes are never read implicitly by this training loop. Only the
-    target-class logit participates in the binary loss.
+    The target-class logit is trained relative to the log-sum-exp of the
+    negative-class logits, so the negative classes receive gradients too.
 
     ``BCEWithLogitsLoss`` consumes raw logits and applies sigmoid internally.
     """
@@ -121,6 +122,8 @@ def train_on_class(
             ].tolist()
         )
 
+    current_classes = set(by_class)
+
     if mode == "multiclass":
         target_indices = [
             index for index in training_indices if labels[index] == target_class
@@ -148,7 +151,6 @@ def train_on_class(
         if retained_memory or negative_pool:
             prior_inputs = []
             prior_targets = []
-            current_classes = set(by_class)
             source_items = [
                 (item, historical_samples_per_class)
                 for item in (retained_memory or [])
@@ -182,10 +184,10 @@ def train_on_class(
                 dataset = ConcatDataset([dataset, prior_dataset])
 
     if mode == "binary_one_vs_rest":
-        # Build sampler weights from the actual assembled dataset. Historical
-        # replay may be capped independently from the current-class budget,
-        # so reconstructing counts from ``samples_per_class`` would disagree
-        # with the assembled dataset length.
+        # Use every assembled example exactly once per epoch. The previous
+        # replacement sampler could repeatedly train on a small subset while
+        # never seeing other examples, making fresh SCRATCH skills unstable.
+        # Keep the one-vs-rest objective, but balance it through BCE itself.
         train_labels = [int(dataset[index][1]) for index in range(len(dataset))]
     else:
         train_labels = [labels[index] for index in training_indices]
@@ -193,6 +195,13 @@ def train_on_class(
     negative_count = len(train_labels) - positive_count
     if len(dataset) == 0:
         raise RuntimeError(f"class {target_class} has no training samples")
+    if positive_count == 0:
+        raise RuntimeError(f"class {target_class} has no positive training samples")
+    if mode == "binary_one_vs_rest" and negative_count == 0:
+        raise RuntimeError(
+            f"class {target_class} has no negative training samples"
+        )
+
     device = next(strategy.model.parameters()).device
     loader = DataLoader(
         dataset,
@@ -203,31 +212,6 @@ def train_on_class(
     criterion = getattr(strategy, "_criterion", None)
     if criterion is None:
         criterion = torch.nn.functional.cross_entropy
-
-    if mode == "binary_one_vs_rest":
-        # Balance positive and negative evidence at the sampler level.
-        # This keeps the binary objective symmetric and makes sigmoid scores
-        # more comparable across skills than a per-skill pos_weight.
-        sampler_weights = torch.tensor(
-            [
-                (
-                    0.5 / positive_count
-                    if label == target_class
-                    else 0.5 / negative_count
-                )
-                for label in train_labels
-            ],
-            dtype=torch.double,
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=min(batch_size, len(dataset)),
-            sampler=WeightedRandomSampler(
-                sampler_weights,
-                num_samples=len(dataset),
-                replacement=True,
-            ),
-        )
 
     strategy.model.train()
     for _ in range(epochs):
@@ -244,7 +228,21 @@ def train_on_class(
                         f"target class {target_class} is outside the model "
                         f"classifier width {logits.shape[1]}"
                     )
-                binary_logits = logits[:, target_class]
+                negative_classes = sorted(set(train_labels) - {target_class})
+                if not negative_classes:
+                    raise RuntimeError(
+                        f"class {target_class} has no negative classes"
+                    )
+                if max(negative_classes) >= logits.shape[1]:
+                    raise RuntimeError(
+                        "binary one-vs-rest training requires a classifier head "
+                        f"covering negative class {max(negative_classes)}; "
+                        f"width={logits.shape[1]}"
+                    )
+                negative_logits = logits[:, negative_classes]
+                binary_logits = logits[:, target_class] - torch.logsumexp(
+                    negative_logits, dim=1
+                )
                 binary_targets = y.eq(target_class).to(dtype=binary_logits.dtype)
                 loss = torch.nn.functional.binary_cross_entropy_with_logits(
                     binary_logits,

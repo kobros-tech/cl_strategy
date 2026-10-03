@@ -23,7 +23,7 @@ import torch
 from avalanche.training.plugins import SupervisedPlugin
 from torch import nn
 
-from ..utils.probing import predict_logits
+from ..utils.probing import incremental_active_units, predict_logits
 from ..utils.protocol_guard import assert_evaluation_experiences
 from .memory import EvaluationMemoryPlugin
 
@@ -32,6 +32,7 @@ def _class_logit(
     logits: torch.Tensor,
     class_id: int,
     owned_classes: Sequence[int],
+    negative_classes: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """Extract the verifier logit for one owned class."""
     if logits.ndim != 2:
@@ -41,15 +42,44 @@ def _class_logit(
             raise RuntimeError(
                 f"class {class_id} is outside skill classifier width {logits.shape[1]}"
             )
-        return logits[:, class_id]
-
-    try:
-        position = list(owned_classes).index(class_id)
-    except ValueError as exc:
+        target_logit = logits[:, class_id]
+    else:
+        try:
+            position = list(owned_classes).index(class_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"class {class_id} is not owned by the selected skill"
+            ) from exc
+        target_logit = logits[:, position]
+    negatives = (
+        sorted(int(value) for value in negative_classes)
+        if negative_classes is not None
+        else []
+    )
+    negatives = [value for value in negatives if value != class_id]
+    if not negatives:
+        return target_logit
+    if max(negatives) >= logits.shape[1]:
         raise RuntimeError(
-            f"class {class_id} is not owned by the selected skill"
-        ) from exc
-    return logits[:, position]
+            f"negative class {max(negatives)} is outside skill classifier "
+            f"width {logits.shape[1]}"
+        )
+    return target_logit - torch.logsumexp(logits[:, negatives], dim=1)
+
+
+def _active_classes(
+    model: nn.Module,
+    state: dict[str, torch.Tensor],
+    owned_classes: Sequence[int],
+) -> list[int]:
+    active_units = incremental_active_units(model, state)
+    if active_units is None:
+        return sorted({int(class_id) for class_id in owned_classes})
+    return [
+        class_id
+        for class_id, active in enumerate(active_units.tolist())
+        if int(active) != 0
+    ]
 
 
 def _fit_platt_calibrator(
@@ -190,7 +220,13 @@ class CLEvaluationPlugin(SupervisedPlugin):
                 logits = predict_logits(strategy.model, state, inputs)
 
             for class_id in owned_classes:
-                raw_score = _class_logit(logits, class_id, owned_classes)
+                domain_classes = _active_classes(strategy.model, state, owned_classes)
+                raw_score = _class_logit(
+                    logits,
+                    class_id,
+                    owned_classes,
+                    [value for value in domain_classes if value != class_id],
+                )
                 binary_target = targets.eq(class_id).to(dtype=torch.float32)
                 scale, bias = _fit_platt_calibrator(raw_score, binary_target)
 
@@ -337,6 +373,7 @@ class CLEvaluationPlugin(SupervisedPlugin):
 
                 batched_logits = torch.vmap(call)(stacked_params)
                 for index, skill in enumerate(skills):
+                    _, one_skill_params = chunk[index]
                     owned_classes = sorted(class_map.classes_for_skill(skill))
                     logits = batched_logits[index]
                     for class_id, (
@@ -346,7 +383,17 @@ class CLEvaluationPlugin(SupervisedPlugin):
                     ) in self._calibrators.items():
                         if calibrated_skill != skill:
                             continue
-                        raw_score = _class_logit(logits, class_id, owned_classes)
+                        domain_classes = _active_classes(
+                            strategy.model,
+                            one_skill_params,
+                            owned_classes,
+                        )
+                        raw_score = _class_logit(
+                            logits,
+                            class_id,
+                            owned_classes,
+                            [value for value in domain_classes if value != class_id],
+                        )
                         raw_scores[:, class_id] = raw_score
                         calibrated_scores[:, class_id] = scale * raw_score + bias
 
